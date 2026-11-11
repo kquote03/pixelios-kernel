@@ -18,7 +18,7 @@ import json
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-META_KEYS = {"name", "codename", "soc", "status", "marketing", "notes"}
+META_KEYS = {"name", "codename", "soc", "status", "marketing", "notes", "provisional"}
 
 
 def _num(v):
@@ -63,6 +63,30 @@ def device_dir(board):
 
 def soc_dir(board):
     return os.path.relpath(_DEVICES[board][1], ROOT)
+
+
+DEFAULT_TARGET = "bluejay"
+
+
+def target_board(env=None):
+    """The phone the hardware tools may touch: $BOARD, default bluejay (AGENTS.md rule 2). Only a device whose board.json
+    names a google/* SoC qualifies; sweet (QEMU only) and unknown names exit with a message on stderr."""
+    env = os.environ if env is None else env
+    board = env.get("BOARD") or DEFAULT_TARGET
+    if board not in _DEVICES or not _DEVICES[board][2]["soc"].startswith("google/"):
+        raise SystemExit(f"BOARD={board!r} is not a phone target (tools/pix devices lists device/*/*/board.json)")
+    return board
+
+
+def provisional(board, devices=None):
+    """board.json "provisional": the keys that are not measured on the phone yet. tools/mkpayload.py refuses such a board."""
+    devices = _DEVICES if devices is None else devices
+    return list(devices[board][2].get("provisional", []))
+
+
+def device_name(board):
+    """Marketing name from board.json "name" (e.g. "Pixel 6")."""
+    return _DEVICES[board][2]["name"]
 
 
 def _touch_macros(v):
@@ -454,6 +478,10 @@ def wlan_seq_render(doc, path="wlan_seq.json") -> str:
 
 
 if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["--target"]:
+        print(target_board())
+        raise SystemExit(0)
     import argparse
     from pathlib import Path
 
