@@ -45,6 +45,9 @@ ALLOWED_TARGETS = {"fastboot", "recovery", "android", "ios", "absent"}
 # Test hook only: multiplies the wait bounds that decide when to ask the user (the unit tests cannot wait 90 s).
 BOUND_SCALE = float(os.environ.get("PHONE_BOUND_SCALE", "1"))
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+from tools import boards  # noqa: E402
+TARGET = boards.target_board()      # the only phone this tool may touch (BOARD env, default bluejay; AGENTS.md rule 2)
 
 # Host staged USB-net command (printed for user reference, NEVER run via sudo)
 # Citation: tools/sweet-usbnet.sh:14, tools/xrun:63
@@ -426,10 +429,10 @@ def run_bounded(cmd, timeout_s=8, logger=None):
 
 def verify_bluejay_target(transport, logger=None):
     """Safety wrapper verification:
-    Confirms target device reports 'bluejay'.
-    - For adb: checks ro.product.device == bluejay.
-    - For fastboot: checks fastboot getvar product == bluejay ONLY when USB ID is 18d1:d001 or 18d1:4ee0.
-    Returns True if confirmed bluejay, False otherwise.
+    Confirms the device reports exactly TARGET (BOARD env, default bluejay).
+    - For adb: checks ro.product.device == TARGET.
+    - For fastboot: checks fastboot getvar product == TARGET ONLY when USB ID is 18d1:d001 or 18d1:4ee0.
+    Returns True if confirmed, False otherwise.
     """
     if transport == "adb":
         rc, out, _ = safe_device_cmd(
@@ -438,10 +441,10 @@ def verify_bluejay_target(transport, logger=None):
             logger=logger,
             skip_bluejay_check=True,
         )
-        if rc == 0 and "bluejay" in out.strip():
+        if rc == 0 and out.strip() == TARGET:
             return True
         if logger:
-            logger.log(f"verify_bluejay_target(adb): device reported '{out.strip()}', not bluejay")
+            logger.log(f"verify_bluejay_target(adb): device reported '{out.strip()}', not {TARGET}")
         return False
 
     elif transport == "fastboot":
@@ -463,10 +466,10 @@ def verify_bluejay_target(transport, logger=None):
             skip_bluejay_check=True,
         )
         combined = f"{out}\n{err}"
-        if "product: bluejay" in combined or "product:\tbluejay" in combined:
+        if re.search(r"^product:\s*" + re.escape(TARGET) + r"\s*$", combined, re.M):
             return True
         if logger:
-            logger.log(f"verify_bluejay_target(fastboot): getvar output did not match bluejay: {combined.strip()}")
+            logger.log(f"verify_bluejay_target(fastboot): getvar output did not match {TARGET}: {combined.strip()}")
         return False
 
     return False
@@ -475,9 +478,9 @@ def verify_bluejay_target(transport, logger=None):
 def safe_device_cmd(cmd, timeout_s=15, logger=None, skip_bluejay_check=False):
     """Single safety wrapper for every adb/fastboot call.
     1. Asserts command is in COMMAND_ALLOWLIST.
-    2. Confirms target device is verified 'bluejay' before sending command.
+    2. Confirms target device is verified TARGET before sending command.
     3. Redacts serial numbers from output.
-    Any non-bluejay target results in refusal and no command being sent.
+    Any other device results in refusal and no command being sent.
     """
     assert_command_allowed(cmd)
     cmd = resolve_cmd(cmd)
@@ -487,8 +490,8 @@ def safe_device_cmd(cmd, timeout_s=15, logger=None, skip_bluejay_check=False):
         if transport in ("adb", "fastboot"):
             if not verify_bluejay_target(transport, logger=logger):
                 if logger:
-                    logger.log(f"safe_device_cmd: REFUSED {cmd} - target device is not verified bluejay")
-                return 1, "", "REFUSED: target is not verified bluejay (other-device)"
+                    logger.log(f"safe_device_cmd: REFUSED {cmd} - target device is not verified {TARGET}")
+                return 1, "", f"REFUSED: target is not verified {TARGET} (other-device)"
 
     return run_bounded(cmd, timeout_s=timeout_s, logger=logger)
 
@@ -533,10 +536,10 @@ def observe_state(logger=None):
         if logger:
             logger.log(f"observe_state: phone-state returned rc={rc_ps} state={ps_state} product={ps_prod}")
 
-        if ps_state in ("fastboot", "recovery", "android", "booting") and ps_prod == "bluejay":
+        if ps_state in ("fastboot", "recovery", "android", "booting") and ps_prod == TARGET:
             return ps_state
 
-        if ps_prod not in ("bluejay", "unknown"):
+        if ps_prod not in (TARGET, "unknown"):
             return "other-device"
 
     # Distinguish hung vs other-device vs absent
@@ -633,7 +636,7 @@ def cmd_goto(args, logger):
                 steps_done += 1
                 rc, _, err = safe_device_cmd(cmd, timeout_s=step_bound, logger=logger)
                 if "REFUSED" in err:
-                    return make_report(logger, "FAIL", "other-device", target, steps_done, ["Device is not bluejay"])
+                    return make_report(logger, "FAIL", "other-device", target, steps_done, [f"Device is not {TARGET}"])
                 state = observe_state(logger=logger)
                 if state == target:
                     return make_report(logger, "PASS", state, target, steps_done)

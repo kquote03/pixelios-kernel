@@ -17,6 +17,8 @@ import tempfile
 import time
 import unittest
 
+os.environ.pop("BOARD", None)   # the state-machine tests model the default target (bluejay)
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHONE_TOOL = os.path.join(REPO_ROOT, "tools", "phone")
 
