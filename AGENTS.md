@@ -16,7 +16,7 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
    bootloader unless the stock factory image is restored. Never flash an older bootloader than the phone has
    (anti-rollback). `userdata` is the only partition the iOS root may replace, and only after the user confirms.
 2. **The human runs the phone.** Run `adb`/`fastboot` only when the attached device reports the expected
-   `ro.product.device` / `product` (bluejay for the Pixel 6a). Any other phone attached is never touched. Anything needing root on the host is staged as a command for the user.
+   `ro.product.device` / `product` (bluejay for the Pixel 6a, oriole for the Pixel 6; the tools take it from `BOARD`, default bluejay, checked by `tools/boards.py --target`). Any other phone attached is never touched. Anything needing root on the host is staged as a command for the user.
 3. **Confirm each destructive step** (erase, flash, write to UFS) with the user right before running it. Earlier
    approval for a phase does not carry over.
 4. **No secrets or firmware in git.** Serial numbers, IMEI, partition dumps, backups, keys, camera credentials, Apple
@@ -37,6 +37,7 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
 |---|---|
 | Quality gate (must print `GATE PASS <hash>`) | `tools/check-all.sh` |
 | Build a probe/dump shim | `shim/build.sh --board bluejay --avb --pstore-fast [--usb-gadget] [--udump N_MIB]` |
+| Target another Pixel | `export BOARD=oriole` before any phone tool (`tools/boards.py --target` prints it) |
 | Build an XNU boot image | `tools/mkadt.py` -> `tools/mkpayload.py` -> `shim/build.sh --boot-xnu PAYLOAD` (see `docs/`) |
 | Kernel CI (macOS runner, ~8 min) | `gh workflow run xnu.yml` then `gh run download <id> -n xnu-kernel` |
 | Device helper | `tools/pix devices|info|check|build|new-device` |
