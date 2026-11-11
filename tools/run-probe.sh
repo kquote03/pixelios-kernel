@@ -1,5 +1,5 @@
 #!/bin/bash
-# One hardware experiment, no human needed (Pixel 6a "bluejay" only):
+# One hardware experiment, no human needed (the BOARD target phone only):
 #   tools/run-probe.sh IMAGE [CAPTURE_SECONDS]
 # adb reboot bootloader (or use the phone if already in fastboot) -> start the
 # USB serial capture -> fastboot boot IMAGE (temporary, nothing is flashed) ->
@@ -9,7 +9,7 @@
 # Needs a build with --usb-gadget; for fast cycles also --pstore-fast and
 # USB_WINDOW=90 (see shim/build.sh).
 set -u
-board=${BOARD:-bluejay}	# device codename the safety checks expect (tools/pix devices)
+board=$(python3 -I "$(dirname "$0")/boards.py" --target) || exit 2	# device codename the safety checks expect (tools/boards.py --target)
 cd "$(dirname "$0")/.." || exit 2
 img=${1:?usage: tools/run-probe.sh IMAGE [CAPTURE_SECONDS]}
 secs=${2:-300}

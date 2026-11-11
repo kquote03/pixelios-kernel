@@ -21,7 +21,7 @@ Subcommands:
                         `adb reboot bootloader` and wait for fastboot.
 
 stdlib only; no third-party packages. `run` refuses any device whose
-`fastboot getvar product` is not "bluejay" (docs/SAFETY.md).
+`fastboot getvar product` is not the target (tools/boards.py --target) (docs/SAFETY.md).
 """
 import argparse
 import datetime
@@ -38,6 +38,8 @@ MARKER = b"PIXELIOS PSTORE v1"
 PERSISTENT_RAM_SIG = 0x43474244  # 'DBGC' little-endian in memory
 BUFFER_HEADER = struct.Struct("<III")  # sig, start, size
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from tools import boards  # noqa: E402
 USAGE = "Pull the PixelOS probe shim log out of Android pstore after a warm reset."
 
 FASTBOOT_TIMEOUT_S = 60
@@ -170,9 +172,10 @@ def cmd_run(args) -> int:
     if r is None:
         return 2
     product = parse_product((r.stdout + r.stderr).decode("utf-8", "replace"))
-    if product != "bluejay":
+    target = boards.target_board()
+    if product != target:
         print(
-            f"REFUSING: fastboot getvar product reported {product!r}, expected 'bluejay'.\n"
+            f"REFUSING: fastboot getvar product reported {product!r}, expected {target!r}.\n"
             "docs/SAFETY.md: never run adb/fastboot against another device.",
             file=sys.stderr,
         )

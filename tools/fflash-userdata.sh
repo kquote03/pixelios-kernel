@@ -1,9 +1,10 @@
 #!/bin/bash
 # Flash the iOS root to userdata, once per image. DESTROYS userdata: pass --yes-erase-userdata after the user confirmed.
 #   tools/fflash-userdata.sh IMG --yes-erase-userdata [--force]
-# Refuses: a caller that does not hold the phone lock (TP-020), no IMG.sha256 / hash mismatch, the same image already flashed (state file) unless --force, not bluejay/unlocked.
+# Refuses: a caller that does not hold the phone lock (TP-020), no IMG.sha256 / hash mismatch, the same image already flashed (state file) unless --force, not the target phone (BOARD, default bluejay) / unlocked.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+board=$(python3 -I tools/boards.py --target) || exit 2	# the phone this tool may touch (tools/boards.py --target)
 img=""; yes=0; force=0
 for a in "$@"; do case "$a" in --yes-erase-userdata) yes=1 ;; --force) force=1 ;; *) img=$a ;; esac; done
 [ -f "$img" ] && [ -f "$img.sha256" ] || { echo "usage: $0 IMG --yes-erase-userdata (needs IMG.sha256)" >&2; exit 2; }
@@ -16,7 +17,7 @@ if [ "$force" = 0 ] && grep -q "^$got " "$state" 2>/dev/null; then
 tools/phone-lock check >&2 || { echo "REFUSED: the phone lock is not held by you (tools/phone-lock run --owner NAME -- CMD, or use tools/xrun / tools/probe-run, which take it after the build)" >&2; exit 1; }
 prod=$(timeout 15 fastboot getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
 unl=$(timeout 15 fastboot getvar unlocked 2>&1 | sed -n 's/^unlocked: *//p' | head -1)
-[ "$prod" = bluejay ] && [ "$unl" = yes ] || { echo "REFUSED: product='$prod' unlocked='$unl'" >&2; exit 1; }
+[ "$prod" = "$board" ] && [ "$unl" = yes ] || { echo "REFUSED: product='$prod' unlocked='$unl'" >&2; exit 1; }
 # M7 (docs/PLAN-BOOT-SPEED.md): keep fastboot's own output and print what was really sent, to settle whether holes in the image are skipped
 mkdir -p logs; fl=logs/flash-$(date -u +%Y%m%dT%H%M%SZ).log; t0=$(date +%s)
 fastboot flash userdata "$img" 2>&1 | tee "$fl"; el=$(( $(date +%s) - t0 ))

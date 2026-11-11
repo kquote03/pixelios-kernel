@@ -24,7 +24,7 @@ main() {
 		[ "$st" = "$last" ] || { echo "+${SECONDS}s $st"; last=$st; }
 		case "$st" in
 			"$expect") echo "RESULT: PASS state=$st after ${SECONDS}s"; exit 0 ;;
-			other) echo "RESULT: ERROR state=other (not a bluejay; not touched)"; exit 2 ;;
+			other) echo "RESULT: ERROR state=other (not the target phone; not touched)"; exit 2 ;;
 			recovery|android) # the software-reset landing; "android" = adb up
 				if [ "$expect" = fastboot ] && [ $tried = 0 ]; then
 					tried=1; echo "+${SECONDS}s to-fastboot.sh"

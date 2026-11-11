@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-shot XNU boot image for bluejay: payload (kernel + ADT + boot-args) + shim, written to shim/out/shim-boot-avb.img.
+# One-shot XNU boot image for the target board (--board, else BOARD, default bluejay): payload (kernel + ADT + boot-args) + shim, written to shim/out/shim-boot-avb.img.
 #   tools/build-xnu-image.sh [--kernel K] [--adt A] [--qr SECONDS|off] [--rw] [--args "extra boot-args"] [--out FILE]
 #   --qr off     (default) no QR takeover: the screen keeps the iOS GUI; use this for GUI runs
 #   --qr 40      QR log loop takes over the screen 40 s after the root mount starts (read with tools/qr-log.py --esp)
@@ -16,16 +16,18 @@
 #   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, private notes) and boot-arg sweetwlan=1 (xnu patch 0124: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
 #   --wlanfw FILE  BCM4389 firmware container (tools/pack_wlanfw.py) appended to the payload as /chosen/memory-map WLANFW (needs --wlan-hold; xnu patch 0121 only checks it)
 #   --overlay DIR  dev overlay (docs/AUTOMATION.md): pack DIR with tools/mkdevoverlay.py, add it as the payload RAM disk and sweetdev=1 (xnu patch 0117)
+#   --board B    device codename (tools/pix devices); without --adt the ADT is generated for it with tools/mkadt.py
 #   --rw         ufsrw=1 rootrw=1 (UFS writes inside userdata, needed to initialise the HFS journal)
 # Never use --pstore-fast here: this bootloader silently rejects the lz4 image (docs/HANDOFF.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
-kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; dvfs=""; restart=""; cpus=1; extra=""; out=""; overlay=""; wlanfw=""; wlan=0; wlanlvl=1
+kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; dvfs=""; restart=""; cpus=1; extra=""; out=""; overlay=""; wlanfw=""; wlan=0; wlanlvl=1; board=""; adt_given=0
 while [ $# -gt 0 ]; do case "$1" in
-	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --qr) qr=$2; shift 2 ;;
+	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; adt_given=1; shift 2 ;; --board) board=$2; shift 2 ;; --qr) qr=$2; shift 2 ;;
 	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --wlan-hold) wlan=1; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --gpu-handover) handover=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --wlanfw) wlanfw=$2; shift 2 ;;
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
+export BOARD=${board:-${BOARD:-}}; board=$(python3 -I tools/boards.py --target) || exit 2
 [ -z "$wlanfw" ] || [ "$wlan" = 1 ] || { echo "--wlanfw needs --wlan-hold" >&2; exit 2; }
 case "$wlanlvl" in 1|2) ;; *) echo "--wlan-level needs 1 or 2" >&2; exit 2 ;; esac
 [ "$wlan" = 1 ] || [ "$wlanlvl" = 1 ] || { echo "--wlan-level needs --wlan-hold" >&2; exit 2; }
@@ -46,10 +48,11 @@ railsarg=(); words=""; dvfsarg=(); hoarg=(); [ "$handover" = 0 ] || hoarg=(--gpu
 if [ "$dvfs" = read ]; then words="${words:+$words,}dvfsr"
 elif [ -n "$dvfs" ]; then words="${words:+$words,}dvfs"; dvfsarg=(--dvfs "$dvfs"); fi
 [ -z "$words" ] || railsarg=(--touch-probe="$words")
-p=$(mktemp /tmp/payload.XXXXXX.bin); ov=""; rdarg=(); trap 'rm -f "$p" "$ov"' EXIT
+p=$(mktemp /tmp/payload.XXXXXX.bin); ov=""; genadt=""; rdarg=(); trap 'rm -f "$p" "$ov" "$genadt"' EXIT
 if [ -n "$overlay" ]; then ov=$(mktemp /tmp/devoverlay.XXXXXX.bin); python3 -I tools/mkdevoverlay.py "$overlay" "$ov" >&2 || exit 2; rdarg=(--ramdisk "$ov"); fi
 [ -z "${XNU_IMAGE_ARGS_ONLY:-}" ] || { echo "boot-args: $args"; exit 0; }   # test hook (tools/test_build_overlay_args.py)
-python3 -I tools/mkpayload.py "$kernel" "$adt" "$p" --board bluejay --cmdline "$args" "${rdarg[@]}" ${wlanfw:+--wlanfw "$wlanfw"} >/dev/null
-META_ARGS="$args" XNU_UFS=1 shim/build.sh --board bluejay --avb --boot-xnu "$p" "${railsarg[@]}" "${dvfsarg[@]}" "${hoarg[@]}" >/dev/null
+if [ "$adt_given" = 0 ]; then genadt=$(mktemp /tmp/adt.XXXXXX.adt); python3 -I tools/mkadt.py "$genadt" --board "$board" >/dev/null || exit 2; adt=$genadt; fi
+python3 -I tools/mkpayload.py "$kernel" "$adt" "$p" --board "$board" --cmdline "$args" "${rdarg[@]}" ${wlanfw:+--wlanfw "$wlanfw"} >/dev/null
+META_ARGS="$args" XNU_UFS=1 shim/build.sh --board "$board" --avb --boot-xnu "$p" "${railsarg[@]}" "${dvfsarg[@]}" "${hoarg[@]}" >/dev/null
 [ -z "$out" ] || cp shim/out/shim-boot-avb.img "$out"
 echo "boot-args: $args"; echo "image: ${out:-shim/out/shim-boot-avb.img}"
