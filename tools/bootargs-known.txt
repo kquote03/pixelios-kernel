@@ -492,8 +492,12 @@ sweettouch	patch:0088
 sweettouchclk	patch:0089
 sweettouchcs	patch:0095
 sweettouchdelay	patch:0088
+sweettouchidretry	patch:0145
+sweettouchidwait	patch:0145
 sweettouchmux	patch:0088
 sweettouchpoke	patch:0093
+sweettouchspi4	patch:0145
+sweettouchsysinfo	patch:0145
 sweettouchvar	patch:0090
 sweetusb	patch:0070
 sweetusbdma	patch:0082
