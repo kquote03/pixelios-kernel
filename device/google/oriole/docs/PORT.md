@@ -7,21 +7,22 @@ Tags: observed on hardware (with run label and shim build id), read from source,
 | Item | Value | Tag |
 |---|---|---|
 | Android build / bootloader | CP1A.260405.005 / slider-16.4-14548185 | observed 2026-11-11 via adb getprop |
+| Bootloader after unlock | unlocked, slider-17.0-15681480, slot b (OrangeFox recovery installed by the user) | observed 2026-11-12 via fastboot getvar |
 | RAM / UFS | 8 GiB LPDDR5 / 128 GB SK hynix | observed 2026-11-11 via adb getprop |
 
 ## Measurements (Part H of the port plan)
 
 | board.json key | Value | Run label | Shim build id |
 |---|---|---|---|
-| dram_banks | TBD | TBD | TBD |
-| usb_dma_range | TBD | TBD | TBD |
-| fb_base (text visible on screen) | TBD | TBD | TBD |
-| userdata_mib | TBD | TBD | TBD |
+| dram_banks | 0x80000000 + 2 GiB; 0x880000000 + 6 GiB (3 x 2 GiB contiguous), no carve-out above 0x880000000 | oriole-probe1 | git 36cacae, sha256 981284da |
+| usb_dma_range | abl@f8800000, 16 MiB; GEVNTADR 0xF8D1B000 inside | oriole-probe1 | git 36cacae, sha256 981284da |
+| fb_base (text visible on screen) | 0xfac00000, text seen by the user | oriole-probe1 | git 36cacae, sha256 981284da |
+| userdata_mib | 112914 (GPT first=0x22F1E6 last=0x1DC03FA, same as bluejay) | oriole-probe1 | git 36cacae, sha256 981284da |
 
 ## Gates
 
 | Gate | Result | Run label | Date |
 |---|---|---|---|
-| G1 probe shim boots, USB log complete | TBD | | |
+| G1 probe shim boots, USB log complete | PASS (observed: all 8 CPUs, FDT, UFS GPT read, USB sections; 448 lines) | oriole-probe1 | 2026-11-12 |
 | G2 XNU boots, USB Ethernet configured | TBD | | |
 | G3 iOS lock screen and touch | TBD | | |

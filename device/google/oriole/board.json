@@ -2,44 +2,98 @@
   "name": "Pixel 6",
   "codename": "oriole",
   "soc": "google/gs101",
-  "status": "bring-up: not yet booted (see docs/PORT.md)",
-  "provisional": ["dram_banks", "usb_dma_range", "fb_base"],
+  "status": "bring-up: probe shim observed 2026-11-12 (run oriole-probe1); XNU not yet booted",
   "dram_banks": [
-    ["0x80000000", "0x80000000"],
-    ["0x880000000", "0x180000000"]
+    [
+      "0x80000000",
+      "0x80000000"
+    ],
+    [
+      "0x880000000",
+      "0x180000000"
+    ]
   ],
-  "xnu_ram": ["0x880000000", "0x100000000"],
+  "xnu_ram": [
+    "0x880000000",
+    "0x100000000"
+  ],
   "fb_base": "0xfac00000",
   "fb_size": "0x9e3400",
   "fb_width": 1080,
   "fb_height": 2400,
   "fb_stride": 4320,
   "key_pins": [
-    [0, "0x174D0000", "0xE0", 1],
-    [1, "0x174E0000", "0x40", 1],
-    [2, "0x174E0000", "0x20", 3]
+    [
+      0,
+      "0x174D0000",
+      "0xE0",
+      1
+    ],
+    [
+      1,
+      "0x174E0000",
+      "0x40",
+      1
+    ],
+    [
+      2,
+      "0x174E0000",
+      "0x20",
+      3
+    ]
   ],
   "key_active_low": 1,
-  "usb_dma_range": ["0xf8800000", "0x1000000"],
-  "touch_chip_id": ["0x36", "0x48"],
+  "usb_dma_range": [
+    "0xf8800000",
+    "0x1000000"
+  ],
+  "touch_chip_id": [
+    "0x36",
+    "0x48"
+  ],
   "touch_usi": 11,
   "touch_max_hz": 10000000,
-  "touch_max_coords": [1079, 2399],
+  "touch_max_coords": [
+    1079,
+    2399
+  ],
   "touch_spi_pin_func": 2,
-  "touch_pin_clk": ["gpp23", 0],
-  "touch_pin_mosi": ["gpp23", 1],
-  "touch_pin_miso": ["gpp23", 2],
-  "touch_pin_cs": ["gpp23", 3],
-  "touch_pin_irq": ["gpa9", 0],
-  "touch_pin_reset": ["gpp26", 0],
-  "touch_pin_mux": ["gpp26", 1],
+  "touch_pin_clk": [
+    "gpp23",
+    0
+  ],
+  "touch_pin_mosi": [
+    "gpp23",
+    1
+  ],
+  "touch_pin_miso": [
+    "gpp23",
+    2
+  ],
+  "touch_pin_cs": [
+    "gpp23",
+    3
+  ],
+  "touch_pin_irq": [
+    "gpa9",
+    0
+  ],
+  "touch_pin_reset": [
+    "gpp26",
+    0
+  ],
+  "touch_pin_mux": [
+    "gpp26",
+    1
+  ],
   "notes": {
-    "provisional": "Keys not measured on an oriole yet. tools/mkpayload.py refuses to build an XNU payload while this list is not empty. Each key leaves the list only with a probe-run label (docs/PORT.md).",
-    "dram_banks": "GUESS from FDT node names memory@80000000, memory@880000000, memory@900000000, memory@980000000 (observed via adb ls /proc/device-tree on 2026-11-11, Android CP1A.260405.005, bootloader slider-16.4-14548185; sizes need root) and ro.boot.hardware.ddr=8GiB: 4 x 2 GiB, the high three contiguous and merged here. Measure with the probe's 'FDT memory' section.",
+    "dram_banks": "OBSERVED on the phone (run oriole-probe1 (2026-11-12, probe shim git 36cacae, image sha256 981284da), capture device/google/oriole/hardware/probe-log-2026-11-12-oriole-probe1.txt): /memory banks 0x80000000, 0x880000000, 0x900000000, 0x980000000, 2 GiB each; the high three are contiguous and merged here; no reserved range lies above 0x880000000. Android CP1A.260405.005, bootloader slider-17.0-15681480.",
     "xnu_ram": "Deliberately the same 4 GiB window as bluejay (the XNU memory path is observed only with this size); it must lie inside a hole-free bank with no reserved range inside. Growing it to 6 GiB is a later, separate change.",
-    "fb_base": "read from source: mainline Linux gs101-oriole.dts cont_splash_mem reg <0x0 0xfac00000 (1080*2400*4)>, framebuffer0 width 1080 height 2400 stride 1080*4 a8r8g8b8. Provisional until the probe shim's text is seen on the oriole screen.",
-    "usb_dma_range": "FDT node reserved-memory/abl@f8800000 exists (observed by name via adb, 2026-11-11); the size 16 MiB is bluejay's. Measure with the probe's 'FDT reserved abl@f8800000' lines and 'USB EVBUF in reserved abl@f8800000'.",
+    "fb_base": "OBSERVED on the phone (run oriole-probe1, 2026-11-12, probe shim git 36cacae): the shim draws its console at 0xfac00000 (FDT has no framebuffer node: 'FB board fallback') and the user saw the text on screen. Source: mainline Linux gs101-oriole.dts cont_splash_mem reg <0x0 0xfac00000 (1080*2400*4)>, framebuffer0 1080x2400 stride 1080*4 a8r8g8b8.",
+    "usb_dma_range": "OBSERVED on the phone (run oriole-probe1 (2026-11-12, probe shim git 36cacae, image sha256 981284da), capture device/google/oriole/hardware/probe-log-2026-11-12-oriole-probe1.txt): reserved-memory abl@f8800000, no-map, 16 MiB (same as bluejay); ABL's DWC3 event buffer GEVNTADR 0xF8D1B000 (4 KiB) lies inside it ('USB EVBUF in reserved abl@f8800000').",
     "key_pins": "read from source: same gpio-keys as bluejay. Google raviole gs101-oriole-common.dtsi -> gs101-raviole.dtsi:8 includes gs101/gs101-common.dtsi (bluejay: gs101-bluejay.dtsi:8, the same file); mainline gs101-pixel-common.dtsi gpio-keys (gpa7-3, gpa8-1, gpa10-1, GPIO_ACTIVE_LOW) is the oriole tree. Bank offsets as in device/google/bluejay/board.json notes.",
-    "touch": "read from source: Google kernel/devices/google/raviole android-gs-raviole-6.1-android16 dts/gs101-oriole-touch.dtsi (st,dchip_id 0x36 0x48, st,max-coords 1079 2399, firmware ftm5_fw_o6.ftb) includes gs101/gs101-fts-touch.dtsi (st,irq-gpio gpa9 0, st,reset-gpio gpp26 0, CS gpp23-3, spi-max-frequency 10 MHz), which includes gs101-common-touch.dtsi:8-15 (SPI gpp23-0..2, TS_SPI_SEL gpp26-1, DVDD LDO25M, AVDD LDO26M). Same files as bluejay; only the panel map and IC firmware name differ."
-  }
+    "touch": "read from source: Google kernel/devices/google/raviole android-gs-raviole-6.1-android16 dts/gs101-oriole-touch.dtsi (st,dchip_id 0x36 0x48, st,max-coords 1079 2399, firmware ftm5_fw_o6.ftb) includes gs101/gs101-fts-touch.dtsi (st,irq-gpio gpa9 0, st,reset-gpio gpp26 0, CS gpp23-3, spi-max-frequency 10 MHz), which includes gs101-common-touch.dtsi:8-15 (SPI gpp23-0..2, TS_SPI_SEL gpp26-1, DVDD LDO25M, AVDD LDO26M). Same files as bluejay; only the panel map and IC firmware name differ.",
+    "userdata_mib": "OBSERVED on the phone (run oriole-probe1 (2026-11-12, probe shim git 36cacae, image sha256 981284da), capture device/google/oriole/hardware/probe-log-2026-11-12-oriole-probe1.txt): GPT entry userdata first=0x22F1E6 last=0x1DC03FA on LUN 0 = 28906005 x 4 KiB = 112914 MiB; identical to bluejay's GPT layout (128 GB UFS)."
+  },
+  "userdata_mib": 112914
 }
