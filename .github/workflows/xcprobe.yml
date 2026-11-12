@@ -1,0 +1,11 @@
+name: xcprobe
+on: workflow_dispatch
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: ls -d /Applications/Xcode*.app; sw_vers
