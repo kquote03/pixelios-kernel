@@ -415,6 +415,24 @@ The whole boot-args line is 607 characters; `tools/mkpayload.py` now exits with 
 `bsd/dev/sweet_touch_poke.h`, tested by `shim/touchpoke_host_test.c`. Run on hardware (2026-10-22, runs touchx3 and later: `poke: 3 ops` lines, reads back the written values); a string without the final `;` is rejected (AP-10).
 Order is MASK before VAL: "bit4 := 0" is `m:10c00640=10=0;`, the oscillator recipe of patch 0095 is `m:10c00640=10=0;d:100;m:10c0180c=f=5;`. The string `m:10c00640=0=10;d:100;m:10c0180c=5=f;` in the 0095 header comment is wrong (MASK 0 = no-op; *observed* in runs oriole-gui3/gui4: `mask 0: 0x10 -> wrote 0x10`); `tools/run-preflight` now fails any `m:` op with MASK 0.
 
+## FTM5 post-reset steps: `sweettouchsysinfo=`, `sweettouchspi4=`, `sweettouchidwait=`, `sweettouchidretry=` (xnu patch 0145)
+
+All default 0 (the patch 0095 path, unchanged). The first two need `sweettouchcs=1` (they run after its controller-ready event, else one
+`skipped` line); order: sysinfo, spi4, idwait, identify, retries. Sources (*read from source*, fts_touch f87fd67 `ftm5/`): Linux probe =
+`fts_system_reset` (reset gpio low, 10 ms, high, poll the FIFO for `03 00`, ftsCore.c:66-108) then `readSysInfo(info, 0)` (fts.c:5343-5352),
+a framebuffer read `A7 00 00` + 1 dummy (ftsCore.c:557-559); Linux never reads DCHIP_ID 0x20000000 at probe. The SPI4 write (ICR 0x2000002D
+:= 0x02) exists only in `hold_m3` of the flash path (ftsFlash.c:283-343, "when no fw is running the chip use SPI3 by default"), after
+`fts_system_reset`, 100 ms and the M3 hold (ftsFlash.c:1046-1062).
+- `sweettouchsysinfo=1`: read 18 bytes of System Info, lines `sysinfo raw: ..` and `sysinfo: signature a5? type 01? chip0Id .. fwVer ..`. Read only.
+- `sweettouchspi4=1` ICR only; `=2` GPIO dir 0x10, pull-up 0x02, config3 0x70 (ALIX 36 48), config0 0x30, ICR 0x02, 1 ms; `=3` 100 ms + hold M3
+  (`FA 20 00 00 24 01`) + the block of 2 (firmware stopped; phase 2 pulses the reset again). Lines `spi4: <step> [addr] := val (6 bytes): sent`
+  and `spi4: ICR [0x2000002d] before|after = 0x..`.
+- `sweettouchidwait=0..1000` ms before each identify; `sweettouchidretry=0..5` extra identifies while it does not match (`idretry k/N`).
+  Out-of-range values: one `refused ...` line, all four off.
+Oriole recipe, one variable per run vs oriole-gui5 (CR-08), each with `--rails`:
+A (read-only additions) `sweettouchmux=1 sweettouchcs=1 sweettouchsysinfo=1 sweettouchidwait=100 sweettouchidretry=3 sweettouchpoke=m:10c00640=10=0;d:100;m:10c0180c=f=5;`;
+B = A + `sweettouchspi4=2` (changed vs A: SPI4 block); C = A + `sweettouchspi4=3` (changed vs B: M3 hold). Status: not run (no device result yet).
+
 ## tools/probe-run: one shim probe cycle, one report
 
 ```
