@@ -24,5 +24,5 @@ Tags: observed on hardware (with run label and shim build id), read from source,
 | Gate | Result | Run label | Date |
 |---|---|---|---|
 | G1 probe shim boots, USB log complete | PASS (observed: all 8 CPUs, FDT, UFS GPT read, USB sections; 448 lines) | oriole-probe1 | 2026-11-12 |
-| G2 XNU boots, USB Ethernet configured | TBD | | |
+| G2 XNU boots, USB Ethernet configured | PASS (observed: Darwin 22.6.0 xnu-8796.141.3 from CI kernel 04457e5 sha256 26d6679c, 1 CPU, USB ECM 192.168.7.2 with DMA in ABL's pool 0xf8d1b000, UFS userdata LUN 0 first block 0x22f1e6 112914 MiB; root mount refused as expected: userdata still Android, HFS signature 0x994d) | oriole-xnu3 (also xnu1, xnu2) | 2026-11-12 |
 | G3 iOS lock screen and touch | TBD | | |

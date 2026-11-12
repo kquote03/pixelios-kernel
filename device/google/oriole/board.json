@@ -2,7 +2,7 @@
   "name": "Pixel 6",
   "codename": "oriole",
   "soc": "google/gs101",
-  "status": "bring-up: probe shim observed 2026-11-12 (run oriole-probe1); XNU not yet booted",
+  "status": "bring-up: XNU boots to the root mount, observed 2026-11-12 (run oriole-xnu3); iOS root not flashed yet",
   "dram_banks": [
     [
       "0x80000000",
