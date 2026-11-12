@@ -2,7 +2,7 @@
   "name": "Pixel 6",
   "codename": "oriole",
   "soc": "google/gs101",
-  "status": "bring-up: XNU boots to the root mount, observed 2026-11-12 (run oriole-xnu3); iOS root not flashed yet",
+  "status": "bring-up: iOS lock screen observed 2026-11-12 (run oriole-gui1); touch not yet working",
   "dram_banks": [
     [
       "0x80000000",
