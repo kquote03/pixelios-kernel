@@ -8,7 +8,7 @@
 Checks (each names the antipattern that motivates it; SKIP = not enough verified information, never a silent pass):
   bootargs  xrun --args: every boot-arg NAME is parsed somewhere (tools/bootargs-known.txt, generated from pristine xnu-8796 +
             xnu/patches; tools/bootargs-extra.txt = hand-added names, each with a citation). A grep is a start, not proof.
-  syntax    xrun --args: sweettouchpoke= must end with ';' (AP-10, patch 0093)
+  syntax    xrun --args: sweettouchpoke= must end with ';' (AP-10, patch 0093); an m:ADDR=MASK=VAL op with MASK 0 is a no-op (runs oriole-gui3/4)
   reach     every --expect row is < every accepted stop row (a pattern with "stopped=" and row=N|M) (AP-27)
   timeout   probe-run --timeout (or the tools/probe-run default) >= max earlier wall of runs with the same build-arg option names
             (tools/runs stats --args --all-worktrees; probe-run writes run.args since review B2) + --margin (default 60 s, a guess) (AP-14/AP-22)
@@ -158,6 +158,19 @@ def c_syntax(tool, o):
     for tok in o["--args"][-1].split():
         if tok.startswith("sweettouchpoke=") and not tok.endswith(";"):
             return "FAIL", "sweettouchpoke= value must end with ';' (AP-10)"
+        if tok.startswith("sweettouchpoke="):
+            # m:ADDR=MASK=VAL writes (old & ~MASK) | (VAL & MASK) (patch 0093 sweet_touch_poke.h): MASK 0 is a silent no-op.
+            # Observed: runs oriole-gui3/gui4 used m:10c00640=0=10 meaning "bit4 := 0" and logged "mask 0: 0x10 -> wrote 0x10".
+            for op in tok.split("=", 1)[1].split(";"):
+                f = op.split(":", 1)
+                if f[0] == "m" and len(f) == 2:
+                    p = f[1].split("=")
+                    try:
+                        mask = int(p[1], 16) if len(p) == 3 else None
+                    except ValueError:
+                        mask = None
+                    if mask == 0:
+                        return "FAIL", "sweettouchpoke op %s has MASK 0 and changes nothing (form m:ADDR=MASK=VAL)" % op
     return "PASS", ""
 
 

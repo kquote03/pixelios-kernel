@@ -4,7 +4,7 @@ import importlib.machinery, importlib.util, json, os, subprocess, sys, tempfile,
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "run-preflight")
-GOOD = "debug=0xc cpus=8 -noprogress sweettouchpoke=m:10c00640=0=10;d:100;m:10c0180c=5=f;"
+GOOD = "debug=0xc cpus=8 -noprogress sweettouchpoke=m:10c00640=10=0;d:100;m:10c0180c=f=5;"
 
 
 def put(path, text):
@@ -50,6 +50,13 @@ class T(unittest.TestCase):
         rc, out = self.xrun("sweettouchpoke=m:10c0180c=5=f")
         self.assertEqual(rc, 1, out)
         self.assertIn("RESULT: FAIL syntax:", out)
+
+    def test_poke_mask_zero_is_noop(self):
+        # runs oriole-gui3/gui4: "m:10c00640=0=10" was meant as bit4 := 0 but MASK 0 writes the old value back
+        rc, out = self.xrun("sweettouchpoke=m:10c00640=0=10;d:100;m:10c0180c=5=f;")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL syntax:", out)
+        self.assertIn("m:10c00640=0=10", out)
 
     def test_unknown_bootarg(self):
         rc, out = self.xrun(GOOD + " nosuchthing=1")
