@@ -413,6 +413,7 @@ CMU_PERIC1 and CMU_TOP are read-only except the words in the ADT: PERIC1 usi mux
 and DIV (OPTION never), TOP mux/div/gate. Max 32 ops, 240 characters; anything bad prints one `poke: rejected (...)` line and runs nothing.
 The whole boot-args line is 607 characters; `tools/mkpayload.py` now exits with an error beyond that. Parser and range table:
 `bsd/dev/sweet_touch_poke.h`, tested by `shim/touchpoke_host_test.c`. Run on hardware (2026-10-22, runs touchx3 and later: `poke: 3 ops` lines, reads back the written values); a string without the final `;` is rejected (AP-10).
+Order is MASK before VAL: "bit4 := 0" is `m:10c00640=10=0;`, the oscillator recipe of patch 0095 is `m:10c00640=10=0;d:100;m:10c0180c=f=5;`. The string `m:10c00640=0=10;d:100;m:10c0180c=5=f;` in the 0095 header comment is wrong (MASK 0 = no-op; *observed* in runs oriole-gui3/gui4: `mask 0: 0x10 -> wrote 0x10`); `tools/run-preflight` now fails any `m:` op with MASK 0.
 
 ## tools/probe-run: one shim probe cycle, one report
 
