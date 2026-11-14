@@ -52,6 +52,14 @@ class SweetWlanNode(unittest.TestCase):
         self.assertEqual(p["tcm"], mkadt.u64(int(w["tcm"], 0), int(w["tcm_bytes"], 0)))
         self.assertEqual(p["atu-r2-off"], mkadt.u32(int(w["atu_r2_off"], 0)))
 
+    def test_oriole_node_equals_bluejay(self):
+        # the XNU driver pins the bluejay addresses (CR-19/CR-20); oriole shares soc.json and has no wlan key of its own
+        self.assertIsNotNone(wlan_node("oriole"))
+        self.assertEqual(wlan_node("oriole"), wlan_node("bluejay"))
+        import json
+        with open(os.path.join(ROOT, "device", "google", "oriole", "board.json")) as f:
+            self.assertNotIn("wlan", json.load(f))
+
     def test_pinned_values_of_the_xnu_driver(self):
         # bsd/dev/sweet_wlan.c refuses any other value (CR-19/CR-20): the observed bluejay addresses, and the SW_* pins of patch 0124 equal them
         w = boards.BOARDS["bluejay"]["wlan"]

@@ -22,6 +22,13 @@ class WlanPins(unittest.TestCase):
         for k, v in PINS.items():
             self.assertIn(f"#define WLAN_{k} {v:#x}UL", h, k)
 
+    def test_oriole_has_the_same_macros(self):
+        # oriole: same SoC and the same gs101-common-wlan.dtsi (pcie_1, wl_reg_on gpp14-2, PERST gph2-0; read from source, 2026-11-14 plan
+        # section 8); the stock recovery capture (oriole-ref1) shows 14520000.pcie with 1 lane, bound to its S2MPU (observed)
+        h = boards.c_header("oriole")
+        for k, v in PINS.items():
+            self.assertIn(f"#define WLAN_{k} {v:#x}UL", h, k)
+
     def test_the_writer_pins_are_in_one_pinctrl_bank(self):
         self.assertLess(PINS["GPP14_EN_PIN"], 4)	# gpp14 has 4 pins (pinctrl-exynos-arm64.c:988)
         self.assertLess(PINS["GPH2_PERST_PIN"], 6)	# gph2 has 6 pins (:1016)
