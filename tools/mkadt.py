@@ -77,6 +77,120 @@ def fake_mac(kind):
     return bytes([0x02, e[0], e[1], e[2], e[3], (e[4] + kind) & 0xff])
 
 
+# xnu patch 0148 (bsd/dev/sweet_hsi2c_fg.h, boot-arg sweetbatt=1): the READ-only fuel-gauge reader over HSI2C12. The controller constants come
+# from soc.json "hsi2c" / "peri" (cites: soc.json notes.hsi2c / notes.peri), the gauge and the observed bootloader handoff words from board.json
+# "fg" (notes.fg). The device allowlist is pinned HERE and in the patch header: exactly one 7-bit address (0x36, the MAX77759 fuel gauge) and
+# exactly these seven registers in this order; anything else in board.json is refused, so a typo can never address the charger (0x69), the PMIC
+# (0x66), the TCPC (0x25), the OVP (0x35) or the direct charger (0x57).
+FG_ADDR7 = 0x36
+FG_REGS = (("REPSOC", 0x06), ("TEMP", 0x08), ("VCELL", 0x09), ("CURRENT", 0x0A), ("AVGCURRENT", 0x0B), ("FULLCAPREP", 0x35),
+           ("DEVNAME", 0x21))	# BMS max_m5_reg.h:209,219,224,229,234,894,548
+_FG_FORBIDDEN = (0x25, 0x35, 0x57, 0x66, 0x69)	# the other devices on hsi2c_12 (board.json notes.fg)
+# unit formulas of the Google maxfg driver (bms 183509a): VCell uV = val * 78125 / 1000 (maxfg_common.h:192-196) -> 78125 nV per LSB; RepSOC
+# 1/256 % (:210-214); Temp 1/256 degC (:198-202); current uA = s16 * 156250 / rsense, rsense in 10 uOhm (max1720x_battery.c:473-477)
+_FG_VCELL_NV_PER_LSB = 78125
+_FG_LSB_PER_PCT = 256
+_FG_LSB_PER_C = 256
+_FG_CURR_NV_UOHM = 156250
+_HSI2C_REGS = ("ctl", "fifo_ctl", "trailing_ctl", "int_enable", "int_status", "err_status", "fifo_status", "tx_data", "rx_data", "conf", "auto_conf",
+               "timeout", "trans_status", "addr", "usi_con")
+_HSI2C_BITS = ("ctl_master", "ctl_rxchon", "ctl_txchon", "fifo_rxfifo_en", "fifo_txfifo_en", "int_tx_underrun", "int_tx_overrun", "int_rx_underrun",
+               "int_rx_overrun", "int_trans_done", "int_trans_abort", "int_no_dev_ack", "int_no_dev", "int_timeout", "fifo_tx_full", "fifo_tx_empty",
+               "fifo_rx_full", "fifo_rx_empty", "conf_hs_mode", "conf_10bit_addr", "conf_auto_mode", "auto_read_write", "auto_stop_after_trans",
+               "auto_master_run", "timeout_en", "trans_slave_busy", "trans_master_busy", "usi_con_reset")
+_HSI2C_FIELDS = ("fifo_rx_trig_shift", "fifo_tx_trig_shift", "fifo_rx_lvl_shift", "fifo_lvl_mask", "auto_len_mask", "addr_mas_shift", "addr_field_mask",
+                 "trans_st_mask", "st_idle", "st_init", "st_no_ack", "st_lose", "trailing_count", "tx_fifo_depth", "pad_func")
+_FG_HANDOFF = ("ctl", "fifo_ctl", "trailing_ctl", "int_enable", "conf", "auto_conf", "timeout", "addr", "usi_con")
+
+
+def _n(v):
+    return int(v, 0) if isinstance(v, str) else v
+
+
+def sweet_batt_props(config):
+    """The properties of /sweet-batt as [(name, bytes)] (without the phandle), or None for a board without an fg block.
+    Raises ValueError on anything outside the allowlist or inconsistent between the tables."""
+    fg = config.get('fg')
+    if not fg:
+        return None
+    hs, peri = config['hsi2c'], config['peri']
+    area = [a for a in peri['areas'] if a['name'] == fg.get('bus')]
+    if fg.get('bus') != 'i2c12' or len(area) != 1 or area[0]['kind'] != 'i2c':
+        raise ValueError(f"fg.bus {fg.get('bus')!r}: only 'i2c12' (USI12 / HSI2C) is supported")
+    area = area[0]
+    addr = _n(fg['addr7'])
+    if addr in _FG_FORBIDDEN or addr != FG_ADDR7:
+        raise ValueError(f"fg.addr7 {addr!r}: the allowlist is exactly {{{FG_ADDR7:#x}}}")
+    regs = tuple((n, _n(o)) for n, o in fg['regs'])
+    if regs != FG_REGS:
+        raise ValueError(f"fg.regs: the allowlist is exactly {FG_REGS}")
+    rs = fg['rsense_10uohm']
+    if not isinstance(rs, int) or not 1 <= rs <= 10000 or (_FG_CURR_NV_UOHM * 1000) % rs:
+        raise ValueError(f"fg.rsense_10uohm {rs!r}: want 1..10000 dividing {_FG_CURR_NV_UOHM * 1000} (an exact nA per LSB)")
+    # one register map: hsi2c.regs_off must equal peri.regs.i2c (and the two FIFO data registers peri.fifo_offs.i2c)
+    ro = hs['regs_off']
+    if tuple(ro) != _HSI2C_REGS:
+        raise ValueError(f"hsi2c.regs_off: want exactly {_HSI2C_REGS} in this order")
+    peri_i2c = {n: int(o, 0) for n, o in peri['regs']['i2c']}
+    fifo = [int(o, 0) for o in peri['fifo_offs']['i2c']]
+    offs = {}
+    for k in _HSI2C_REGS:
+        off = int(ro[k], 0)
+        if off & 3 or off >= 0x100:
+            raise ValueError(f"hsi2c.regs_off.{k}: {off:#x} not an aligned offset below 0x100")
+        if k in ("tx_data", "rx_data"):
+            if off != fifo[("tx_data", "rx_data").index(k)]:
+                raise ValueError(f"hsi2c.regs_off.{k}: {off:#x} differs from peri.fifo_offs.i2c")
+        elif peri_i2c.get("USI_CON" if k == "usi_con" else "HSI2C_" + k.upper()) != off:
+            raise ValueError(f"hsi2c.regs_off.{k}: {off:#x} differs from peri.regs.i2c")
+        offs[k] = off
+    if set(hs['bits']) != set(_HSI2C_BITS) or set(hs['fields']) != set(_HSI2C_FIELDS):
+        raise ValueError("hsi2c.bits / hsi2c.fields: want exactly the names the patch header reads")
+    for k, b in hs['bits'].items():
+        if not isinstance(b, int) or not 0 <= b < 32:
+            raise ValueError(f"hsi2c.bits.{k}: want a bit number 0..31")
+    flds = {k: _n(v) for k, v in hs['fields'].items()}
+    for k, v in flds.items():
+        if not isinstance(v, int) or not 0 <= v <= 0xffffffff:
+            raise ValueError(f"hsi2c.fields.{k}: want a 32-bit number")
+    # the two I2C pads: one bank (soc.json <bank>_bank), CON / DAT offsets of peri.pad_off
+    pins = {p[0].rsplit('_', 1)[-1]: p for p in peri['pins'] if p[3] == fg['bus']}
+    if set(pins) != {"SCL", "SDA"} or pins["SCL"][1] != pins["SDA"][1]:
+        raise ValueError("peri.pins: the fuel-gauge bus needs exactly an SCL and an SDA pin on one bank")
+    bank = _n(config[pins["SCL"][1] + '_bank'])
+    con, dat = _n(peri['pad_off']['con']), _n(peri['pad_off']['dat'])
+    gate = {k: _n(area[k]) for k in ('gate_ipclk_off', 'gate_pclk_off', 'qch_off')}
+    hand = fg.get('handoff', {})
+    if set(hand) != set(_FG_HANDOFF):
+        raise ValueError(f"fg.handoff: want exactly {_FG_HANDOFF}")
+    hand = {k: _n(v) for k, v in hand.items()}
+    mas = (flds['addr_field_mask'] << flds['addr_mas_shift'])
+    if hand['addr'] & ~mas or hand['auto_conf'] & (1 << hs['bits']['auto_master_run']):
+        raise ValueError("fg.handoff: ADDR outside the master field, or AUTO_CONF with MASTER_RUN")
+    u = lambda *v: u32(*v)
+    props = [('compatible', cstr('google,gs101-hsi2c-fg')),
+             ('reg', u64(_n(area['base_pa']), max(offs.values()) + 4)),
+             ('pad-bank', u64(bank, max(con, dat) + 4)),
+             ('usi-mode-reg', u64(_n(area['mode_pa']), 4)),
+             ('cmu-reg', u64(_n(area['cmu_pa']), max(gate.values()) + 4)),
+             ('usi-mode-val', u(_n(area['mode_val']))), ('usi-mode-mask', u(_n(peri['mode_mask']))),
+             ('cmu-gate-ipclk-off', u(gate['gate_ipclk_off'])), ('cmu-gate-pclk-off', u(gate['gate_pclk_off'])), ('cmu-qch-off', u(gate['qch_off'])),
+             ('cmu-cg-val-bit', u(peri['gate_cg_val_bit'])), ('cmu-qch-enable-bit', u(peri['qch_enable_bit'])),
+             ('cmu-qch-req-bit', u(peri['qch_clock_req_bit'])),
+             ('pad-con-off', u(con)), ('pad-dat-off', u(dat)), ('pin-scl', u(pins["SCL"][2])), ('pin-sda', u(pins["SDA"][2]))]
+    props += [('off-' + k.replace('_', '-'), u(offs[k])) for k in _HSI2C_REGS]
+    props += [('bit-' + k.replace('_', '-'), u(hs['bits'][k])) for k in _HSI2C_BITS]
+    props += [('fld-' + k.replace('_', '-'), u(flds[k])) for k in _HSI2C_FIELDS]
+    props += [('fg-addr7', u(addr)), ('fg-regs', u(*[o for _name, o in regs])), ('fg-vcell-nv-per-lsb', u(_FG_VCELL_NV_PER_LSB)),
+              ('fg-repsoc-lsb-per-pct', u(_FG_LSB_PER_PCT)), ('fg-temp-lsb-per-c', u(_FG_LSB_PER_C)),
+              ('fg-curr-na-per-lsb', u(_FG_CURR_NV_UOHM * 1000 // rs))]
+    props += [('handoff-' + k.replace('_', '-'), u(hand[k])) for k in _FG_HANDOFF]
+    for k, _v in props:
+        if len(k) > 31:
+            raise ValueError(f"ADT property name {k!r} longer than 31 characters")
+    return props
+
+
 def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wlan_node=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (the QEMU virt smoke runs were retired, T2)."""
     config = BOARDS[board]
@@ -344,6 +458,10 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         if all(k in w for k in ('tcm', 'tcm_bytes', 'atu_r2_off')) else [])
     ) if w and all(k in w for k in ('mem', 'cfg', 'atu', 'elbi', 'pmu_pcie1_iso')) and not qemu else None
 
+    # bsd/dev/sweet_hsi2c.c (patch 0148): the fuel gauge on HSI2C12 (sweet_batt_props above). Only boards whose board.json has an fg block.
+    bp = sweet_batt_props(config) if not qemu else None
+    batt = node('sweet-batt', [ph()] + bp) if bp else None
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
@@ -360,7 +478,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or no_ufs) else [ufs]) + ([usb] if usb else []) + ([reset] if reset else []) + ([keys] if keys else []) + ([touch] if touch else []) + ([wlan] if wlan else []))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or no_ufs) else [ufs]) + ([usb] if usb else []) + ([reset] if reset else []) + ([keys] if keys else []) + ([touch] if touch else []) + ([wlan] if wlan else []) + ([batt] if batt else []))
 
 
 if __name__ == '__main__':
