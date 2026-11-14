@@ -151,6 +151,16 @@ def check_cmdline(cmdline):
     return cl
 
 
+def with_board_args(cmdline, board):
+    """Append board.json "xnu_bootargs_default" (a list of boot-args) for every key the cmdline does not already set. A key is the
+    text before '=' (a bare flag is its own key), so an explicit --args value always wins and nothing is doubled (PE_parse_boot_argn
+    takes the last one, review 17 L5). Boards without the key are unchanged byte for byte."""
+    extra = boards.BOARDS.get(board, {}).get('xnu_bootargs_default') or []
+    have = {t.split('=', 1)[0] for t in cmdline.split()}
+    add = [a for a in extra if a.split('=', 1)[0] not in have]
+    return ' '.join([cmdline] + add) if add else cmdline
+
+
 def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None):
     unmeasured = boards.provisional(board)
     if unmeasured:
@@ -213,7 +223,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
-    cl = check_cmdline(cmdline)
+    cl = check_cmdline(with_board_args(cmdline, board))
     out[CMDLINE:CMDLINE + len(cl)] = cl
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
@@ -224,6 +234,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
 
 
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['--board-cmdline'] and len(sys.argv) == 4:   # tools/build-xnu-image.sh: the line the payload will carry
+        print(with_board_args(sys.argv[3], sys.argv[2]))
+        sys.exit(0)
     ap = argparse.ArgumentParser()
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')

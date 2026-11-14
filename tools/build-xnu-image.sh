@@ -50,6 +50,7 @@ elif [ -n "$dvfs" ]; then words="${words:+$words,}dvfs"; dvfsarg=(--dvfs "$dvfs"
 [ -z "$words" ] || railsarg=(--touch-probe="$words")
 p=$(mktemp /tmp/payload.XXXXXX.bin); ov=""; genadt=""; rdarg=(); trap 'rm -f "$p" "$ov" "$genadt"' EXIT
 if [ -n "$overlay" ]; then ov=$(mktemp /tmp/devoverlay.XXXXXX.bin); python3 -I tools/mkdevoverlay.py "$overlay" "$ov" >&2 || exit 2; rdarg=(--ramdisk "$ov"); fi
+args=$(python3 -I tools/mkpayload.py --board-cmdline "$board" "$args") || exit 2   # board.json xnu_bootargs_default (oriole touch recipe), shown in the report
 [ -z "${XNU_IMAGE_ARGS_ONLY:-}" ] || { echo "boot-args: $args"; exit 0; }   # test hook (tools/test_build_overlay_args.py)
 if [ "$adt_given" = 0 ]; then genadt=$(mktemp /tmp/adt.XXXXXX.adt); python3 -I tools/mkadt.py "$genadt" --board "$board" >/dev/null || exit 2; adt=$genadt; fi
 python3 -I tools/mkpayload.py "$kernel" "$adt" "$p" --board "$board" --cmdline "$args" "${rdarg[@]}" ${wlanfw:+--wlanfw "$wlanfw"} >/dev/null
