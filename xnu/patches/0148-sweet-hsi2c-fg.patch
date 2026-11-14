@@ -489,7 +489,7 @@ new file mode 100644
 +	    (c->mode_val & ~c->mode_mask))
 +		return "gate description out of range";
 +	if ((c->i2c_pa & 0xFFFu) || c->i2c_len == 0u || c->i2c_len > 0x1000u || (c->pad_pa & 3u) || (c->mode_pa & 3u) || (c->cmu_pa & 0xFFFu) ||
-+	    c->pad_len == 0u || c->pad_len > 0x100u || c->mode_len > 0x100u || c->cmu_len == 0u || c->cmu_len > 0x10000u)
++	    c->pad_len == 0u || c->pad_len > 0x100u || c->mode_len > 0x100u || c->cmu_len == 0u || c->cmu_len > (64u << 10))
 +		return "a block address or length is out of range";
 +	if (c->vcell_nv == 0u || c->repsoc_lsb == 0u || c->temp_lsb == 0u || c->curr_na == 0u)
 +		return "a unit scale is zero";
