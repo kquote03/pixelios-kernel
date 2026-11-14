@@ -496,6 +496,7 @@ sweettouchidretry	patch:0145
 sweettouchidwait	patch:0145
 sweettouchmux	patch:0088
 sweettouchpoke	patch:0093
+sweettouchrstfirst	patch:0146
 sweettouchspi4	patch:0145
 sweettouchsysinfo	patch:0145
 sweettouchvar	patch:0090
