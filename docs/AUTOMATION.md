@@ -566,3 +566,25 @@ unless `--pid N`. Owner default: `$PHONE_OWNER`, else `agent-<pid>`. Last line `
 - **Memo limits (round 3 F4/F5).** The memo compares a dependency's hash on every open (an edit + revert during a run stores nothing), records
   `os.listdir`/`os.scandir`/`glob.glob` results as inputs (hash of the sorted names, re-listed on a hit; by fd or with `root_dir` = not stored),
   and does NOT track failed opens of missing files or `os.stat`/`Path.exists` checks (a memoized function must not branch on those).
+
+## tools/ref-capture: stock Linux reference from recovery (TP-034)
+
+```
+tools/ref-capture [--out DIR] [--only NAME,...]     # phone in recovery, ro.product.device == $BOARD; run under tools/phone-lock run
+tools/ref-capture --list                             # the allowlist; touches nothing
+```
+Read-only capture of the stock kernel's view of the phone (dmesg, /proc/interrupts, /proc/iomem, a tar of the device tree, pinctrl pins and pinconf,
+regulators name/state/microvolts, power_supply uevents, thermal zones, /proc/modules, bus device lists, debugfs gpio, regmap names, the first 2 KiB of `misc`
+(BCB; strings extracted on the host to `misc-bcb.txt`). Each command is a fixed allowlist entry wrapped in `timeout 8` on the phone and bounded on the host;
+`refusal()` rejects `clk_summary` (crashed the phone once, observed by the user), regmap `registers`, redirections and write verbs before anything is sent.
+One line per item (`OK name bytes` / `EMPTY` / `TIMEOUT` / `REFUSED`), last line `RESULT: PASS files=N dir=DIR` (exit 0) / FAIL (1: a timeout or nothing
+captured) / ERROR (2: not recovery, wrong device). Output under `~/pixelios-artifacts/ref/<board>/<UTC>/` (never in git). Tests: `tools/test_ref_capture.py` (fake adb).
+
+## tools/phone-battery: battery voltage from the bootloader (TP-031)
+
+```
+tools/phone-battery [--record RUN_DIR] [--min MV]
+```
+Only `fastboot getvar product|battery-voltage|battery-soc-ok` (8 s each), only when `product` == `$BOARD`. Last line
+`RESULT: PASS battery-voltage=NNNN mV soc-ok=yes|no` (0) / FAIL (1: missing or below `--min`) / ERROR (2). `--record` merges `battery_mv`,
+`battery_soc_ok` into `RUN_DIR/run.json`. Tests: `tools/test_phone_battery.py` (fake fastboot). First oriole read: 4029 mV, soc-ok yes [obs 2026-11-14].

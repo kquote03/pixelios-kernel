@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""ref-capture: read-only capture of the stock Linux state of the phone in recovery (TP-034).
+
+  tools/ref-capture [--out DIR] [--only NAME,...]     capture (default dir ~/pixelios-artifacts/ref/<board>/<UTC stamp>/)
+  tools/ref-capture --list                             print the allowlist, touch nothing
+
+Requires: adb sees exactly the phone in recovery (`adb get-state` = recovery) and `ro.product.device` equals $BOARD
+(tools/boards.py target_board, default bluejay; AGENTS.md rule 2). Run it under `tools/phone-lock run`.
+Read-only: only the fixed ITEMS below are sent (`adb exec-out`), each wrapped in `timeout 8` on the phone and bounded on the
+host (REF_HOST_TIMEOUT, default 60 s for loop items, 20 s otherwise). refusal() is checked on every command before it is
+sent: `clk/clk_summary` (crashed the phone once, observed by the user), any regmap `registers`, output redirections and
+write verbs are refused by construction. Never reboots the phone.
+Output: one line per item `OK name bytes` | `EMPTY name` | `TIMEOUT name` | `REFUSED name`, then
+RESULT: PASS files=N dir=DIR (exit 0) | FAIL ... (exit 1: a timeout or nothing captured) | ERROR ... (exit 2).
+Env (tests): REF_ADB adb binary, REF_HOST_TIMEOUT seconds, ARTIFACTS root.
+"""
+import os, re, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+T8 = "timeout 8 "
+
+
+def _loop(glob, body):
+    # one shell loop over a fixed glob; every read inside is itself bounded
+    return "for f in %s; do echo \"== $f\"; %s; done 2>/dev/null" % (glob, body)
+
+
+# (name, output file, command run with `adb exec-out`). Allowlist from the 2026-11-14 plan, step I1 (+ I2: misc BCB, read-only).
+ITEMS = [
+    ("dmesg", "dmesg.txt", T8 + "dmesg"),
+    ("interrupts", "interrupts.txt", T8 + "cat /proc/interrupts"),
+    ("iomem", "iomem.txt", T8 + "cat /proc/iomem"),
+    ("devicetree", "devicetree.tar", T8 + "tar -cf - -C /sys/firmware/devicetree base 2>/dev/null"),
+    ("pinctrl-pins", "pinctrl-pins.txt", _loop("/sys/kernel/debug/pinctrl/*/pins", T8 + "cat \"$f\"")),
+    ("pinctrl-pinconf", "pinctrl-pinconf.txt", _loop("/sys/kernel/debug/pinctrl/*/pinconf-pins", T8 + "cat \"$f\"")),
+    ("regulators", "regulators.txt", _loop("/sys/class/regulator/*", "for n in name state microvolts; do echo \"$n=$(" + T8
+                                           + "cat \"$f/$n\" 2>/dev/null)\"; done")),
+    ("power-supply", "power-supply.txt", _loop("/sys/class/power_supply/*/uevent", T8 + "cat \"$f\"")),
+    ("thermal", "thermal.txt", _loop("/sys/class/thermal/thermal_zone*", "echo \"$(" + T8 + "cat \"$f/type\") $(" + T8
+                                     + "cat \"$f/temp\")\"")),
+    ("lsmod", "lsmod.txt", T8 + "cat /proc/modules"),
+    ("buses", "buses.txt", T8 + "ls -l /sys/bus/spi/devices /sys/bus/i2c/devices /sys/bus/pci/devices /sys/bus/platform/devices 2>/dev/null"),
+    ("gpio", "gpio.txt", T8 + "cat /sys/kernel/debug/gpio"),
+    ("regmap-names", "regmap-names.txt", _loop("/sys/kernel/debug/regmap/*/name", T8 + "cat \"$f\"")),
+    ("misc-bcb", "misc-bcb.bin", T8 + "dd if=/dev/block/by-name/misc bs=2048 count=1 2>/dev/null"),
+]
+
+DENY = [
+    (re.compile(r"clk_summary|/debug/clk\b"), "clk debugfs (clk_summary crashed the phone once)"),
+    (re.compile(r"regmap/[^ ]*/(?!name\b)[a-z_]+"), "regmap file other than name"),
+    (re.compile(r">>|>\s*/(?!dev/null)|[^2]>\s*[^&]|^>"), "output redirection"),
+    (re.compile(r"\bof="), "dd of="),
+    (re.compile(r"\b(tee|rm|mv|cp|insmod|rmmod|modprobe|reboot|setprop|mount|umount|chmod|chown|echo\s+\S+\s*>|write|svc|am|pm)\b"),
+     "write verb"),
+]
+
+
+def refusal(cmd):
+    """None if cmd may be sent, else the reason. Redirections of stderr to /dev/null are the only allowed '>'."""
+    probe = cmd.replace("2>/dev/null", "")
+    for rx, why in DENY:
+        if rx.search(probe):
+            return why
+    return None
+
+
+def adb(args, tmo):
+    exe = os.environ.get("REF_ADB", "adb")
+    try:
+        p = subprocess.run([exe, *args], capture_output=True, timeout=tmo)
+        return p.returncode, p.stdout
+    except subprocess.TimeoutExpired:
+        return None, b""
+
+
+def strings(data, n=4):
+    return "\n".join(m.decode("ascii") for m in re.findall(rb"[\x20-\x7e]{%d,}" % n, data)) + "\n"
+
+
+def main(argv):
+    out, only = None, None
+    if argv[:1] == ["--list"]:
+        for name, fname, cmd in ITEMS:
+            print("%-16s %-22s %s" % (name, fname, cmd))
+        return 0
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--out" and i + 1 < len(argv):
+            out = argv[i + 1]; i += 2
+        elif argv[i] == "--only" and i + 1 < len(argv):
+            only = argv[i + 1].split(","); i += 2
+        else:
+            print("RESULT: ERROR unknown argument %r (see the header of tools/ref-capture)" % argv[i]); return 2
+    items = ITEMS
+    if only:
+        names = {n for n, _, _ in ITEMS}
+        bad = [o for o in only if o not in names]
+        if bad:
+            print("RESULT: ERROR unknown item(s) %s (--list)" % ",".join(bad)); return 2
+        items = [it for it in ITEMS if it[0] in only]
+    import boards
+    try:
+        board = boards.target_board()
+    except SystemExit as e:
+        print("RESULT: ERROR %s" % e); return 2
+    rc, st = adb(["get-state"], 10)
+    st = st.decode(errors="replace").strip()
+    if rc is None or rc != 0 or st != "recovery":
+        print("RESULT: ERROR phone not in recovery (adb get-state: %r)" % st); return 2
+    rc, dev = adb(["shell", "getprop", "ro.product.device"], 10)
+    dev = dev.decode(errors="replace").strip()
+    if rc != 0 or dev != board:
+        print("RESULT: ERROR ro.product.device=%r is not BOARD=%s; not touched" % (dev, board)); return 2
+    if out is None:
+        root = os.environ.get("ARTIFACTS") or os.path.expanduser("~/pixelios-artifacts")
+        out = os.path.join(root, "ref", board, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    os.makedirs(out, exist_ok=True)
+    ht = os.environ.get("REF_HOST_TIMEOUT")
+    files, timeouts = 0, 0
+    for name, fname, cmd in items:
+        why = refusal(cmd)
+        if why:
+            print("REFUSED %s (%s)" % (name, why)); continue
+        tmo = float(ht) if ht else (60 if cmd.startswith("for ") else 20)
+        rc, data = adb(["exec-out", cmd], tmo)
+        if rc is None:
+            print("TIMEOUT %s" % name); timeouts += 1; continue
+        if not data:
+            print("EMPTY %s" % name); continue
+        with open(os.path.join(out, fname), "wb") as f:
+            f.write(data)
+        if name == "misc-bcb":
+            with open(os.path.join(out, "misc-bcb.txt"), "w") as f:
+                f.write(strings(data))
+        files += 1
+        print("OK %s %d" % (name, len(data)))
+    if timeouts or files == 0:
+        print("RESULT: FAIL files=%d timeouts=%d dir=%s" % (files, timeouts, out)); return 1
+    print("RESULT: PASS files=%d dir=%s" % (files, out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

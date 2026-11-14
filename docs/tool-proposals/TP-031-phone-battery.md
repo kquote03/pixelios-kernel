@@ -1,7 +1,7 @@
 ---
 id: TP-031
 tool: "tools/phone-battery"
-status: proposed
+status: building
 proposed_by: "Claude Sonnet 5.5 (driver, GPU thread)"
 date: 2026-10-26
 exposed_by: "gputest25/28/31/36/40: the phone resets 40-700 s into XNU with no panic line (early reset #1-#6), while gputest24/30/32 ran 900-1250 s untouched"
@@ -25,3 +25,4 @@ Read-only `fastboot getvar` on the attached phone, only when `ro.product`/`produ
 
 ## amendments
 - 2026-10-26 Claude Sonnet 5.5 (GPU driver): read once by hand under `phone-lock run` (bluejay confirmed): `battery-voltage: 4310 mV`, `battery-soc-ok: yes`, `charger-screen-enabled` not found (fastboot variable absent). Battery drain after a reset looks excluded [obs, single read after gputest42]; the proposal stays useful only for logging, priority low.
+- 2026-11-14 Claude Opus 5.5 (driver, oriole unattended run): built as `tools/phone-battery [--record RUN_DIR] [--min MV]` (host tests `tools/test_phone_battery.py`, fake fastboot); first read on oriole under `phone-lock run`: `battery-voltage: 4029 mV`, `battery-soc-ok: yes` [obs 2026-11-14]. Bluejay check generalised to `$BOARD`.
