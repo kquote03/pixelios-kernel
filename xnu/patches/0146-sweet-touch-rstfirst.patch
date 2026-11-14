@@ -10,10 +10,12 @@ sweettouchrstfirst=1: after the mux check and before the clock / SPI setup, CS h
 pulls off and wait for the ready event without a second pulse (stop if none); the DCHIP_ID identify is skipped (it reads ff / 20
 under the stock driver once the firmware runs); then phase 2 as before (Sense ON, FIFO polling). Default 0: 0095/0145 paths and
 bluejay unchanged. Same pads and registers as the existing reset path; no new SoC register.
+Polling: with sweettouchrstfirst=1 the FIFO is read only while the irq pad is low, as fts_interrupt_handler (fts.c:4510-4550):
+run oriole-gui6 (unconditional 8 ms polling) read only empty-FIFO patterns and the IC restarted every few seconds.
 
 ---
 diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
-index d5f74ad..ae9ba46 100644
+index d5f74ad..3ea46ff 100644
 --- a/bsd/dev/sweet_touch_gs101.c
 +++ b/bsd/dev/sweet_touch_gs101.c
 @@ -184,6 +184,7 @@ static struct {
@@ -125,7 +127,21 @@ index d5f74ad..ae9ba46 100644
  	for (int r = 1; !ok && r <= tg.idretry; r++) {
  		ok = tg_identify_try(r);
  	}
-@@ -1318,7 +1368,7 @@ sweet_touch_gs101_init(void)
+@@ -1285,6 +1335,13 @@ tg_run(void)
+ 	}
+ 	printf("SWEET TOUCH: scanning, %dx%d raw -> %ux%u\n", (int)tg.max_x + 1, (int)tg.max_y + 1, tg.width, tg.height);
+ 	for (;;) {
++		if (tg.rstfirst && tg_pin_get(&tg.irq) != 0) {
++			/* patch 0146: read the FIFO only while the IC pulls its irq low, as fts_interrupt_handler (fts.c:4510-4550).
++			 * Unconditional 8 ms polling read empty-FIFO patterns (ff.. / 65 6e ff..), took their "remaining" byte as 31
++			 * more events, and the IC restarted every few seconds (run oriole-gui6); the irq-gated shim read 3002 touches. */
++			tg_sleep_ms(2);
++			continue;
++		}
+ 		int n = tg_drain(&logged);
+ 		if (n < 0) {
+ 			if (errors++ % 100u == 0) {
+@@ -1318,7 +1375,7 @@ sweet_touch_gs101_init(void)
  	char const *compat = NULL;
  	unsigned int csize = 0;
  	int mode = 2, delay_s = 45, mux = 0, clk = 0, var = 0, cs = 0;
@@ -134,7 +150,7 @@ index d5f74ad..ae9ba46 100644
  	thread_t thread;
  
  	if (started) {
-@@ -1347,6 +1397,7 @@ sweet_touch_gs101_init(void)
+@@ -1347,6 +1404,7 @@ sweet_touch_gs101_init(void)
  	(void)PE_parse_boot_argn("sweettouchsysinfo", &sysinfo, sizeof(sysinfo));
  	(void)PE_parse_boot_argn("sweettouchidwait", &idwait, sizeof(idwait));
  	(void)PE_parse_boot_argn("sweettouchidretry", &idretry, sizeof(idretry));
@@ -142,7 +158,7 @@ index d5f74ad..ae9ba46 100644
  	(void)PE_parse_boot_argn("sweettouchpoke", tg.poke, sizeof(tg.poke));   /* longer values are cut: poke_parse then sees > 240 chars */
  	if (delay_s < 0 || delay_s > 3600) {
  		delay_s = 45;
-@@ -1367,6 +1418,7 @@ sweet_touch_gs101_init(void)
+@@ -1367,6 +1425,7 @@ sweet_touch_gs101_init(void)
  	tg.sysinfo = sysinfo;
  	tg.idwait_ms = (uint32_t)idwait;
  	tg.idretry = idretry;
