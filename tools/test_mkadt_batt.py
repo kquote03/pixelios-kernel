@@ -74,6 +74,19 @@ class SweetBattNode(unittest.TestCase):
         for k in names:
             self.assertLessEqual(len(k), 31, k)
 
+    def test_c_table_is_the_node_bytes(self):
+        # shim/build.sh feeds this table to the host test: it must hold exactly the node's bytes
+        c = mkadt.sweet_batt_c("oriole")
+        rows = re.findall(r'\{ "([\w,-]+)", (\d+), \{ ([0-9a-fx, ]+) \} \},', c)
+        got = {k: bytes(int(b, 16) for b in v.split(", ")) for k, n, v in rows}
+        self.assertEqual(len(rows), len(mkadt.sweet_batt_props(boards.BOARDS["oriole"])))
+        self.assertEqual(got, {k: v for k, v in node_props("oriole").items() if k not in ("name", "AAPL,phandle")})
+        for k, n, v in rows:
+            self.assertEqual(int(n), len(got[k]))
+            self.assertLessEqual(int(n), 64)
+        with self.assertRaises(ValueError):
+            mkadt.sweet_batt_c("bluejay")
+
     def test_the_allowlist_is_pinned(self):
         self.assertEqual(mkadt.FG_ADDR7, 0x36)
         self.assertEqual(mkadt.FG_REGS, (("REPSOC", 0x06), ("TEMP", 0x08), ("VCELL", 0x09), ("CURRENT", 0x0A), ("AVGCURRENT", 0x0B),
@@ -118,8 +131,8 @@ class SweetBattNode(unittest.TestCase):
                 break
             if on and line.startswith("+"):
                 hdr.append(line[1:])
-        hdr = "\n".join(hdr)
-        u32 = set(re.findall(r'X\(\s*[\w\[\]]+\s*,\s*"([\w-]+)"\s*,\s*\w+\s*\)', hdr))
+        hdr = re.sub(r"/\*.*?\*/", " ", "\n".join(hdr), flags=re.S)
+        u32 =set(re.findall(r'X\(\s*[\w\[\]]+\s*,\s*"([\w-]+)"\s*,\s*\w+\s*\)', hdr))
         pa = set(re.findall(r'X\(\s*\w+\s*,\s*\w+\s*,\s*"([\w-]+)"\s*\)', hdr))
         if not u32 or not pa:
             self.fail("the header's SFG_CFG_U32 / SFG_CFG_PA lists not found")
