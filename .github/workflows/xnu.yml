@@ -17,7 +17,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
   push:
-    branches: [main, wip/oriole-touch-0145]
+    branches: [main, wip/oriole-touch-0145, wip/oriole-next]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
