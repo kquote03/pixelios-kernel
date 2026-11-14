@@ -265,7 +265,10 @@ class T(unittest.TestCase):
         self.assertIn("--kernel FILE is required", out)
 
     def test_intent_wlan_unknown_and_none(self):
-        rc, out = self.xr("--intent", "wlan", "--label", "wd2-1")   # wlan row has no required flag (xrun lacks --wlan-hold): must pass the intent check
+        rc, out = self.xr("--intent", "wlan", "--label", "wd2-1")   # 2026-11-14: the wlan row requires --wlan-hold (xrun passes it through now)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("intent wlan: missing --wlan-hold", out)
+        rc, out = self.xr("--intent", "wlan", "--wlan-hold", "--label", "wd2-1")   # with it the intent check passes
         self.assertIn("--kernel FILE is required", out)
         rc, out = self.xr("--label", "wdog")   # `wd` alone no longer implies wlan
         self.assertIn("--kernel FILE is required", out)
