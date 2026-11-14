@@ -433,7 +433,7 @@ Oriole recipe, one variable per run vs oriole-gui5 (CR-08), each with `--rails`:
 A (read-only additions) `sweettouchmux=1 sweettouchcs=1 sweettouchsysinfo=1 sweettouchidwait=100 sweettouchidretry=3 sweettouchpoke=m:10c00640=10=0;d:100;m:10c0180c=f=5;`;
 B = A + `sweettouchspi4=2` (changed vs A: SPI4 block); C = A + `sweettouchspi4=3` (changed vs B: M3 hold). Status: not run (no device result yet).
 
-## Fuel-gauge reader: `sweetbatt=1` (xnu patch 0148, plan step C4; BUILT, UNRUN, awaiting an independent review)
+## Fuel-gauge reader: `sweetbatt=1` (xnu patch 0148, plan step C4; reviewed SAFE docs/reviews/0148-hsi2c-fg-review-fable-1.md; RUN ONCE: o2-c4-batt1 FAIL fail-safe)
 
 Default off: without `sweetbatt=1` (absent or `0`) the patch maps nothing and reads nothing (*read from source*: `sweet_batt_init()` returns
 before any ADT lookup; pinned by `tools/test_hsi2c_fg_audit.py`); any other value prints `SWEET BATTERY: refused sweetbatt=N ...`. It also needs
@@ -452,7 +452,7 @@ negative = discharging; Linux reports the opposite sign). Any refusal or failure
 `SWEET BATTERY: reader stopped, no further HSI2C12 access this boot`. Code: `bsd/dev/sweet_hsi2c_fg.h` (pure, all access through
 `struct sfg_ops`, one writer `sfg_w32()`), `bsd/dev/sweet_hsi2c.c` (glue). Tests: `shim/hsi2c_fg_xnu_host_test.c` (also ASan/UBSan, built by
 `shim/build.sh`), `tools/test_mkadt_batt.py`, `tools/test_hsi2c_fg_audit.py`.
-Run form once reviewed (not run yet): `tools/xrun ... --args "sweetbatt=1"`, expect `SWEET BATTERY: soc=`; never with a shim `--fg-read` image
+Result 2026-11-15 (observed, o2-c4-batt1, CI kernel 14c9780): handoff words as the shim saw, first RepSOC read errored, one RX FIFO byte left -> `restore=FAILED`, reader stopped. Rule (0148 F7): after `restore=FAILED` or `BUS NOT IDLE`, power-cycle the phone before the next experiment. Run form: `tools/xrun ... --args "sweetbatt=1"`, expect `SWEET BATTERY: soc=`; never with a shim `--fg-read` image
 in the same boot (the bus could be left mid-transfer, review F5).
 
 | Step | Status | Tag |
