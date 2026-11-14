@@ -53,6 +53,7 @@ struct fake {
 	unsigned rom0;                                  /* run D: a store to backplane address 0 is accepted and ignored (a ROM bank aliased at 0, unknown X4) */
 	unsigned clob_at;                               /* run C: after this store number the RAM word at backplane address clob_bp flips a bit (a later store clobbering an earlier one; 0 = never) */
 	uint32_t clob_bp;
+	unsigned link_down_at;                          /* patch 0147 F1: after this store number the link leaves L0 (ELBI 0x2C8 low bits 0x11 -> 0x10; 0 = never) */
 };
 
 static uint32_t *f_wrap(struct fake *f, uint32_t win)
@@ -134,6 +135,8 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	}
 	f->lastw.space = space; f->lastw.win = win; f->lastw.off = off; f->lastw.val = v;
 	f->nw++;
+	if (f->link_down_at && f->link_down_at == f->nw)
+		f->ltssm = (f->ltssm & ~0x3Fu) | 0x10u;
 	if (f->src_flip_at == f->nw && space == SWW_BAR2 && win == 0 && off >= SWW_RAM_BASE)
 		imgbuf[off - SWW_RAM_BASE + 8] ^= 0x40;
 	if (f->fail_wr_at == f->nw)
@@ -975,8 +978,8 @@ static void runb_full(void)
 	mkimg(SWW_IMG_MAX);
 	crc = tcrc(imgbuf, SWW_IMG_MAX);
 	obsb(&f, 336);
-	CHECK(runb(&f, &x, 4, SWW_IMG_MAX, crc) == 0 && x.img_next == 441005u && f.nw == NWANT + NB_TAIL + 441005u && x.img_crc_rb == crc && count_str("W10 chunk ") == 27);
-	CHECK(f.w[NWANT + 3].off == SWW_RAM_BASE && ramarr[0x3AEAB0u / 4] == iw(441004u) && (ramarr[0x3AEAB0u / 4] >> 16) == 0 && ramarr[0x3AEAB4u / 4] == PAT && ram_ok(441005u, 0x49FFFCu));
+	CHECK(runb(&f, &x, 4, SWW_IMG_MAX, crc) == 0 && x.img_next == 441023u && f.nw == NWANT + NB_TAIL + 441023u && x.img_crc_rb == crc && count_str("W10 chunk ") == 27);
+	CHECK(f.w[NWANT + 3].off == SWW_RAM_BASE && ramarr[0x3AEAF8u / 4] == iw(441022u) && (ramarr[0x3AEAF8u / 4] >> 24) == 0 && ramarr[0x3AEAFCu / 4] == PAT && ram_ok(441023u, 0x49FFFCu));   /* patch 0147: the bound is the oriole image, 1764091 B = 441022 words + 3 bytes */
 	/* one byte more than the bound, an empty image, a wrong container CRC, no image: refused at W8, before the first run B store */
 	obsb(&f, 336);
 	mkimg(SWW_IMG_MAX + 1);
@@ -1200,7 +1203,7 @@ static void runb_deny_sweep(void)
 
 				w = wins[wi];
 				if (w == 0)
-					want = off == 0 || (off >= 0x200000u && off <= 0x3FFFFCu && (off < 0x3AEAB4u || v == 0));      /* offset 0: the run D reset vector, any value (swl_wr decides the value) */
+					want = off == 0 || (off >= 0x200000u && off <= 0x3FFFFCu && (off < 0x3AEAFCu || v == 0));      /* patch 0147: image end 0x3AEAFC (was 0x3AEAB4); offset 0: the run D reset vector, any value (swl_wr decides the value) */
 				else if (w == 0x400000u)
 					want = off <= 0x1FFFFCu;        /* v == 0: the last word of run B; any v: the run C tail tuples (their address and word are decided at run time) */
 				else
@@ -1972,7 +1975,7 @@ static void rund(void)
 	mkimg(len);
 	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
 	forge(imgbuf, len, pin);
-	CHECK(tcrc(imgbuf, len) == pin && SWW_FW_LEN == 1764018u && SWW_FW_CRC == 0x1153ccffu && SWW_FW_LEN == SWW_IMG_MAX);
+	CHECK(tcrc(imgbuf, len) == pin && swl_fw_known(len, pin) && SWW_FW_LEN_BJ == 1764018u && SWW_FW_CRC_BJ == 0x1153ccffu && SWW_FW_LEN_OR == SWW_IMG_MAX && SWW_IMG_MAX == 1764091u);
 	w0 = iw(0);
 	CHECK(w0 == 0xEA000010u && w0 != PAT);
 	cx_hand(336);
@@ -2100,7 +2103,7 @@ static void rund(void)
 	rd_put(&f, &x);
 	imgbuf[100] ^= 1;
 	x.img_crc = tcrc(imgbuf, len);
-	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764018 bytes crc") != 0 && strstr(logbuf, "is not the pinned 1764018 bytes crc 0x1153ccff") != 0);
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764018 bytes crc") != 0 && strstr(logbuf, "is not a pinned identity (1764018 B 0x1153ccff or 1764091 B 0x92567396)") != 0);
 	/* the pin before the first store of the run: a consistent image of another length or content stops at the early check, no read, no store, nothing armed (review 0130 finding 8) */
 	obsb(&f, 336);
 	CHECK(runc(&f, &x, 6, len, tcrc(imgbuf, len)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && x.row == 14 && x.restore == SWW_RS_NONE && x.armed == 0 && x.rb == 0);
@@ -2117,11 +2120,11 @@ static void rund(void)
 	forge(imgbuf, len - 4u, pin);
 	CHECK(tcrc(imgbuf, len - 4u) == pin);
 	obsb(&f, 336);
-	CHECK(runc(&f, &x, 6, len - 4u, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not the pinned") != 0);
+	CHECK(runc(&f, &x, 6, len - 4u, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not a pinned identity") != 0);
 	rd_put(&f, &x);
 	x.img_len = len - 4u;
 	x.img_crc = pin;
-	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not the pinned") != 0);
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not a pinned identity") != 0);
 	keep = imglen;
 	mkimg(66);
 	obsb(&f, 336);
@@ -2138,6 +2141,73 @@ static void rund(void)
 	cx_plain(3, 336);
 	obsb(&f, 336);
 	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.nv_varsize == cx.varsize && ramarr[0] == w0);
+}
+
+/* patch 0147: the firmware identity table (bluejay 1764018 B crc 0x1153ccff, oriole 1764091 B crc 0x92567396): exactly a row, never a mix or a neighbour */
+static void fwid(void)
+{
+	static struct fake f, g;
+	struct swl_wx x;
+	const uint32_t len = 1764091u, pin = 0x92567396u;
+	uint32_t w0, n5;
+
+	CHECK(swl_fw_known(1764018u, 0x1153ccffu) && swl_fw_known(1764091u, 0x92567396u));
+	CHECK(!swl_fw_known(1764018u, 0x92567396u) && !swl_fw_known(1764091u, 0x1153ccffu));         /* rows are not mixed */
+	CHECK(!swl_fw_known(1764090u, pin) && !swl_fw_known(1764092u, pin) && !swl_fw_known(1764017u, 0x1153ccffu) && !swl_fw_known(1764019u, 0x1153ccffu));
+	CHECK(!swl_fw_known(len, pin ^ 1u) && !swl_fw_known(len, pin ^ 0x80000000u) && !swl_fw_known(0, 0) && !swl_fw_known(len, 0) && !swl_fw_known(0, pin));
+	CHECK(SWW_IMG_MAX == len && SWW_IMG_MAXW == 441023u && SWW_IMG_END == 0x3AEAFCu && SWW_IMG_END <= SWW_WIN_TAIL && SWW_RAM_MIN == 1791299u && SWW_RAM_MIN <= 0x2A0000u);
+	/* the oriole-sized image with the oriole CRC (synthetic bytes, forged CRC, no firmware byte) runs level 6 to the end on the observed RAM (336 x 8 KiB, ram_end 0x4a0000) */
+	cx_init_rng();
+	mkimg(len);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, len, pin);
+	CHECK(tcrc(imgbuf, len) == pin);
+	w0 = iw(0);
+	cx_hand(336);
+	obsb(&g, 336);
+	CHECK(runc(&g, &x, 5, len, pin) == 0 && x.flags == CLEVEL5 && x.img_next == 441023u && ramarr[0] == PAT);
+	n5 = g.nw;
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.flags == (CLEVEL5 | SWF_W14) && f.nw == n5 + 1 && ramarr[0] == w0 && all_allowed(&f) && f.win2 == 0);
+	CHECK(ramarr[0x3AEAF8u / 4] == iw(441022u) && ramarr[0x3AEAFCu / 4] == PAT);                  /* the last image word, nothing above the bound */
+	/* the same bytes with a CRC one bit off the pin: consistent container (forged), not an identity -> no store at level 6 */
+	forge(imgbuf, len, pin ^ 1u);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin ^ 1u) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764091 bytes crc 0x92567397 is not a pinned identity") != 0);
+	/* the oriole length with the bluejay CRC (a mixed row) -> no store */
+	forge(imgbuf, len, 0x1153ccffu);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, 0x1153ccffu) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764091 bytes crc 0x1153ccff is not a pinned identity") != 0);
+	/* one byte over the new bound: refused at W8 before any store, whatever the CRC */
+	mkimg(len + 1u);
+	obsb(&f, 336);
+	CHECK(runb(&f, &x, 4, len + 1u, tcrc(imgbuf, len + 1u)) == -SWW_E_IMG && f.nw == 0 && x.row == 8 && strstr(logbuf, "W8 no usable image (1764092 bytes, at most 1764091)") != 0);
+}
+
+/* patch 0147, review 0129-0132 F1: a stop while cfg 0x84 is armed and the link has left L0 does NOT send the config restore TLP; restore=skipped; the state left is printed (F5) */
+static void f1_cfg_restore(void)
+{
+	static struct fake f;
+	struct swl_wx x;
+	uint32_t len = 3 * 65536 + 4098, crc;
+
+	mkimg(len);
+	crc = tcrc(imgbuf, len);
+	/* reference: link stays up, the window restore is sent and read back (the 0130 behaviour) */
+	obsb(&f, 336);
+	f.win2_stuck = 0;
+	f.fail_wr_at = NWANT + 2;                                                                       /* the W9 last-word store fails: stop with cfg 0x84 armed */
+	CHECK(runb(&f, &x, 4, len, crc) < 0 && x.stop_code == SWW_E_WR && f.win2 == 0 && x.restore == SWW_RS_OK && f.nw == NWANT + 3);
+	CHECK(strstr(logbuf, "left after stop: atu_r2=ENABLED sys_mem=OUT OF RESET ca7=OUT OF RESET, CPUHALT cfg84=0 (restored)") != 0);
+	/* the link drops right after the W8 window store: W9's precondition stops the run, the config restore is skipped (no store, no config read) */
+	obsb(&f, 336);
+	f.link_down_at = NWANT + 1;
+	CHECK(runb(&f, &x, 4, len, crc) < 0 && x.stop_code == SWW_E_PRE && x.row == 9 && f.nw == NWANT + 1 && f.win2 == 0x400000u && x.restore == SWW_RS_SKIPPED);
+	CHECK(strstr(logbuf, "restore of group 8 skipped, link precondition 2") != 0 && strstr(logbuf, "stopped at W9 restore=skipped") != 0);
+	CHECK(strstr(logbuf, "cfg84=TAIL WINDOW (restore not done)") != 0 && (x.rs_ok & SWW_RG_W84) == 0 && (x.armed_at_stop & SWW_RG_W84) != 0);
+	/* a stop with nothing armed prints the untouched state */
+	obsb(&f, 336);
+	CHECK(runb(&f, &x, 4, SWW_IMG_MAX + 1u, 1u) < 0 && f.nw == 0 && strstr(logbuf, "left after stop: atu_r2=untouched sys_mem=untouched ca7=untouched cfg84=0") != 0);
 }
 
 /* review 0132 F2: W14 runs only when stage 1 listed PCIe core 0x83c with rev < 74 or == 128 (DHD does not read the DAR security register there, dhd_pcie.c:11735-11745) */
@@ -2179,6 +2249,8 @@ int main(void)
 	runc_gates();
 	runc_deny_sweep();
 	rund();
+	fwid();
+	f1_cfg_restore();
 	if (fails) {
 		fprintf(stderr, "RESULT: FAIL wlan_wr_host_test (%u checks)\n", fails);
 		return 1;

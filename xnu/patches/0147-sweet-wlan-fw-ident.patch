@@ -1,0 +1,237 @@
+SWEET WLAN firmware identity table + review 0129-0132 F1/F5 (patch 0147, plan 2026-11-14_oriole-oneshot-2 step W0, user decision D1). Levels 1-3 unchanged.
+(a) The single level-6 pin (SWW_FW_LEN 1764018 / SWW_FW_CRC 0x1153ccff, bluejay, run wd3) becomes a table of known identities swl_fwids[]: bluejay {1764018, 0x1153ccff} and oriole
+    {1764091, 0x92567396} (container line of run wlan-oriole-l4; host zlib.crc32 of the stock oriole vendor fw_bcmdhd.bin, sha256 8a52ffe1). swl_fw_known(len, crc) accepts exactly one row; it replaces
+    every former pin check (0132: swl_wr SWT_RV, swl_fw_pin, glue rv_ok). Glue: from level 4 on, an image that is not a table identity is not handed to stage 3 (x.img = NULL: W8 stops, zero stores),
+    so the copy (W10) and the reset vector (W14) only ever see a pinned identity whose CRC swl_img_check() recomputes from the bytes.
+(b) SWW_RAM_MIN 1791226 -> 1791299, so SWW_IMG_MAX = 1764091 B (441023 words, SWW_IMG_END 0x3AEAFC < SWW_WIN_TAIL 0x400000); observed RAM 2752512 B (ram_end 0x4a0000, run wlan-oriole-l3) >= RAM_MIN.
+(c) F1: swl_restore() sends a config-space restore (cfg 0x84 := 0) only while swl_lpre() (the RC-local half of the 0124 preconditions: PHY isolation, link L0, ATU r0/r1) holds; else it reports
+    "restore of group N skipped, link precondition P" and restore=skipped. swl_wpre() calls swl_lpre() first (same checks, same order as before).
+(d) F5: every stop prints "SWEET WLAN: left after stop: atu_r2=.. sys_mem=.. ca7=.. cfg84=.. cfg80=last window selected; armed .. restored .. tuples .." (no bus access).
+Tests: shim/wlan_wr_host_test.c (fwid, f1_cfg_restore), tools/test_wlan_wr_mutants.py. HW-WRITE path: review docs/reviews/0147-wlan-fw-ident-review-fable-*.md.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index a775678..571d351 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -299,12 +299,18 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	x.b = &wb;
+ 	x.level = level;
+ 	hw->l3 = level;
+-	hw->rv_ok = level >= 6 && sw_fw.p != NULL && sw_fw.len == SWW_FW_LEN && sw_fw.crc == SWW_FW_CRC;
++	hw->rv_ok = level >= 6 && sw_fw.p != NULL && swl_fw_known(sw_fw.len, sw_fw.crc);       /* patch 0147: a pinned identity (swl_fwids[]) */
+ 	hw->rv_done = 0;
+ 	hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;
+ 	x.img = sw_fw.p;
+ 	x.img_len = sw_fw.len;
+ 	x.img_crc = sw_fw.crc;
++	/* patch 0147: from level 4 on (image copy) only an image whose container length and CRC32 are one pinned identity reaches the writer; swl_img_check() then proves the CRC is the bytes' CRC.
++	 * Another image is not handed over: the run stops at W8 ("no usable image") before any store. */
++	if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc)) {
++		printf("SWEET WLAN: firmware %u bytes crc %#010x is not a pinned identity, not handed to stage 3\n", sw_fw.len, sw_fw.crc);
++		x.img = NULL;
++	}
+ 	x.nv_src = sw_nv.p;
+ 	x.nv_src_len = sw_nv.len;
+ 	x.nv_src_crc = sw_nv.crc;
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+index ff842b9..387245c 100644
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -33,7 +33,7 @@
+ #define SWW_CFG88       0x00080080u     /* PCI_SPROM_CONTROL as observed (runs w3a-n33, w3a-n28c); DHD dhd_pcie.c:2165 aborts on all-ones */
+ #define SWW_RAM_BASE    0x200000u       /* CA7_4389_RAM_BASE, include_sbchipc.h:4169, dhd_pcie.c:2348-2351 */
+ #define SWW_RAM_MAX     0x400000u       /* DONGLE_TCM_MAP_SIZE, dhd_pcie.h:42; dhd_pcie.c:2453 fails attach above it */
+-#define SWW_RAM_MIN     1791226u        /* 1764018 B image + 27208 B vars/token/rTLV bound (docs/research/43 s.2 fit arithmetic) */
++#define SWW_RAM_MIN     1791299u        /* patch 0147: 1764091 B image (the larger pinned identity, oriole) + 27208 B vars/token/rTLV bound (docs/research/43 s.2 fit arithmetic); observed RAM 2752512 B (ram_end 0x4a0000, wlan-oriole-l3) */
+ #define SWW_NRB         8u              /* SYS_MEM rev 9 coreinfo 0x115: (coreinfo & 0x3E0) >> 5 (siutils.c:7036-7041; observed run w3a-n36 row 1379) */
+ #define SWW_NB          21u             /* coreinfo & 0x1F */
+ #define SWW_BANK_ROM    0x80u           /* SYSMEM_BANKIDX_ROM_MASK (g4389-include_sbsysmem.h:164): a RAM bank index stays below it */
+@@ -58,12 +58,12 @@
+ /* Run B (patch 0130, docs/research/43 rows W8..W10) */
+ #define SWW_WIN_TAIL    0x400000u       /* cfg 0x84 (BAR2 window) value for backplane 0x400000..0x7FFFFF: DHD_BUS_BAR1_BPWIN = addr & ~(bar size - 1) (dhd_pcie.c:6149, 6232); row W8 */
+ #define SWW_RAM_VARS    27208u          /* bytes after the image that RAM_MIN reserves (vars + token + rTLV; docs/research/43 s.2 fit arithmetic) */
+-#define SWW_IMG_MAX     (SWW_RAM_MIN - SWW_RAM_VARS)    /* 1764018 B: the largest image this run copies (row W10) */
+-#define SWW_IMG_MAXW    ((SWW_IMG_MAX + 3u) / 4u)       /* 441005 words (row W10) */
++#define SWW_IMG_MAX     (SWW_RAM_MIN - SWW_RAM_VARS)    /* 1764091 B (patch 0147, was 1764018): the largest image this run copies (row W10) */
++#define SWW_IMG_MAXW    ((SWW_IMG_MAX + 3u) / 4u)       /* 441023 words (row W10; 441005 before patch 0147) */
+ #define SWW_IMG_END     (SWW_RAM_BASE + 4u * SWW_IMG_MAXW)      /* first backplane address after the image words */
+ #define SWW_CHUNK_W     16384u          /* words per 64 KiB chunk: preconditions, window and the CRC read-back are checked per chunk (row W10, s.3 (4)) */
+ #define SWW_LAST_HI_MAX (SWW_RAM_BASE + SWW_RAM_MAX - 4u - SWW_WIN_TAIL)        /* last RAM word when ram_end > 0x400000: BAR2 offset under window SWW_WIN_TAIL, ram_end <= 0x600000 */
+-_Static_assert(SWW_IMG_MAX + SWW_RAM_VARS == SWW_RAM_MIN && SWW_IMG_MAX == 1764018u, "image bound");
++_Static_assert(SWW_IMG_MAX + SWW_RAM_VARS == SWW_RAM_MIN && SWW_IMG_MAX == 1764091u && SWW_IMG_END == 0x3AEAFCu, "image bound");
+ 
+ /* Run C (patch 0131, docs/research/43 rows W11..W13, boot-arg sweetwlan=5): the tail below ram_end = NVRAM text, length token, rTLV (DHD: dhdpcie_bus_write_vars, dhdpcie_wrt_rnd) */
+ #define SWW_NV_DHD_MAX  32768u          /* MAX_NVRAMBUF_SIZE (bcm4389-dhd.h:509): DHD downloads only 0 < len < this (dhd_pcie.c:4208) */
+@@ -79,12 +79,35 @@ _Static_assert(SWW_WIN_TAIL >= SWW_IMG_END, "the tail window starts above the im
+ 
+ /* Run D (patch 0132, docs/research/43a rows W14, X4; boot-arg sweetwlan=6): the reset vector. DHD stores the first dword of the firmware file as bus->resetinstr (dhd_pcie.c:3934-3936) and, for a CA7,
+  * writes it at address 0 after the image, the vars and the rTLV (dhd_pcie.c:10198-10227); the image itself also goes to SWW_RAM_BASE. Firmware IDENTITY pinned for level 6 (not firmware bytes): the
+- * container entry's length and CRC32 (observed run wd3, review 0130 finding 8). The NVRAM entry is NOT pinned: it is only CRC-checked against its container record (swl_nv_prep). */
+-#define SWW_FW_LEN      1764018u
+-#define SWW_FW_CRC      0x1153ccffu
++ * container entry's length and CRC32 (observed run wd3, review 0130 finding 8). The NVRAM entry is NOT pinned: it is only CRC-checked against its container record (swl_nv_prep).
++ * Patch 0147: the single pin became a table of known identities (swl_fwids[]); a check accepts exactly one table entry (length AND CRC32 of the same row), nothing in between. */
++#define SWW_FW_LEN_BJ   1764018u        /* bluejay vendor fw_bcmdhd.bin: container entry observed run wd3 */
++#define SWW_FW_CRC_BJ   0x1153ccffu
++#define SWW_FW_LEN_OR   1764091u        /* oriole vendor fw_bcmdhd.bin: container line 'FW length 1764091 crc32 0x92567396 ok' (run wlan-oriole-l4); host zlib.crc32 of the extracted file, sha256 8a52ffe1 */
++#define SWW_FW_CRC_OR   0x92567396u
+ #define SWW_SEC_SBOOT   0x2u            /* DAR_SEC_SBOOT_MASK, include_pcie_core.h:1161; tested on the word at bp 0 because PCIe core 0x83c rev 72 < 74 (dhd_pcie.c:11741, 10208-10222) */
+ #define SWW_CORE_PCIE2  0x83c           /* PCIE2_CORE_ID, include_hndsoc.h:200; the core whose rev is DHD's buscorerev */
+-_Static_assert(SWW_FW_LEN == SWW_IMG_MAX, "the pinned firmware is the largest accepted image");
++_Static_assert(SWW_FW_LEN_OR == SWW_IMG_MAX && SWW_FW_LEN_BJ < SWW_IMG_MAX, "the larger pinned firmware is the largest accepted image");
++
++struct swl_fwid { uint32_t len, crc; };
++static const struct swl_fwid swl_fwids[] = {
++	{ SWW_FW_LEN_BJ, SWW_FW_CRC_BJ },
++	{ SWW_FW_LEN_OR, SWW_FW_CRC_OR },
++};
++
++/* 1 when (len, crc) is exactly one row of swl_fwids[], else 0 */
++static inline int
++swl_fw_known(uint32_t len, uint32_t crc)
++{
++	unsigned i;
++
++	for (i = 0; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {
++		if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {
++			return 1;
++		}
++	}
++	return 0;
++}
+ 
+ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ 
+@@ -286,6 +309,7 @@ struct swl_wx {
+ 	uint32_t tn[4];                                 /* run C: index of the next word swl_wr() accepts per tail kind SWK_* */
+ 	uint8_t rtlv[SWW_RTLV_RNG];                     /* run C: the random bytes of the rTLV */
+ 	uint32_t w14_old, rb;                           /* run D: the word read at address 0 before the store; the word swl_wr() last read back */
++	uint32_t armed_at_stop, rs_ok;                  /* patch 0147 (review F5): the groups armed when the stop latched, the groups whose restore was stored and read back */
+ };
+ 
+ static inline const char *
+@@ -579,14 +603,12 @@ swl_win_known(uint32_t w)
+ 	return 0;
+ }
+ 
+-/* The 0124 preconditions, re-read: PHY isolation, link L0, ATU r0/r1 (and r2 once enabled), EP Command MEM-only, BAR0. 0 = ok. */
++/* The RC-local half of the 0124 preconditions (no TLP): PHY isolation, link L0, ATU r0/r1 (swl_pre_link). 0 = ok, 8 = a read failed. Patch 0147 (review 0129-0132 F1): also the gate of a config-space restore. */
+ static inline int
+-swl_wpre(struct swl_wx *x)
++swl_lpre(struct swl_wx *x)
+ {
+-	static const uint32_t w2[7] = { 0u, SWW_ATU_ENABLE, SWW_TCM_PA, 0u, SWW_TCM_PA + (SWW_TCM_BYTES - 1u), SWW_TCM_PA, 0u };
+-	uint32_t iso, ltssm, cmd, b0, b1, a0[7], a1[7], r2;
++	uint32_t iso, ltssm, a0[7], a1[7];
+ 	unsigned i;
+-	int bad;
+ 
+ 	if (swl_rdx(x, SWW_ISO, 0, 0, &iso) || swl_rdx(x, SWW_ELBI, 0, 0x2C8u, &ltssm)) {
+ 		return 8;
+@@ -596,7 +618,19 @@ swl_wpre(struct swl_wx *x)
+ 			return 8;
+ 		}
+ 	}
+-	bad = swl_pre_link(iso, ltssm, a0, a1);
++	return swl_pre_link(iso, ltssm, a0, a1);
++}
++
++/* The 0124 preconditions, re-read: PHY isolation, link L0, ATU r0/r1 (and r2 once enabled), EP Command MEM-only, BAR0. 0 = ok. */
++static inline int
++swl_wpre(struct swl_wx *x)
++{
++	static const uint32_t w2[7] = { 0u, SWW_ATU_ENABLE, SWW_TCM_PA, 0u, SWW_TCM_PA + (SWW_TCM_BYTES - 1u), SWW_TCM_PA, 0u };
++	uint32_t cmd, b0, b1, r2;
++	unsigned i;
++	int bad;
++
++	bad = swl_lpre(x);
+ 	if (bad) {
+ 		return bad;
+ 	}
+@@ -633,7 +667,7 @@ swl_restore(struct swl_wx *x)
+ {
+ 	unsigned i;
+ 	uint32_t live, rb;
+-	int bad = 0, did = 0, skipped = 0, pre = -1, ok;
++	int bad = 0, did = 0, skipped = 0, pre = -1, lpre = -1, ok;
+ 
+ 	for (i = 0; i < sizeof swl_rs / sizeof swl_rs[0]; i++) {
+ 		const struct swl_rs *r = &swl_rs[i];
+@@ -642,6 +676,16 @@ swl_restore(struct swl_wx *x)
+ 			continue;
+ 		}
+ 		x->armed &= ~r->grp;
++		if (r->space == SWW_CFG) {      /* patch 0147 (review 0129-0132 F1): a config TLP only while the link and ATU region 0 are as proven */
++			if (lpre < 0) {
++				lpre = swl_lpre(x);
++			}
++			if (lpre) {
++				printf("SWEET WLAN: restore of group %u skipped, link precondition %d\n", r->grp, lpre);
++				skipped = 1;
++				continue;
++			}
++		}
+ 		if (r->space == SWW_BAR0) {
+ 			if (pre < 0) {
+ 				pre = swl_wpre(x);
+@@ -664,10 +708,27 @@ swl_restore(struct swl_wx *x)
+ 		ok = !swl_store(x, r->space, r->win, r->off, r->val) && !swl_rdx(x, r->space, r->win, r->off, &rb) && !((rb ^ r->val) & r->vmask);
+ 		printf("SWEET WLAN: restore space %d win %#x off %#x := %#x %s\n", r->space, r->win, r->off, r->val, ok ? "ok" : "FAILED");
+ 		bad |= !ok;
++		if (ok) {
++			x->rs_ok |= r->grp;
++		}
+ 	}
+ 	x->restore = bad ? SWW_RS_FAILED : skipped ? SWW_RS_SKIPPED : did ? SWW_RS_OK : SWW_RS_NONE;
+ }
+ 
++/* patch 0147 (review 0129-0132 F5): what a stop leaves changed, from the tuples done and the restores that were stored and read back (no bus access) */
++static inline void
++swl_left(const struct swl_wx *x)
++{
++	const char *r2, *sm, *ca, *w84;
++
++	r2 = !(x->done & (1u << SWT_ATU_CR2)) ? "untouched" : (x->rs_ok & SWW_RG_ATU2) ? "disabled again" : "ENABLED";
++	sm = (x->done & (1u << SWT_SM_RELEASE)) && !(x->rs_ok & SWW_RG_SM) ? "OUT OF RESET" : (x->done & (1u << SWT_SM_ASSERT)) ? "in reset" : "untouched";
++	ca = (x->done & (1u << SWT_CA_RELEASE)) && !(x->rs_ok & SWW_RG_CA) ? "OUT OF RESET, CPUHALT" : (x->done & (1u << SWT_CA_ASSERT)) ? "in reset" : "untouched";
++	w84 = !(x->armed_at_stop & SWW_RG_W84) ? "0" : (x->rs_ok & SWW_RG_W84) ? "0 (restored)" : "TAIL WINDOW (restore not done)";
++	printf("SWEET WLAN: left after stop: atu_r2=%s sys_mem=%s ca7=%s cfg84=%s cfg80=last window selected; armed %#x restored %#x tuples %#x\n",
++	    r2, sm, ca, w84, x->armed_at_stop, x->rs_ok, x->done);
++}
++
+ /* the first failure latches STOPPED, records the row and runs the restore; returns the negative code */
+ static inline int
+ swl_stop(struct swl_wx *x, int code)
+@@ -676,7 +737,9 @@ swl_stop(struct swl_wx *x, int code)
+ 		x->stopped = 1;
+ 		x->stop_code = code;
+ 		printf("SWEET WLAN: W%u STOP: %s (code %d)\n", x->row, swl_ename(code), code);
++		x->armed_at_stop = x->armed;
+ 		swl_restore(x);
++		swl_left(x);
+ 	}
+ 	return -code;
+ }
+@@ -723,8 +786,8 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 	    x->img_next >= (x->img_len + 3u) / 4u || val != swl_img_word(x, x->img_next))) {
+ 		return swl_stop(x, SWW_E_IMG);
+ 	}
+-	if ((p->flags & SWT_RV) && (x->img == NULL || x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC || val != swl_img_word(x, 0))) {
+-		return swl_stop(x, SWW_E_IMG);  /* run D: only image word 0 of the pinned firmware */
++	if ((p->flags & SWT_RV) && (x->img == NULL || !swl_fw_known(x->img_len, x->img_crc) || val != swl_img_word(x, 0))) {
++		return swl_stop(x, SWW_E_IMG);  /* run D: only image word 0 of a pinned firmware (patch 0147: a swl_fwids[] row) */
+ 	}
+ 	if (p->flags & SWT_TW) {        /* run C: the geometry, the kind's next address and its word are computed here from the state, not taken from the caller */
+ 		ti = x->tn[p->kind];
+@@ -1316,8 +1379,8 @@ swl_w13(struct swl_wx *x)
+ static inline int
+ swl_fw_pin(struct swl_wx *x)
+ {
+-	if (x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC) {
+-		printf("SWEET WLAN: W%u firmware identity %u bytes crc %#010x is not the pinned %u bytes crc %#010x\n", x->row, x->img_len, x->img_crc, SWW_FW_LEN, SWW_FW_CRC);
++	if (!swl_fw_known(x->img_len, x->img_crc)) {
++		printf("SWEET WLAN: W%u firmware identity %u bytes crc %#010x is not a pinned identity (%u B %#010x or %u B %#010x)\n", x->row, x->img_len, x->img_crc, SWW_FW_LEN_BJ, SWW_FW_CRC_BJ, SWW_FW_LEN_OR, SWW_FW_CRC_OR);
+ 		return swl_stop(x, SWW_E_IMG);
+ 	}
+ 	return 0;
