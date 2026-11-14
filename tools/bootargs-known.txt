@@ -452,13 +452,16 @@ swd_wakereason_panic	xnu
 swd_waketimeout	xnu
 sweet_amfi_debug	patch:0035
 sweetaccel	patch:0084
+sweetbatt	patch:0148
 sweetbattery	patch:0061
 sweetbusy	patch:0098
 sweetdev	patch:0117
 sweetenv	patch:0110
 sweetfb_hz	patch:0056
+sweetfb_inv	patch:0144
 sweetfb_native	patch:0060
 sweetfb_noconsole	patch:0046
+sweetfps	patch:0141
 sweetfvmap	patch:0097
 sweetgpu	patch:0102
 sweetgpujob	patch:0103
@@ -503,6 +506,7 @@ sweettouchvar	patch:0090
 sweetusb	patch:0070
 sweetusbdma	patch:0082
 sweetusblog	patch:0075
+sweetwlan	patch:0124
 syscall_rejection_mode	xnu
 task_exc_guard_default	xnu
 task_iomon_interval_secs	xnu
