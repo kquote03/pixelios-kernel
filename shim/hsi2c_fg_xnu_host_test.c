@@ -562,6 +562,7 @@ int main(void)
 	EXPECT(has("refused REPSOC reg=0x06 timeout"));
 	EXPECT(ticks - 1000 >= 24576000ull / 100);		/* waited at least 10 ms of counter */
 	EXPECT(ticks - 1000 <= 4 * (24576000ull / 100));	/* the counter ended it, not the poll cap */
+	EXPECT(nreads < 4u * 2500u * 4u);	/* ~2458 polls of 4 reads per 10 ms wait at 100 ticks per counter read: the counter bound, not the 100000-poll cap */
 	world(); rxtimeout_at = 4;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nw == 17 + 9 + 7 + 6 && restore_tail() && has("refused TEMP reg=0x08 timeout"));
 	/* the poll count bounds the wait even when the counter barely moves */
@@ -610,10 +611,13 @@ int main(void)
 		EXPECT(sfg_w32(&r, 0x00, 0xC8) == -2 && sfg_w32(&r, 0x00, 0x8) == -2 && sfg_w32(&r, 0x00, 0x80000048) == -2);
 		EXPECT(sfg_w32(&r, 0x04, 0x00010003) == -2 && sfg_w32(&r, 0x04, 0) == -2);
 		EXPECT(sfg_w32(&r, 0x20, 0x0F80) == -2 && sfg_w32(&r, 0x20, 0) == -2);
-		/* no other device: every 7-bit address but 0x36 in the master field is refused (0x69 charger, 0x66 PMIC, 0x25 TCPC, 0x57, 0x35 OVP) */
+		/* no other device: every 7-bit address but 0x36 in the master field is refused (0x69 charger, 0x66 PMIC, 0x57, 0x35 OVP). The one
+		 * exception is the snapshot itself: the bootloader leaves ADDR = 0x9400 (= 0x25 << 10, the TCPC, runs oriole-peri1/fg1), and the
+		 * restore writes it back WITHOUT MASTER_RUN (no transfer; RUN needs ADDR = 0xD800, checked below), exactly as the shim does. */
 		for (uint32_t a = 0; a < 0x80; a++)
-			if (a != 0x36)
-				EXPECT(sfg_w32(&r, 0x70, a << 10) == -2 || (a << 10) == 0x9400);
+			if (a != 0x36 && a != 0x25)
+				EXPECT(sfg_w32(&r, 0x70, a << 10) == -2);
+		EXPECT(nw == 0);
 		EXPECT(sfg_w32(&r, 0x70, 0x69u << 10) == -2 && sfg_w32(&r, 0x70, 0x66u << 10) == -2 &&
 		       sfg_w32(&r, 0x70, 0x57u << 10) == -2 && sfg_w32(&r, 0x70, 0x35u << 10) == -2 && sfg_w32(&r, 0x70, 0x0000D801) == -2 &&
 		       sfg_w32(&r, 0x70, 0x0700D800) == -2);
