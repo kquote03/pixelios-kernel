@@ -99,3 +99,12 @@ Compared against CI kernel `xnu-6980340` (same xnu/patches as `main`, verified w
 - `RESULT: FAIL build failed`: the first error lines are in the report; full log in `work/<label>/build.log`.
 - Stale or odd state: `--fresh` (70 s).
 - Debug make: `--make-args "--debug=b"`. A second work tree: `--label NAME`.
+
+## NixOS host (2026-11-14, plan oneshot-2 step I1)
+
+Observed on the dev machine (NixOS, no global packages): `tools/xnu-local-build` runs inside a `buildFHSEnv` kept next to the repos, `$W/pixos-lb-fhs.nix` (outside git):
+- packages of `pixos-fhs.nix` plus m4, autoconf, automake, libtool, flex, bison, rsync, libxcrypt, ncurses, libuuid, zlib, `stdenv.cc.cc.lib`, cmake, ninja, perl, dpkg and an `apt-get` stub (the tool only checks it exists);
+- `LD_LIBRARY_PATH=/usr/lib:/usr/lib64`: the prebuilt theos cctools (`ld64` etc.) need `libtinfo.so.6`, which the env has in /usr/lib but not in its ld.so.cache (fix 1);
+- a clang selector instead of plain `clang`: arguments containing `-apple-` go to `llvmPackages.clang-unwrapped` (21.1.8), everything else to the nix-wrapped clang. The wrapped clang adds `-Wl,-dynamic-linker=<glibc>` to the Mach-O link and ld64 refuses it (fix 2); the unwrapped one cannot link the host tools (no crtbegin/libgcc).
+Build: `nix-build -I nixpkgs=flake:nixpkgs pixos-lb-fhs.nix -o .pixos-lb-fhs`, then `.pixos-lb-fhs/bin/pixos-lb-fhs -c "tools/xnu-local-build --label NAME"`.
+Result (observed, run o2-local1 / o2-base-local1): make exit 0, 139 patches, kernel 15,880,904 B (CI 17,398,456 B), 0 unsupported instructions; it boots oriole to SBCoverSheet with touch scanning. Incremental rebuilds of one patch take minutes.
