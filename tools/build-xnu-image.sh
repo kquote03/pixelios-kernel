@@ -29,7 +29,8 @@ while [ $# -gt 0 ]; do case "$1" in
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
 export BOARD=${board:-${BOARD:-}}; board=$(python3 -I tools/boards.py --target) || exit 2
 [ -z "$wlanfw" ] || [ "$wlan" = 1 ] || { echo "--wlanfw needs --wlan-hold" >&2; exit 2; }
-case "$wlanlvl" in 1|2) ;; *) echo "--wlan-level needs 1 or 2" >&2; exit 2 ;; esac
+case "$wlanlvl" in [1-6]) ;; *) echo "--wlan-level needs 1..6 (0124: 1|2 read-only; 0129 3, 0130 4, 0131 5, 0132 6: chip writes, see their reviews)" >&2; exit 2 ;; esac
+[ "$wlanlvl" -lt 4 ] || [ -n "$wlanfw" ] || { echo "--wlan-level $wlanlvl copies the firmware image: needs --wlanfw (tools/pack_wlanfw.py)" >&2; exit 2; }
 [ "$wlan" = 1 ] || [ "$wlanlvl" = 1 ] || { echo "--wlan-level needs --wlan-hold" >&2; exit 2; }
 args="debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_checkin sweetusb=0 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1"
 [ "$usbnet" = 1 ] && args=${args/sweetusb=0/sweetusb=2}   # replace, never add: a duplicate key is ambiguous (review 17 L5: for key=value the LAST one wins in PE_parse_boot_argn, so `--gui --args sweetfb_noconsole=2` gives 2)
