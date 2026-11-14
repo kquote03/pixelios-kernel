@@ -17,7 +17,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
   push:
-    branches: [main]
+    branches: [main, wip/oriole-touch-0145]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -45,7 +45,10 @@ jobs:
 
   kernel:
     # macos-14 ships Xcode 15, whose iig matches the xnu-8796 IORPC ABI (Xcode 16's does not)
-    runs-on: macos-14
+    # macos-14 is retired ("configuration macos-14-arm64-us-default is not supported", run 43257314710); no hosted image has
+    # Xcode 15 (xcprobe run 43258010625: macos-15 = Xcode 16.0-16.3, macos-26 = 26.x). Try the oldest Xcode 16; its iig may not
+    # match the xnu-8796 IORPC ABI (DriverKit only; the local build stubs DriverKit too, docs/LOCAL-BUILD.md).
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
