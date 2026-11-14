@@ -588,3 +588,12 @@ tools/phone-battery [--record RUN_DIR] [--min MV]
 Only `fastboot getvar product|battery-voltage|battery-soc-ok` (8 s each), only when `product` == `$BOARD`. Last line
 `RESULT: PASS battery-voltage=NNNN mV soc-ok=yes|no` (0) / FAIL (1: missing or below `--min`) / ERROR (2). `--record` merges `battery_mv`,
 `battery_soc_ok` into `RUN_DIR/run.json`. Tests: `tools/test_phone_battery.py` (fake fastboot). First oriole read: 4029 mV, soc-ok yes [obs 2026-11-14].
+
+### sweetpcie1mmu=1 (xnu patch 0149, READ-ONLY, plan oneshot-2 W4)
+With `sweetwlan>=1` and `--wlan-hold`, right after `SWEET WLAN: stage 1 done`: prints `SWEET PCIE1 MMU: ep cmd/status ... bus master on|off`, the RC iATU inbound regions 0..3
+(`atu in rN ...`), then `reading s2mpu_hsi2 0x14480000`, `s2mpu_hsi2 CTRL0=...`, `FAULT_STATUS=...`, `done (read-only)`. No store. A hang after the "reading" line means the S2MPU
+block is not readable from EL1 (power cycle reverts). Run: `tools/xrun ... --wlan-hold --intent wlan --args 'sweetwlan=2 sweetpcie1mmu=1' --expect 'SWEET PCIE1 MMU: done'`.
+
+### patch 0147 (sweetwlan=4..6 on oriole)
+The level-6 firmware pin is a table (bluejay 1764018 B crc 0x1153ccff, oriole 1764091 B crc 0x92567396), the image bound is 1764091 B; levels >= 4 only accept a table identity.
+A stop prints `SWEET WLAN: left after stop: atu_r2=.. sys_mem=.. ca7=.. cfg84=..`; a cfg 0x84 restore with the link down is `skipped` (review F1).

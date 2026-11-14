@@ -1,0 +1,71 @@
+SWEET PCIe1 MMU probe (patch 0149, plan 2026-11-14 oneshot-2 step W4), boot-arg sweetpcie1mmu=1, READ-ONLY. Needs sweetwlan >= 1 (runs right after "stage 1 done", i.e. with the link in L0
+and ATU r0/r1 proven). Prints the EP Command/Status word (bus master bit), the RC's DesignWare iATU inbound regions 0..3 (unrolled layout, Linux pcie-designware.h PCIE_ATU_UNROLL_BASE)
+and CTRL0 / FAULT_STATUS of the HSI2 S2MPU at 0x14480000 (gs101-s2mpu.dtsi:18-24; PCIe1's DT node names it and has use-sysmmu = false). Lines: "SWEET PCIE1 MMU: ...", last
+"SWEET PCIE1 MMU: done (read-only)". No store. Without the boot-arg nothing changes.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index 571d351..c5bca3e 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -321,6 +321,42 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
+ }
+ 
++/*
++ * Patch 0149 (plan oneshot-2 step W4, boot-arg sweetpcie1mmu=1): READ-ONLY view of what stands between the BCM4389 and host memory, for the DMA design (W7).
++ * - S2MPU of HSI2 (the PCIe1 stream ids 4/5): reg 0x14480000 size 0x10000 (Google gs101-s2mpu.dtsi:18-24, kernel/devices/google/gs101 a9b5edb); pcie_1 points at it
++ *   (gs101-pcie.dtsi pcie@14520000 "s2mpu = <&s2mpu_hsi2>", "use-sysmmu = false": no SysMMU node for PCIe1). Read: CTRL0 +0x0 and FAULT_STATUS +0x2000, the two words patch 0102
++ *   reads on the G3D S2MPUs (docs/research/28 section 6, soc-gs s2mpu-regs.h); observed readable from EL1 for G3D (run gpu-oriole-g4).
++ * - DesignWare iATU inbound regions 0..3 of the RC: unrolled layout region << 9 | dir << 8, dir 1 = inbound (Linux v6.18 drivers/pci/controller/dwc/pcie-designware.h
++ *   PCIE_ATU_UNROLL_BASE); the outbound regions 0/1/2 at 0x000/0x200/0x400 of the same block are the ones 0124/0129 already read (SW_ATU). 7 words each (CR1, CR2, LOWER_BASE,
++ *   UPPER_BASE, LIMIT, LOWER_TARGET, UPPER_TARGET), RC-local DBI reads (no TLP).
++ * - EP Command/Status (cfg 0x04): bit 2 = Bus Master Enable (PCI spec); read through the config window 0124 proved.
++ * No store anywhere in this function. Runs only after stage 1 passed (link L0, ATU r0/r1 as the shim left them).
++ */
++static void
++sweet_pcie1_mmu_probe(volatile uint32_t *atu, volatile uint32_t *cfg)
++{
++	volatile uint32_t *s;
++	uint32_t cmd, w[7];
++	unsigned r, i;
++
++	cmd = cfg[0x04 / 4];
++	printf("SWEET PCIE1 MMU: ep cmd/status %#x bus master %s; sysmmu none (DT use-sysmmu=false)\n", cmd, (cmd & 0x4u) ? "ON" : "off");
++	for (r = 0; r < 4; r++) {
++		for (i = 0; i < 7; i++) {
++			w[i] = atu[((r << 9) | 0x100u) / 4 + i];
++		}
++		printf("SWEET PCIE1 MMU: atu in r%u cr1 %#x cr2 %#x base %#x:%#x limit %#x target %#x:%#x\n", r, w[0], w[1], w[3], w[2], w[4], w[6], w[5]);
++	}
++	printf("SWEET PCIE1 MMU: reading s2mpu_hsi2 0x14480000\n");
++	s = sw_map(0x14480000ull, 0x4000);
++	if (s == NULL) {
++		return;
++	}
++	printf("SWEET PCIE1 MMU: s2mpu_hsi2 CTRL0=%#x\n", s[0]);
++	printf("SWEET PCIE1 MMU: s2mpu_hsi2 FAULT_STATUS=%#x\n", s[0x2000 / 4]);
++	printf("SWEET PCIE1 MMU: done (read-only)\n");
++}
++
+ void
+ sweet_wlan_init(void)
+ {
+@@ -329,7 +365,7 @@ sweet_wlan_init(void)
+ 	DTEntry node;
+ 	char const *compat = NULL;
+ 	unsigned int csize = 0;
+-	uint32_t level = 0, iso, ltssm, a0[7], a1[7];
++	uint32_t level = 0, mmu = 0, iso, ltssm, a0[7], a1[7];
+ 	int bad;
+ 	unsigned i;
+ 	struct sw_hw hw = { 0 };
+@@ -403,6 +439,9 @@ sweet_wlan_init(void)
+ 	bus.ctx = &hw;
+ 	if (swl_stage1(&bus, &chip, hw.level) == 0) {
+ 		printf("SWEET WLAN: stage 1 done level %u (read-only)\n", (unsigned)hw.level);
++		if (PE_parse_boot_argn("sweetpcie1mmu", &mmu, sizeof(mmu)) && mmu == 1) {
++			sweet_pcie1_mmu_probe(atu, hw.cfg);
++		}
+ 		if (level >= 6 && !swl_w14_rev_ok(&chip)) {
+ 			printf("SWEET WLAN: W14 needs the DAR security register (PCIe core 0x83c missing or rev not < 74 or 128), not implemented, running level 5\n");
+ 			level = 5;

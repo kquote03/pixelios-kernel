@@ -470,6 +470,7 @@ sweetlog	patch:0047
 sweetlogts	patch:0115
 sweetmali	patch:0104
 sweetnull	patch:0048
+sweetpcie1mmu	patch:0149
 sweetqr	patch:0081
 sweetqr_chunk	patch:0081
 sweetqr_ecc	patch:0094
