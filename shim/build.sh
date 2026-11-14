@@ -430,8 +430,11 @@ fi
 chk() { local what="$1" prev="" a; shift; for a; do [ "$prev" = -o ] && case $a in *host_test*) echo "${a##*/}" >>"$O/host-tests.list" ;; esac; prev=$a; done	# a failed compile or test must stop the build; every compiled *host_test* output is listed for the gate (check-all.sh host-tests fails if one is missing)
 	if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }
 htdir=${XDG_CACHE_HOME:-$HOME/.cache}/pixelios/host-tests
+# xnu patch 0148: the /sweet-batt ADT property bytes tools/mkadt.py writes for oriole (the only board with an fg block), for hsi2c_fg_xnu_host_test.c
+"$PYTHON" -c 'import sys; sys.path.insert(0, ".."); from tools import mkadt; sys.stdout.write(mkadt.sweet_batt_c("oriole"))' > $O/sweet_batt_adt.h ||
+	{ echo "FAIL tools/mkadt.py sweet_batt_c (out/sweet_batt_adt.h)" >&2; exit 1; }
 # shellcheck disable=SC2046  # intentional word splitting of the file lists (an empty "" argument would break sha256sum)
-htdigest() { { sha256sum *.c *.h $O/board_config.h $([ -f $O/wlan_seq.h ] && echo $O/wlan_seq.h) $(grep -o '\.\./xnu/patches/[0-9][0-9]*-[A-Za-z0-9._-]*\.patch' build.sh | sort -u) build.sh; gcc -v 2>&1; } | sha256sum | cut -c1-32; }
+htdigest() { { sha256sum *.c *.h $O/board_config.h $O/sweet_batt_adt.h $([ -f $O/wlan_seq.h ] && echo $O/wlan_seq.h) $(grep -o '\.\./xnu/patches/[0-9][0-9]*-[A-Za-z0-9._-]*\.patch' build.sh | sort -u) build.sh; gcc -v 2>&1; } | sha256sum | cut -c1-32; }
 ht=$(htdigest)
 if [ -e "$htdir/$ht.ok" ] && [ "${PIXELIOS_HOST_TESTS:-}" != always ]; then
 	echo "host tests: cached $ht"
@@ -590,6 +593,12 @@ else
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
 	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c
 	chk "touchpoke_host_test" $O/touchpoke_host_test
+	# READ-only fuel-gauge reader of xnu patch 0148 (new-file hunk of bsd/dev/sweet_hsi2c_fg.h): replayed against a fake HSI2C12 + gauge, config from the mkadt bytes above
+	awk '$0=="+++ b/bsd/dev/sweet_hsi2c_fg.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0148-sweet-hsi2c-fg.patch > $O/sweet_hsi2c_fg.h
+	chk "hsi2c_fg_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/hsi2c_fg_xnu_host_test hsi2c_fg_xnu_host_test.c
+	chk "hsi2c_fg_xnu_host_test" $O/hsi2c_fg_xnu_host_test
+	chk "hsi2c_fg_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/hsi2c_fg_xnu_asan_host_test hsi2c_fg_xnu_host_test.c
+	chk "hsi2c_fg_xnu_asan_host_test" $O/hsi2c_fg_xnu_asan_host_test
 	# the inputs may have been edited while the tests ran: stamp only if the digest is unchanged (otherwise the next build runs them again)
 	if [ "$(htdigest)" = "$ht" ]; then mkdir -p "$htdir" && : >"$htdir/$ht.ok.$$" && mv -f "$htdir/$ht.ok.$$" "$htdir/$ht.ok"; else echo "host tests: inputs changed while they ran, no stamp"; fi
 fi

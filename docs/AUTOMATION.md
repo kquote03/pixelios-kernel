@@ -433,6 +433,32 @@ Oriole recipe, one variable per run vs oriole-gui5 (CR-08), each with `--rails`:
 A (read-only additions) `sweettouchmux=1 sweettouchcs=1 sweettouchsysinfo=1 sweettouchidwait=100 sweettouchidretry=3 sweettouchpoke=m:10c00640=10=0;d:100;m:10c0180c=f=5;`;
 B = A + `sweettouchspi4=2` (changed vs A: SPI4 block); C = A + `sweettouchspi4=3` (changed vs B: M3 hold). Status: not run (no device result yet).
 
+## Fuel-gauge reader: `sweetbatt=1` (xnu patch 0148, plan step C4; BUILT, UNRUN, awaiting an independent review)
+
+Default off: without `sweetbatt=1` (absent or `0`) the patch maps nothing and reads nothing (*read from source*: `sweet_batt_init()` returns
+before any ADT lookup; pinned by `tools/test_hsi2c_fg_audit.py`); any other value prints `SWEET BATTERY: refused sweetbatt=N ...`. It also needs
+the ADT node `/sweet-batt` (`tools/mkadt.py`, only boards whose board.json has an `fg` block, today oriole). Not in `xnu_bootargs_default`.
+What it does: the controller sequence of the reviewed shim `--fg-read` (branch wip/shim-fg-read, `shim/fgread.c`, review
+`docs/reviews/fgread-review-fable-1.md` there: SAFE after F1-F4) from an XNU kernel thread, 20 s after `sweet_ufs_init`, then every 30 s:
+I2C READs of the MAX77759 fuel gauge (7-bit 0x36 only) on HSI2C12, registers 0x06 0x08 0x09 0x0A 0x0B 0x35 0x21 only, each = one pointer
+byte written + a repeated-start 2-byte read. Same seven writable controller registers, values, order, preconditions (i2c12 gate, pads F4,
+TIMEOUT/TRAILING already Linux's), bounded waits (10 ms of counter and 100000 polls per message) and F1-F3 restore as the shim; additionally
+the live controller must equal the handoff words observed in runs oriole-peri1/oriole-fg1 (board.json `fg.handoff`). Each register transfer
+and the restore run with preemption disabled (at most ~30 ms on a fault path). No reset, no reconfiguration, no bus recovery, ever.
+Lines: first set `SWEET BATTERY: before ...` (4), `restore wait idle=1`, `restore ...` (3), `raw 06=XXXX 08=XXXX 09=XXXX 0A=XXXX 0B=XXXX 35=XXXX
+21=XXXX restore=ok|FAILED`; every set `SWEET BATTERY: soc=NN.NN% v=NNNN mV i=+-N.N mA t=NN.N C src=fg` (i = AvgCurrent with the register sign,
+negative = discharging; Linux reports the opposite sign). Any refusal or failure: `SWEET BATTERY: refused <reason>` (a failed register:
+`refused <NAME> reg=0xNN nack|timeout|error restore=ok|FAILED`), `!!! RESTORE FAILED` lines if the read-back differs, then
+`SWEET BATTERY: reader stopped, no further HSI2C12 access this boot`. Code: `bsd/dev/sweet_hsi2c_fg.h` (pure, all access through
+`struct sfg_ops`, one writer `sfg_w32()`), `bsd/dev/sweet_hsi2c.c` (glue). Tests: `shim/hsi2c_fg_xnu_host_test.c` (also ASan/UBSan, built by
+`shim/build.sh`), `tools/test_mkadt_batt.py`, `tools/test_hsi2c_fg_audit.py`.
+Run form once reviewed (not run yet): `tools/xrun ... --args "sweetbatt=1"`, expect `SWEET BATTERY: soc=`; never with a shim `--fg-read` image
+in the same boot (the bus could be left mid-transfer, review F5).
+
+| Step | Status | Tag |
+|---|---|---|
+| C4 hsi2c-fg (XNU fuel-gauge reader) | built, unrun (awaiting review): patch 0148 applies on the stack (tools/stack-apply PASS), local kernel build RESULT PASS sha256 88444aa3 (~/pixelios-artifacts/xnu-local-c4-9225e36), host test PASS normal + ASan/UBSan, audit PASS; on hardware: nothing yet | observed (host builds/tests only, 2026-11-14); hardware behaviour: guess until a run |
+
 ## tools/probe-run: one shim probe cycle, one report
 
 ```
