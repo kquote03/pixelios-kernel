@@ -558,7 +558,7 @@ else
 	awk '$0=="+++ b/bsd/dev/sweet_wlan_chip.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0124-sweet-wlan-bwfm-core.patch > $O/sweet_wlan_chip.h
 	chk "wlan_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_xnu_host_test wlan_xnu_host_test.c
 	chk "wlan_xnu_host_test" $O/wlan_xnu_host_test
-	# stage-3 chip WRITER of xnu patches 0129 + 0130 + 0131 + 0132 + 0147 (new-file hunk of bsd/dev/sweet_wlan_wr.h, includes the chip header above): replayed with fault injection (mutants: tools/test_wlan_wr_mutants.py)
+	# stage-3 chip WRITER of xnu patches 0129 + 0130 + 0131 + 0132 + 0147 + 0150 + 0154 (new-file hunk of bsd/dev/sweet_wlan_wr.h, includes the chip header above): replayed with fault injection (mutants: tools/test_wlan_wr_mutants.py)
 	awk '$0=="+++ b/bsd/dev/sweet_wlan_wr.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0129-sweet-wlan-chip-writes.patch > $O/sweet_wlan_wr.h
 	# patch 0130 (run B) changes that header: apply its hunk for the file on top of the 0129 text, so the test sees the bytes the kernel gets
 	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0130-sweet-wlan-image-copy.patch > $O/sweet_wlan_wr.0130.diff
@@ -580,6 +580,10 @@ else
 	# patch 0150 (run E: CA7 release, firmware-ready poll, read-only shared/console dump) changes it once more: the same way, on top of the text after 0147
 	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0150-sweet-wlan-fw-ready.patch > $O/sweet_wlan_wr.0150.diff
 	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0150.diff || { echo "FAIL patch 0150 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
+	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
+	# patch 0154 (review 0147 N3 board-bound identity table, review 0150 G2 cites) changes it once more: the same way, on top of the text after 0150
+	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0154-sweet-wlan-ca7-latch.patch > $O/sweet_wlan_wr.0154.diff
+	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0154.diff || { echo "FAIL patch 0154 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
 	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
 	chk "wlan_wr_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_wr_host_test wlan_wr_host_test.c
 	chk "wlan_wr_host_test" $O/wlan_wr_host_test

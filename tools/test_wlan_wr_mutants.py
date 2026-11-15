@@ -4,7 +4,7 @@ Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in 
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
 EQUIVALENT with the clause that implies it (CR-02). A pattern that matches nothing fails too (the header changed under the mutant list).
 Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; patch 0131 (run C: W11 NVRAM text, W12 length token, W13 rTLV) changes them again; patch 0132 (run D: W14 reset vector, firmware identity pin) once more; the texts under test are the files
-after 0124, 0128, 0129, 0130, 0131, 0132, 0147, 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
+after 0124, 0128, 0129, 0130, 0131, 0132, 0147, 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump; 0154: the glue release gate and BAR2 latch, review 0150 G1, and the board-bound identity table, review 0147 N3). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
 process_nvram_vars port); a mutant is killed when either fails.
 Run: python3 -B tools/test_wlan_wr_mutants.py  (also picked up by `unittest discover -s tools -p 'test_*.py'`)."""
 import concurrent.futures
@@ -27,6 +27,7 @@ PATCH0131 = os.path.join(ROOT, "xnu", "patches", "0131-sweet-wlan-nvram-rtlv.pat
 PATCH0132 = os.path.join(ROOT, "xnu", "patches", "0132-sweet-wlan-reset-vector.patch")
 PATCH0147 = os.path.join(ROOT, "xnu", "patches", "0147-sweet-wlan-fw-ident.patch")
 PATCH0150 = os.path.join(ROOT, "xnu", "patches", "0150-sweet-wlan-fw-ready.patch")
+PATCH0154 = os.path.join(ROOT, "xnu", "patches", "0154-sweet-wlan-ca7-latch.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
 TEST_NV = os.path.join(ROOT, "shim", "wlan_nv_host_test.c")
 HDR_PATH = "bsd/dev/sweet_wlan_wr.h"
@@ -65,7 +66,7 @@ def apply_chain(path, patches):
 
 
 def final_header():
-    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150))
+    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154))
 
 
 def glue_before():
@@ -73,7 +74,7 @@ def glue_before():
 
 
 def glue_after():
-    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150))
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154))
 
 
 def new_file(patch, path):
@@ -126,7 +127,13 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_stage3", "x.b = &wb;"),
     ("sweet_wlan_stage3", "x.level = level;"),
     ("sweet_wlan_stage3", "hw->l3 = level;"),  # patch 0132: sw3_wr allows backplane address 0 only at level 6 ...
-    ("sweet_wlan_stage3", "hw->rv_ok = level >= 6 && sw_fw.p != NULL && swl_fw_known(sw_fw.len, sw_fw.crc);"),  # review 0132 F5: the pin, in the glue too (patch 0147: the identity table)
+    ("sweet_wlan_stage3", "hw->rv_ok = level >= 6 && sw_fw.p != NULL && swl_fw_known(sw_fw.len, sw_fw.crc, hw->board);"),  # review 0132 F5: the pin, in the glue too (patch 0147: the identity table; 0154: of this board)
+    ("sweet_wlan_stage3", "char const *mn = NULL;"),  # patch 0154 (review 0147 N3): the root ADT model-number
+    ("sweet_wlan_stage3", "unsigned int mnsz = 0;"),
+    ("sweet_wlan_stage3", 'hw->board = SecureDTLookupEntry(NULL, "", &root) == kSuccess && SecureDTGetProperty(root, "", (void const **)&mn, &mnsz) == kSuccess ? swl_board_id(mn, mnsz) : 0;'),
+    ("sweet_wlan_stage3", "hw->released = 0;"),  # patch 0154 (review 0150 G1): the latch starts open at every stage 3 run ...
+    ("sweet_wlan_stage3", "x.board = hw->board;"),
+    ("sw3_wr", "h->released = 1;"),  # ... and closes at the first CA7 IOCTL store without CPUHALT
     ("sweet_wlan_stage3", "hw->rv_done = 0;"),
     ("sw3_wr", "h->rv_done = 1;"),  # the one store at backplane address 0 is made once
     ("sweet_wlan_stage3", "hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;"),  # ... and only this word
@@ -239,6 +246,16 @@ def audit_store_path(hdr, glue):
     # review 0131 F2: the rTLV entropy is drawn in full
     if body(glue, "sw3_rng").count("read_random(buf, n);") != 1:
         f.append("sw3_rng does not draw all n bytes with read_random")
+    # patch 0154 (review 0150 G1): the release gate and the BAR2 latch are in sw3_wr, the latch before the store, the CPUHALT bit is DHD's SICF_CPUHALT
+    w = body(glue, "sw3_wr")
+    gate = w.find("!(v & SW_CPUHALT) && (h->l3 < 7 || !h->rv_done)) {")
+    latch = w.find("if (space == SWW_BAR2 && h->released) {")
+    setl = w.find("h->released = 1;")
+    store = w.find("*p = v;")
+    if gate < 0 or latch < 0 or setl < 0 or store < 0 or not (gate < store and latch < store and setl < store):
+        f.append("sw3_wr has no release gate / BAR2 latch before the store")
+    if not re.search(r"^#define SW_CPUHALT\s+0x20u\b", glue, re.M):
+        f.append("SW_CPUHALT is not 0x20u")
     return f
 
 
@@ -572,20 +589,20 @@ MUTANTS = [
     ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV)", "(SWT_BULK | SWT_TW)")], None),
     ("run D swl_wr: guard removed", [("if ((p->flags & SWT_RV) && (x->img == NULL", "if (0 && (x->img == NULL")], None),
     ("run D swl_wr: no image", [("(p->flags & SWT_RV) && (x->img == NULL || !swl_fw_known", "(p->flags & SWT_RV) && (!swl_fw_known")], None),
-    ("run D swl_wr: identity not checked", [("|| !swl_fw_known(x->img_len, x->img_crc) || val != swl_img_word(x, 0)", "|| val != swl_img_word(x, 0)")], None),
-    ("run D swl_wr: value not image word 0", [("|| !swl_fw_known(x->img_len, x->img_crc) || val != swl_img_word(x, 0)))", "|| !swl_fw_known(x->img_len, x->img_crc)))")], None),
-    ("run D pin: always passes", [("if (!swl_fw_known(x->img_len, x->img_crc)) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (0) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
+    ("run D swl_wr: identity not checked", [("|| !swl_fw_known(x->img_len, x->img_crc, x->board) || val != swl_img_word(x, 0)", "|| val != swl_img_word(x, 0)")], None),
+    ("run D swl_wr: value not image word 0", [("|| !swl_fw_known(x->img_len, x->img_crc, x->board) || val != swl_img_word(x, 0)))", "|| !swl_fw_known(x->img_len, x->img_crc, x->board)))")], None),
+    ("run D pin: always passes", [("if (!swl_fw_known(x->img_len, x->img_crc, x->board)) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (0) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
     # --- patch 0147: the identity table swl_fwids[] / swl_fw_known
-    ("fwid: rows mixed", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {", "if (len == swl_fwids[i].len || crc == swl_fwids[i].crc) {")], None),
-    ("fwid: length not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {", "if (crc == swl_fwids[i].crc) {")], None),
-    ("fwid: CRC not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {", "if (len == swl_fwids[i].len) {")], None),
+    ("fwid: rows mixed", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc && board", "if ((len == swl_fwids[i].len || crc == swl_fwids[i].crc) && board")], None),
+    ("fwid: length not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc && board", "if (crc == swl_fwids[i].crc && board")], None),
+    ("fwid: CRC not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc && board", "if (len == swl_fwids[i].len && board")], None),
     ("fwid: last row skipped", [("for (i = 0; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {", "for (i = 0; i + 1 < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {")], None),
     ("fwid: first row skipped", [("for (i = 0; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {", "for (i = 1; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {")], None),
-    ("fwid: always known", [("\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 0;\n}\n\nenum { SWW_CFG = 1", "\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 1;\n}\n\nenum { SWW_CFG = 1")], None),
+    ("fwid: always known", [("\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 0;\n}\n\n/* patch 0154: the board id", "\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 1;\n}\n\n/* patch 0154: the board id")], None),
     ("fwid: another bluejay CRC", [("#define SWW_FW_CRC_BJ   0x1153ccffu", "#define SWW_FW_CRC_BJ   0x1153ccfeu")], None),
     ("fwid: another oriole CRC", [("#define SWW_FW_CRC_OR   0x92567396u", "#define SWW_FW_CRC_OR   0x92567397u")], None),
-    ("fwid: another oriole length row", [("\t{ SWW_FW_LEN_OR, SWW_FW_CRC_OR },", "\t{ SWW_FW_LEN_OR - 1u, SWW_FW_CRC_OR },")], None),
-    ("fwid: another bluejay length row", [("\t{ SWW_FW_LEN_BJ, SWW_FW_CRC_BJ },", "\t{ SWW_FW_LEN_BJ + 4u, SWW_FW_CRC_BJ },")], None),
+    ("fwid: another oriole length row", [("\t{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE },", "\t{ SWW_FW_LEN_OR - 1u, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE },")], None),
+    ("fwid: another bluejay length row", [("\t{ SWW_FW_LEN_BJ, SWW_FW_CRC_BJ, SWW_BOARD_BLUEJAY },", "\t{ SWW_FW_LEN_BJ + 4u, SWW_FW_CRC_BJ, SWW_BOARD_BLUEJAY },")], None),
     # --- patch 0147, review 0129-0132 F1: a config restore only while the link half of the preconditions holds; F5: the state left
     ("F1: config restore without the link check", [("\t\t\tif (lpre) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group %u skipped, link", "\t\t\tif (0) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group %u skipped, link")], None),
     ("F1: gate on another space", [("if (r->space == SWW_CFG) {      /* patch 0147", "if (r->space == SWW_BAR2) {      /* patch 0147")], None),
@@ -642,6 +659,24 @@ MUTANTS = [
     ("run E W16: ends on the tail window", [("\tSWW_TRY(swl_w84_zero(x));        /* review 0150 F1", "\t(void)0;        /* review 0150 F1")], None),
     ("run E con_out: no line cap", [("if (ch == '\\n' || len == SWW_CON_LINE) {", "if (ch == '\\n') {")], None),   # review 0150 F6
     ("run E con_out: non-printables printed", [("\t\tif (ch >= 0x20 && ch < 0x7F) {", "\t\tif (ch != '\\n') {")], None),
+    # --- patch 0154: review 0150 G3 (the survivors of review 0150-1 F6, now covered), G4 (EQUIVALENT), review 0147 N3 (the identity table bound to the board)
+    ("run E W16: no token/RAM pre-check (X3)", [("\tif (x->tok == 0u || x->ram_bytes < SWW_RAM_MIN) {\n\t\treturn swl_stop(x, SWW_E_STATE);", "\tif (0) {\n\t\treturn swl_stop(x, SWW_E_STATE);")], None),
+    ("run E tuple: middle IOCTL from any IOCTL (X8)", [(".omask = SWW_IOCTL_MASK, .oval = 0x21u, .coff = SWL_AGENT_RESET_CTL", ".coff = SWL_AGENT_RESET_CTL")], None),
+    ("run E window tuple: back to 0 before the release (X9)", [(".oval = SWW_WIN_TAIL, .need = SWF_W15 },", ".oval = SWW_WIN_TAIL, .need = SWF_W14 },")], None),
+    ("run E W17: unaligned console pointer followed (X15)", [("\tif ((x->con & 3u) || x->con < SWW_RAM_BASE", "\tif (x->con < SWW_RAM_BASE")], None),
+    ("run E bp_rd: no disarm on window 0 (X2)", [("\t\tif (want == 0u) {\n\t\t\tx->armed &= ~SWW_RG_W84;\n\t\t}\n", "")], None),
+    ("run E w84_zero: no disarm (X2)", [("\t\tx->w84 = 0;\n\t\tx->armed &= ~SWW_RG_W84;\n", "\t\tx->w84 = 0;\n")], None),
+    ("run E W16 not up: window left for the restore (X11)", [("if (!swl_w84_zero(x) && !swl_win(x, SWW_WIN_CA7WRAP)", "if (!swl_win(x, SWW_WIN_CA7WRAP)")], None),
+    ("run E swl_left: the run E tail branch dropped (G4/Y5)", [('(x->flags & SWF_W15) && x->w84 ? "TAIL WINDOW (run E, restore not armed)" : "0"', '"0"')],
+     "swl_w84_zero runs before every swl_done of W16/W17 and every tail move goes through swl_wr, which arms SWW_RG_W84 first (review 0150-2 G4): at a stop, x->w84 != 0 implies the group is in armed_at_stop, so the branch is never taken"),
+    ("identity: board not compared (N3)", [("&& board == swl_fwids[i].board", "")], None),
+    ("identity: oriole row on the bluejay board (N3)", [("{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE }", "{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_BLUEJAY }")], None),
+    ("identity: W14 pin ignores the board (N3)", [("if (!swl_fw_known(x->img_len, x->img_crc, x->board)) {", "if (!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY)) {")], None),
+    ("identity: reset-vector tuple ignores the board (N3)", [("!swl_fw_known(x->img_len, x->img_crc, x->board) || val", "!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY) || val")],
+     "swl_fw_pin(x) with the same (img_len, img_crc, board) runs before any store in swl_stage3 (row 14) and again at the start of swl_w14, so a store reaching the SWT_RV check already passed the board-bound pin"),
+    ("board id: prefix accepted (N3)", [("if (n != b[i].len) {", "if (n > b[i].len) {")], None),
+    ("board id: length ignored (N3)", [("if (n != b[i].len) {\n\t\t\tcontinue;\n\t\t}\n", "")], None),
+    ("board id: NULL followed (N3)", [("\tif (s == NULL) {\n\t\treturn 0;\n\t}\n", "")], None),
 ]
 
 
@@ -752,7 +787,10 @@ struct sw_hw {
 	uint32_t rv;
 	int rv_ok;
 	int rv_done;
+	int released;
+	uint32_t board;
 };
+#define SW_CPUHALT 0x20u        /* the glue's define (audit_store_path pins it there) */
 @GLUE@
 static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[0x400000 / 4];
 static uint32_t *const arr[] = { cfg, atu, elbi, iso, mem, tcm };
@@ -777,7 +815,7 @@ int main(void)
 	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
 	static const uint32_t vals[] = { 0xDEADBEEFu, 0u, 0x400000u };
 	static const uint32_t bwins[] = { 0u, 0x400000u, 0x200000u, 0x800000u, 0x18001000u };
-	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0 };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0, 0, 0 };
 	int bad = 0, acc = 0;
 
 	(void)sw3_rd;
@@ -866,6 +904,64 @@ int main(void)
 		}
 	}
 	for (int i = 0; i < 4; i++) tcm[i] = 0x10000000u * 6 + (uint32_t)i;
+	/* patch 0154 (review 0150 G1): a CA7 IOCTL value without CPUHALT (0x20) only at stage 3 level 7 and after the reset-vector store (rv_done); such a store latches released;
+	 * after it no BAR2 store at all, while cfg 0x80/0x84, the CA7 RESET_CTL (the restore) and CPUHALT values stay allowed. The SYS_MEM wrapper IOCTL 0x1 neither needs the gate nor latches. */
+	{
+		static const uint32_t iv[] = { 0x1u, 0x3u, 0x0u, 0x21u, 0x23u, 0x20u, 0xFFFFFFDFu, 0x80000001u };
+
+		for (int l3 = 0; l3 < 9; l3++) {
+			for (int rd = 0; rd < 2; rd++) {
+				for (unsigned vi = 0; vi < 8; vi++) {
+					for (int wsel = 0; wsel < 2; wsel++) {
+						uint32_t w = wsel ? SWW_WIN_SMWRAP : SWW_WIN_CA7WRAP;
+						int ca = !wsel, halt = (iv[vi] & 0x20u) != 0;
+
+						hw.l3 = l3; hw.rv_done = rd; hw.released = 0;
+						cfg[0x80 / 4] = w;
+						mem[0x408 / 4] = 0x77777777u;
+						int r = sw3_wr(&hw, SWW_BAR0, w, 0x408, iv[vi]);
+						int want = !ca || halt || (l3 >= 7 && rd);
+						if ((r == 0) != want || (r == 0 ? mem[0x408 / 4] != iv[vi] : mem[0x408 / 4] != 0x77777777u) || hw.released != (r == 0 && ca && !halt)) {
+							if (bad++ < 20) printf("BAD release gate l3 %d rv_done %d win %#x val %#x: ret %d released %d, want accept %d\n", l3, rd, w, iv[vi], r, hw.released, want);
+						}
+						acc += r == 0;
+					}
+				}
+			}
+		}
+		/* the latch: released = 1 refuses every BAR2 store (window 0 from the RAM base, the tail window, the reset vector word) and nothing else changes */
+		for (int rel = 0; rel < 2; rel++) {
+			static const uint32_t bw[] = { 0u, 0x400000u, 0u };
+			static const uint32_t bo[] = { 0x200000u, 0x9FFFCu, 0u };
+
+			for (int i = 0; i < 3; i++) {
+				hw.l3 = 7; hw.rv_ok = 1; hw.rv_done = 0; hw.rv = 0xEA000010u; hw.released = rel;
+				cfg[0x84 / 4] = bw[i];
+				uint32_t keep = tcm[bo[i] / 4];
+				tcm[bo[i] / 4] = 0x77777777u;
+				int r = sw3_wr(&hw, SWW_BAR2, bw[i], bo[i], i == 2 ? 0xEA000010u : 0xDEADBEEFu);
+				if ((r == 0) != !rel || (rel && tcm[bo[i] / 4] != 0x77777777u)) {
+					if (bad++ < 20) printf("BAD latch released %d win %#x off %#x: ret %d\n", rel, bw[i], bo[i], r);
+				}
+				tcm[bo[i] / 4] = keep;
+				acc += r == 0;
+			}
+			hw.released = rel; hw.l3 = 7;
+			cfg[0x84 / 4] = 0x400000u;
+			int r1 = sw3_wr(&hw, SWW_CFG, 0, 0x84, 0u);
+			cfg[0x80 / 4] = SWW_WIN_PCIE;
+			int r2 = sw3_wr(&hw, SWW_CFG, 0, 0x80, SWW_WIN_CA7WRAP);
+			int r3 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_CA7WRAP, 0x800, 1u);
+			int r4 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_CA7WRAP, 0x408, 0x21u);
+			if (r1 || r2 || r3 || r4 || hw.released != rel) {
+				if (bad++ < 20) printf("BAD latch released %d: cfg84 %d cfg80 %d ca7 reset_ctl %d ca7 ioctl 0x21 %d released %d\n", rel, r1, r2, r3, r4, hw.released);
+			}
+			acc += !r1 + !r2 + !r3 + !r4;
+		}
+		hw.released = 0; hw.rv_done = 0; hw.rv_ok = 0; hw.l3 = 0;
+		for (int a = 0; a < 6; a++)
+			for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+	}
 	printf("%s accepted %d bad %d\n", bad ? "FAIL" : "PASS", acc, bad);
 	return bad != 0;
 }
@@ -942,6 +1038,17 @@ GLUE_MUTANTS = [
     ("BAR2 compared against the BAR0 window", [("(space == SWW_BAR2 && h->cfg[SWW_CFG_WIN2 / 4] != win)", "(space == SWW_BAR2 && h->cfg[SWW_CFG_WIN / 4] != win)")]),
     ("store past the 4 MiB window", [("off < SWW_TCM_BYTES ? &h->tcm[off / 4]", "off <= SWW_TCM_BYTES ? &h->tcm[off / 4]")]),
     ("unaligned BAR2 store", [("if ((off & 3u) != 0) {\n\t\treturn NULL;", "if ((off & 1u) != 0) {\n\t\treturn NULL;")]),
+    # patch 0154 (review 0150 G1): the release gate and the BAR2 latch
+    ("release gate removed", [("!(v & SW_CPUHALT) && (h->l3 < 7 || !h->rv_done)) {", "0) {")]),
+    ("release allowed at level 6", [("(h->l3 < 7 || !h->rv_done)", "(h->l3 < 6 || !h->rv_done)")]),
+    ("release without the reset vector", [("(h->l3 < 7 || !h->rv_done)", "(h->l3 < 7)")]),
+    ("release gate on the CPUHALT values too", [("!(v & SW_CPUHALT) && (h->l3 < 7", "(h->l3 < 7")]),
+    ("release gate on any wrapper", [("if (space == SWW_BAR0 && win == SWW_WIN_CA7WRAP && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT) && (h->l3", "if (space == SWW_BAR0 && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT) && (h->l3")]),
+    ("latch never set", [("\t\th->released = 1;\n", "")]),
+    ("latch ignored", [("if (space == SWW_BAR2 && h->released) {", "if (0) {")]),
+    ("latch set by the SYS_MEM wrapper too", [("if (space == SWW_BAR0 && win == SWW_WIN_CA7WRAP && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT)) {", "if (space == SWW_BAR0 && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT)) {")]),
+    ("latch set by the CPUHALT values too", [("off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT)) {\n\t\th->released = 1;", "off == SWL_AGENT_IOCTL) {\n\t\th->released = 1;")]),
+    ("latch blocks every store", [("if (space == SWW_BAR2 && h->released) {", "if (h->released) {")]),
 ]
 
 
