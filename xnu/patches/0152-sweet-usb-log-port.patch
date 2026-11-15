@@ -1,0 +1,20 @@
+SWEET USB live-log port (patch 0152): boot-arg sweetusblogport=N (1..65535) sends the UDP console log (patch 0075) to 192.168.7.1:N instead of 5140.
+Without the boot-arg nothing changes. No hardware access. Reason: the host firewall (NixOS networking.firewall) drops UDP 5140 when it is active (observed 2026-11-15 c4-batt5:
+rx counters rose, listener got 0 bytes, firewall.service active); 64738 is already in allowedUDPPorts.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -845,7 +845,11 @@
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+-	to.sin_port = htons(5140);
++	uint32_t port = 5140;
++	if (!PE_parse_boot_argn("sweetusblogport", &port, sizeof(port)) || port == 0 || port > 65535) {
++		port = 5140;            /* boot-arg sweetusblogport=N (patch 0152): another UDP port for a host firewall that blocks 5140 */
++	}
++	to.sin_port = htons((uint16_t)port);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);

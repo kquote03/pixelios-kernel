@@ -507,6 +507,7 @@ sweettouchvar	patch:0090
 sweetusb	patch:0070
 sweetusbdma	patch:0082
 sweetusblog	patch:0075
+sweetusblogport	patch:0152
 sweetwlan	patch:0124
 syscall_rejection_mode	xnu
 task_exc_guard_default	xnu
