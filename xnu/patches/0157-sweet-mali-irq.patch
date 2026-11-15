@@ -7,10 +7,10 @@ and MMU interrupts (INTID 452/453 = SPI 420/421, stock oriole DT; GPU INTID 451 
   instead of being EOId and re-taken forever (review M2). Before the first attach nothing changes.
 - sweet_mali.c: ISR reads *_IRQ_STATUS, writes that *_IRQ_MASK to 0, counts, wakes sm_thread; masks armed at submit (slot done/fail bits,
   MMU AS0 page fault + bus error), zeroed in finish(); sm_thread keeps check_job and its timeouts, fallback deadline 5 ms; dead = GIC detach
-  then masks 0; counts printed: "SWEET MALI: irq counts mode=... job=N mmu=N spurious=N unhandled_spi=N". Without bit 0x200 nothing changes.
+  then masks 0; review 0155 F1: a replay submit failure other than EINVAL leaks the BOs (a job may run); counts printed: "SWEET MALI: irq counts mode=... job=N mmu=N spurious=N unhandled_spi=N". Without bit 0x200 nothing changes.
 
 diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
-index 6aa9c23..345b42d 100644
+index 6aa9c23..4326b6d 100644
 --- a/bsd/dev/sweet_mali.c
 +++ b/bsd/dev/sweet_mali.c
 @@ -64,6 +64,7 @@ extern int sweet_gpu_power_on(volatile uint32_t *g);
@@ -171,7 +171,17 @@ index 6aa9c23..345b42d 100644
  	sm.busy = 1;
  	wr(R_JS_BASE(slot) + JS_COMMAND_NEXT, JS_CMD_START);
  	*seq = sm.busy_seq;
-@@ -993,6 +1099,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -865,6 +971,9 @@ sm_replay_job(const uint8_t *buf, size_t len, unsigned idx, int *stop)
+ 		rc = sweet_mali_submit(j.jc[c], (j.req[c] & SMR_REQ_FS) ? SWEET_MALI_REQ_FS : 0, &seq);
+ 		if (rc != 0) {
+ 			printf("SWEET MALI: replay %s=FAIL chain %u submit %d\n", j.name, c, rc);
++			if (rc != EINVAL) {
++				safe = 0;       /* review 0155 F1 (needed once the IRQ path exists): ETIMEDOUT/EBUSY/ENXIO may mean a job is in flight, so leak, never free */
++			}
+ 			goto out;
+ 		}
+ 		rc = sweet_mali_wait(seq, SMR_WAIT_US);
+@@ -993,6 +1102,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  	if (sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0)) {
  		return;
  	}
@@ -181,7 +191,7 @@ index 6aa9c23..345b42d 100644
  	if ((mode & 3u) == 2) {
  		sm_selftest();
  	}
-@@ -1003,6 +1112,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -1003,6 +1115,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  			sm_replay();
  		}
  	}
