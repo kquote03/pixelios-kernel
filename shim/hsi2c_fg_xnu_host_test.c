@@ -478,7 +478,7 @@ int main(void)
 	EXPECT(has("SWEET BATTERY: before CTL=00000048 FIFO_CTL=00080083 INT_EN=00000080"));
 	EXPECT(has("SWEET BATTERY: before CONF=980110FF TIMEOUT=000000FF TRAILING=00FFFFFF"));
 	EXPECT(has("SWEET BATTERY: raw 06=3E6D 08=1D79 09=C6B8 0A=FE20 0B=FE31 35=082F 21=6200 restore=ok"));
-	EXPECT(has("SWEET BATTERY: restore wait idle=1"));
+	EXPECT(has("SWEET BATTERY: restore wait idle=1") && !has("SWEET BATTERY: fail "));
 	EXPECT(count("SWEET BATTERY: soc=62.42% v=3974 mV i=-144.6 mA t=29.4 C src=fg") == 1);
 	EXPECT(!has("!!!") && !has("refused") && st.stopped == 0 && st.sets == 1);
 	/* the next set (30 s later): the same writes, ONE line only */
@@ -545,6 +545,8 @@ int main(void)
 	world(); nack_at = 1;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nruns == 1 && nw == 7 + 6 && restore_tail() && as_before());
 	EXPECT(has("SWEET BATTERY: refused REPSOC reg=0x06 nack restore=ok") && has("raw 06=---- 08=----") && !has("src=fg") && st.stopped);
+	/* review F5 (0148): the failure-time status words, the step and the poll condition, from reads the reader already made */
+	EXPECT(has("SWEET BATTERY: fail at ptr-txroom why=nack-int") && has("SWEET BATTERY: fail INT_STATUS=") && has("SWEET BATTERY: fail POLLS="));
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && nruns == 1 && nw == 7 + 6);
 	/* NACK on the read of the third register: two good reads, then the restore (bus held -> restore=FAILED, loud) */
 	world(); nack_at = 6;
@@ -560,6 +562,7 @@ int main(void)
 	world(); timeout_at = 1;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nw == 8 + 6 && restore_tail() && as_before());
 	EXPECT(has("refused REPSOC reg=0x06 timeout"));
+	EXPECT(has("fail at ptr-txdone why=none"));
 	EXPECT(ticks - 1000 >= 24576000ull / 100);		/* waited at least 10 ms of counter */
 	EXPECT(ticks - 1000 <= 4 * (24576000ull / 100));	/* the counter ended it, not the poll cap */
 	EXPECT(nreads < 4u * 2500u * 4u);	/* ~2458 polls of 4 reads per 10 ms wait at 100 ticks per counter read: the counter bound, not the 100000-poll cap */
@@ -571,11 +574,17 @@ int main(void)
 	/* arbitration lost / ERR_STATUS */
 	world(); abort_at = 2;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && has("refused REPSOC reg=0x06 error") && restore_tail() && as_before());
+	EXPECT(has("fail at rd-byte0 why=int-errs") && count("SWEET BATTERY: fail ") == 3);
 	world(); err_at = 3;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nw == 17 + 7 + 6 && has("refused TEMP reg=0x08 error restore=FAILED"));
+	EXPECT(has("fail at ptr-txroom why=err-status") && has("fail STAGE_ERR=00000001"));
 	/* a faulting write (the 3rd: ADDR): error, restore still runs */
 	world(); wfault_n = 3;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nruns == 0 && restore_tail() && has("refused REPSOC reg=0x06 error restore=ok"));
+	EXPECT(has("fail at ptr-start why=none"));
+	/* INT_STATUS stays set: the read message cannot start; the step names it */
+	world(); ist_sticky = 1;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && has("fail at rd-start"));
 	/* every write accepted but dropped (CR-07): the AUTO_CONF read-back differs -> never ok */
 	world(); ignore_from = 1; ignore_any = 1;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && nruns == 0 && has("refused") && !has("src=fg"));
@@ -594,7 +603,7 @@ int main(void)
 		struct sfg_run r;
 
 		world();
-		r.o = &ops; r.c = &cfg;
+		r.o = &ops; r.c = &cfg; r.d = NULL;
 		memset(&r.s, 0, sizeof(r.s));
 		r.s.ctl = 0x48; r.s.fifo = 0x00080083; r.s.inten = 0x80; r.s.addr = 0x9400; r.s.aconf = 0x00030001;
 		crit_depth = 1;
