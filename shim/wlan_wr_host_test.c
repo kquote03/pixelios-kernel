@@ -2052,6 +2052,11 @@ static void rund(void)
 	CHECK(runc(&g, &x, 5, len, pin) == 0 && x.flags == CLEVEL5 && ramarr[0] == PAT && x.w14_old == 0 && strstr(logbuf, "w14") == 0 && strstr(logbuf, "W14") == 0 && strstr(logbuf, "level 5 done vars=12") != 0);
 	n5 = g.nw;
 	sf = g; sx = x; memcpy(sram, ramarr, sizeof ramarr);
+	/* review 0154 F3: the SWT_RV clause itself is board-bound: a direct store of image word 0 at backplane 0 with the other board in x.board is refused and stores nothing
+	 * (the step functions would stop earlier at swl_fw_pin; this pins the board term of swl_wr's own check) */
+	x.board = SWW_BOARD_ORIOLE;
+	x.level = 6;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && g.nw == n5 && ramarr[0] == PAT && x.stopped);
 	/* level 6, the whole run: one more store than level 5, the first dword of the image at address 0 */
 	obsb(&f, 336);
 	CHECK(runc(&f, &x, 6, len, pin) == 0);
