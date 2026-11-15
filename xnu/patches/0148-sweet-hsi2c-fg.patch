@@ -258,7 +258,7 @@ diff --git a/bsd/dev/sweet_hsi2c_fg.h b/bsd/dev/sweet_hsi2c_fg.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_hsi2c_fg.h
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,967 @@
 +/*
 + * sweet_hsi2c_fg.h - xnu patch 0148: READ-ONLY fuel-gauge reader over HSI2C12 (MAX77759 fuel gauge, 7-bit 0x36), boot-arg sweetbatt=1.
 + * Pure C: no MMIO, no kernel call. Every bus access goes through struct sfg_ops (bsd/dev/sweet_hsi2c.c maps the blocks); every store goes
@@ -620,10 +620,22 @@ new file mode 100644
 +struct sfg_st {
 +	uint32_t ist, fs, ts;
 +};
++/*
++ * Review F5 (docs/reviews/0148-hsi2c-fg-review-fable-1.md): what the reader saw when a transfer failed. Plain memory, filled only from words
++ * the reader already read (sfg_poll) and from the counter it already reads (sfg_wait): no extra register access. NULL = not recorded.
++ */
++enum { SFG_D_NONE = 0, SFG_D_PTR_START, SFG_D_PTR_TXROOM, SFG_D_PTR_TX, SFG_D_PTR_TXDONE, SFG_D_PTR_CLEAR, SFG_D_RD_START, SFG_D_RD_BYTE0,
++       SFG_D_RD_POP0, SFG_D_RD_BYTE1, SFG_D_RD_POP1, SFG_D_RD_IDLE, SFG_D_RD_CLEAR, SFG_D_NSTAGES };
++enum { SFG_DW_NONE = 0, SFG_DW_UNREADABLE, SFG_DW_NACK_INT, SFG_DW_NACK_STATE, SFG_DW_INT_ERRS, SFG_DW_LOSE, SFG_DW_ERR_STATUS, SFG_DW_N };
++struct sfg_diag {
++	unsigned stage, why, polls;
++	uint32_t ist, fs, ts, err, dt, lim;
++};
 +struct sfg_run {
 +	const struct sfg_ops *o;
 +	const struct sfg_cfg *c;
 +	struct sfg_snap s;
++	struct sfg_diag *d;
 +};
 +
 +/* the words a read may target; everything else is refused before the bus (RX_DATA only through sfg_rx_pop, TX_DATA never) */
@@ -726,12 +738,23 @@ new file mode 100644
 +	const struct sfg_cfg *c = r->c;
 +	uint32_t err = 0;
 +
-+	if (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st->ist) || !sfg_r32(r, SFG_SP_I2C, c->o_fifo_st, &st->fs) ||
-+	    !sfg_r32(r, SFG_SP_I2C, c->o_trans, &st->ts) || !sfg_r32(r, SFG_SP_I2C, c->o_err, &err))
++	int ok = sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st->ist) && sfg_r32(r, SFG_SP_I2C, c->o_fifo_st, &st->fs) &&
++	    sfg_r32(r, SFG_SP_I2C, c->o_trans, &st->ts) && sfg_r32(r, SFG_SP_I2C, c->o_err, &err);
++	unsigned why = !ok ? SFG_DW_UNREADABLE : (st->ist & c->int_nack) ? SFG_DW_NACK_INT : (st->ts & c->f_st_mask) == c->st_no_ack ? SFG_DW_NACK_STATE :
++	    (st->ist & c->int_errs) ? SFG_DW_INT_ERRS : (st->ts & c->f_st_mask) == c->st_lose ? SFG_DW_LOSE : err ? SFG_DW_ERR_STATUS : SFG_DW_NONE;
++
++	if (r->d) {			/* F5: the words of this poll, kept in memory for the failure line */
++		r->d->ist = st->ist;
++		r->d->fs = st->fs;
++		r->d->ts = st->ts;
++		r->d->err = err;
++		r->d->why = why;
++	}
++	if (!ok)
 +		return SFG_ERROR;
-+	if ((st->ist & c->int_nack) || (st->ts & c->f_st_mask) == c->st_no_ack)
++	if (why == SFG_DW_NACK_INT || why == SFG_DW_NACK_STATE)
 +		return SFG_NACK;	/* LX :529-536 (NO_DEV_ACK / NO_DEV -> -ENXIO); state NO_ACK :154 */
-+	if ((st->ist & c->int_errs) || (st->ts & c->f_st_mask) == c->st_lose || err)
++	if (why != SFG_DW_NONE)
 +		return SFG_ERROR;	/* LX :525-528 (TRANS_ABORT = arbitration), :537-540 (TIMEOUT); SGS :103-106 under/overrun; state LOSE :155 */
 +	return SFG_OK;
 +}
@@ -740,6 +763,17 @@ new file mode 100644
 +sfg_lim(const struct sfg_run *r)
 +{
 +	return r->o->freq_hz / 1000u * SFG_XFER_MS;
++}
++
++/* the counter check of sfg_wait; F5: keeps the ticks since t0 (low 32 bits) */
++static int
++sfg_late(const struct sfg_run *r, uint64_t t0, uint64_t lim)
++{
++	uint64_t dt = r->o->now(r->o->ctx) - t0;
++
++	if (r->d)
++		r->d->dt = (uint32_t)dt;
++	return dt > lim;
 +}
 +
 +/* Bounded wait for `what`, counted from t0 (the start of the message): SFG_XFER_MS of counter AND SFG_POLLS polls. */
@@ -753,6 +787,10 @@ new file mode 100644
 +	for (i = 0; i < SFG_POLLS; i++) {
 +		int e = sfg_poll(r, st), ok;
 +
++		if (r->d) {			/* F5: poll count of this wait and its counter bound */
++			r->d->polls = i + 1u;
++			r->d->lim = (uint32_t)lim;
++		}
 +		if (e != SFG_OK)
 +			return e;
 +		ok = what == SFG_W_TXROOM ? (st->fs & c->f_lvl_mask) < c->tx_depth :					/* SGS :966-968 */
@@ -761,7 +799,7 @@ new file mode 100644
 +		     !(st->ts & SFG_BIT(c->b_mbusy));								/* LX :635-637 */
 +		if (ok)
 +			return SFG_OK;
-+		if (r->o->now(r->o->ctx) - t0 > lim)
++		if (sfg_late(r, t0, lim))
 +			break;
 +	}
 +	return SFG_TIMEOUT;
@@ -795,6 +833,52 @@ new file mode 100644
 +	return SFG_OK;
 +}
 +
++/* F5: the step of sfg_xfer about to run (memory only); always 1, so it can sit inside the && chains */
++static int
++sfg_stage(const struct sfg_run *r, unsigned stage)
++{
++	if (r->d) {
++		r->d->stage = stage;
++		r->d->why = SFG_DW_NONE;
++		r->d->polls = 0;
++	}
++	return 1;
++}
++
++static const char *
++sfg_stage_name(unsigned s)
++{
++	static const char *const n[SFG_D_NSTAGES] = { "none", "ptr-start", "ptr-txroom", "ptr-tx", "ptr-txdone", "ptr-clear", "rd-start", "rd-byte0",
++						      "rd-pop0", "rd-byte1", "rd-pop1", "rd-idle", "rd-clear" };
++
++	return s < SFG_D_NSTAGES ? n[s] : "?";
++}
++
++static const char *
++sfg_why_name(unsigned w)
++{
++	static const char *const n[SFG_DW_N] = { "none", "unreadable", "nack-int", "nack-state", "int-errs", "lose-state", "err-status" };
++
++	return w < SFG_DW_N ? n[w] : "?";
++}
++
++/* F5: the failure-time lines (memory only): the step, the poll condition, the last polled INT_STATUS / FIFO_STATUS / TRANS / ERR, timing */
++static void
++sfg_diag_lines(const struct sfg_ops *o, const struct sfg_diag *d)
++{
++	struct sfg_buf b;
++
++	sfg_start(&b, "fail at ");
++	sfg_txt(&b, sfg_stage_name(d->stage));
++	sfg_txt(&b, " why=");
++	sfg_txt(&b, sfg_why_name(d->why));
++	sfg_txt(&b, " ERR=");
++	sfg_hex(&b, d->err, 8);
++	sfg_emit(o, &b);
++	sfg_three(o, "fail", "INT_STATUS", d->ist, "FIFO_STATUS", d->fs, "TRANS", d->ts);
++	sfg_three(o, "fail", "POLLS", d->polls, "DT", d->dt, "LIM", d->lim);
++}
++
 +/* One register: pointer write without STOP, repeated-start read of two bytes with STOP (GKI regmap-i2c.c:181-191). *raw = LSB first. */
 +static int
 +sfg_xfer(const struct sfg_run *r, enum sfg_reg reg, uint32_t *raw)
@@ -803,30 +887,36 @@ new file mode 100644
 +	struct sfg_st st = { 0, 0, 0 };
 +	uint32_t b = 0, v = 0;
 +	uint64_t t0 = r->o->now(r->o->ctx);
-+	int e = sfg_msg_start(r, 0);
++	int e;
 +	unsigned n;
 +
-+	if (e == SFG_OK)
++	sfg_stage(r, SFG_D_PTR_START);
++	e = sfg_msg_start(r, 0);
++	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TXROOM))
 +		e = sfg_wait(r, t0, SFG_W_TXROOM, &st);
-+	if (e == SFG_OK && sfg_w32(r, c->o_tx, sfg_reg_ptr(reg)))					/* ref: SGS :969-970 */
++	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TX) && sfg_w32(r, c->o_tx, sfg_reg_ptr(reg)))	/* ref: SGS :969-970 */
 +		e = SFG_ERROR;
-+	if (e == SFG_OK)
++	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TXDONE))
 +		e = sfg_wait(r, t0, SFG_W_TXDONE, &st);
-+	if (e == SFG_OK && (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st.ist) || sfg_w32(r, c->o_int_st, st.ist)))	/* ref: SGS :974-979 (w1c), fresh (F2) */
++	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_CLEAR) &&
++	    (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st.ist) || sfg_w32(r, c->o_int_st, st.ist)))	/* ref: SGS :974-979 (w1c), fresh (F2) */
 +		e = SFG_ERROR;
 +	if (e != SFG_OK)
 +		return e;
 +	t0 = r->o->now(r->o->ctx);
++	sfg_stage(r, SFG_D_RD_START);
 +	e = sfg_msg_start(r, 1);
 +	for (n = 0; e == SFG_OK && n < SFG_VAL_BYTES; n++) {
++		sfg_stage(r, SFG_D_RD_BYTE0 + 2u * n);
 +		e = sfg_wait(r, t0, SFG_W_RXBYTE, &st);						/* SGS :897-905 */
-+		if (e == SFG_OK && !sfg_rx_pop(r, &b))
++		if (e == SFG_OK && sfg_stage(r, SFG_D_RD_POP0 + 2u * n) && !sfg_rx_pop(r, &b))
 +			e = SFG_ERROR;
 +		v |= (b & 0xFFu) << (8u * n);								/* LSB first (REGMAP_ENDIAN_NATIVE, BMS max_m5.c:1618) */
 +	}
-+	if (e == SFG_OK)
++	if (e == SFG_OK && sfg_stage(r, SFG_D_RD_IDLE))
 +		e = sfg_wait(r, t0, SFG_W_IDLE, &st);						/* LX :820-821 exynos5_i2c_wait_bus_idle */
-+	if (e == SFG_OK && (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st.ist) || sfg_w32(r, c->o_int_st, st.ist)))	/* deviation: clear what the read raised (LX :512-513) */
++	if (e == SFG_OK && sfg_stage(r, SFG_D_RD_CLEAR) &&
++	    (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st.ist) || sfg_w32(r, c->o_int_st, st.ist)))	/* deviation: clear what the read raised (LX :512-513) */
 +		e = SFG_ERROR;
 +	*raw = v;
 +	return e;
@@ -1041,6 +1131,7 @@ new file mode 100644
 +sfg_set(struct sfg_state *st, const struct sfg_ops *o, const struct sfg_cfg *c)
 +{
 +	struct sfg_run r;
++	struct sfg_diag dg = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 +	struct sfg_buf b;
 +	uint32_t raw[SFG_NREGS];
 +	const char *why;
@@ -1051,6 +1142,7 @@ new file mode 100644
 +		return 1;
 +	r.o = o;
 +	r.c = c;
++	r.d = &dg;
 +	r.s.ctl = r.s.fifo = r.s.trail = r.s.inten = r.s.ist = r.s.err = r.s.fstat = r.s.conf = r.s.aconf = r.s.tmo = r.s.trans = r.s.addr = r.s.usicon = 0;
 +	for (i = 0; i < SFG_NREGS; i++)
 +		raw[i] = 0;
@@ -1116,6 +1208,7 @@ new file mode 100644
 +		sfg_say(o, "!!! RESTORE FAILED: ", "a reset clears it (guess: the controller state is lost on reset)");
 +	}
 +	if (e != SFG_OK) {
++		sfg_diag_lines(o, &dg);
 +		sfg_start(&b, "refused ");
 +		sfg_txt(&b, sfg_reg_name(failed));
 +		sfg_txt(&b, " reg=0x");

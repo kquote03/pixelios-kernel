@@ -577,7 +577,7 @@ int main(void)
 	EXPECT(has("fail at rd-byte0 why=int-errs") && count("SWEET BATTERY: fail ") == 3);
 	world(); err_at = 3;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nw == 17 + 7 + 6 && has("refused TEMP reg=0x08 error restore=FAILED"));
-	EXPECT(has("fail at ptr-txroom why=err-status") && has("fail STAGE_ERR=00000001"));
+	EXPECT(has("fail at ptr-txroom why=err-status ERR=00000001"));
 	/* a faulting write (the 3rd: ADDR): error, restore still runs */
 	world(); wfault_n = 3;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && nruns == 0 && restore_tail() && has("refused REPSOC reg=0x06 error restore=ok"));

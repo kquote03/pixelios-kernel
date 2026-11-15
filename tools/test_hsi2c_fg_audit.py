@@ -9,6 +9,8 @@ Pins, on the text the kernel gets (the new-file hunks of the patch):
                             the order of sfg_set (stop latch, counter, gate, pads, controller words, preconditions, reads, restore).
   bsd/dev/sweet_hsi2c.c     the boot-arg check comes before any ADT lookup or mapping; exactly one MMIO store (sb.i2c[...] = v in sb_wr32);
                             no hex literal >= 0x10000 (every address comes from the ADT); sb_wr32 is only the ops.wr32 hook.
+  review F5 (2026-11-15): the failure-time diagnostics (sfg_stage, sfg_late, sfg_diag_lines and the name tables) contain no bus access, and
+                            sfg_poll still reads exactly its four status words.
 Every check has a killing mutant below (CR-01/CR-02): the mutants run on a private copy of the text, never on the file."""
 import hashlib
 import os
@@ -28,6 +30,7 @@ PINNED = {
     "sfg_restore": "182e9de8d5de0440",
     "sfg_msg_start": "24cd1f91ce953cc1",
 }
+F5_NOBUS = ("sfg_stage", "sfg_stage_name", "sfg_why_name", "sfg_diag_lines", "sfg_late")
 W32_SITES = {"sfg_msg_start": 7, "sfg_xfer": 3, "sfg_restore": 6}
 REGS_TEXT = ("#define SFG_REGS(X) X(REPSOC, 0x06u) X(TEMP, 0x08u) X(VCELL, 0x09u) X(CURRENT, 0x0Au) X(AVGCURRENT, 0x0Bu) X(FULLCAPREP, 0x35u) "
              "X(DEVNAME, 0x21u)")
@@ -147,6 +150,14 @@ def check_header(src, pinned=PINNED):
                  "if(c->addr7!=SFG_DEV_ADDR7)return", "if(c->regs[i]!=sfg_reg_ptr(i))return"):
         if need not in n:
             raise AssertionError(f"header: lost '{need}'")
+    # review F5: the failure-time diagnostics only keep and print words the reader already read; they reach no bus access at all
+    for fn in F5_NOBUS:
+        a, b = func_span(code, fn)
+        if re.search(r"\b(?:sfg_r32|sfg_w32|sfg_rx_pop|sfg_poll|sfg_wait|sfg_xfer|sfg_msg_start|sfg_restore)\s*\(|->rd32\(|->wr32\(|->crit\(", code[a:b]):
+            raise AssertionError(f"header: F5 diagnostic {fn} must not touch the bus")
+    pa, pb = func_span(code, "sfg_poll")
+    if len(re.findall(r"\bsfg_r32\s*\(", code[pa:pb])) != 4 or re.search(r"\bsfg_w32\s*\(", code[pa:pb]):
+        raise AssertionError("header: sfg_poll reads exactly INT_STATUS, FIFO_STATUS, TRANS_STATUS, ERR_STATUS and writes nothing")
     xa, xb = func_span(code, "sfg_xfer")
     if not norm(code[xa:xb]).startswith("staticintsfg_xfer(conststructsfg_run*r,enumsfg_regreg,uint32_t*raw)"):
         raise AssertionError("header: sfg_xfer takes an enum sfg_reg (no pointer byte or data byte from the caller)")
@@ -227,6 +238,9 @@ HDR_MUTANTS = [
     ("gate after the controller reads", "\twhy = sfg_gate(&r);\n\tif (why)\n\t\treturn sfg_refuse(st, o, why);\n", ""),
     ("restore only on success", "restored = sfg_restore(&r, first || e != SFG_OK);", "restored = e == SFG_OK ? sfg_restore(&r, first) : 1;"),
     ("a data byte from the caller", "sfg_xfer(const struct sfg_run *r, enum sfg_reg reg, uint32_t *raw)", "sfg_xfer(const struct sfg_run *r, uint32_t reg, uint32_t *raw)"),
+    ("F5 diag reads a register", "\tuint64_t dt = r->o->now(r->o->ctx) - t0;\n", "\tuint64_t dt = r->o->now(r->o->ctx) - t0;\n\tuint32_t x = 0;\n\n\t(void)sfg_r32(r, SFG_SP_I2C, r->c->o_ctl, &x);\n"),
+    ("F5 diag prints with a bus write", "\tsfg_txt(&b, \" ERR=\");\n", "\t(void)sfg_w32(0, 0u, 0u);\n\tsfg_txt(&b, \" ERR=\");\n"),
+    ("a fifth poll read", "sfg_r32(r, SFG_SP_I2C, c->o_err, &err);\n", "sfg_r32(r, SFG_SP_I2C, c->o_err, &err) && sfg_r32(r, SFG_SP_I2C, c->o_conf, &err);\n"),
     ("a goto", "\tif (st->stopped)\n\t\treturn 1;", "\tif (st->stopped)\n\t\tgoto out;\nout:"),
 ]
 GLUE_MUTANTS = [
