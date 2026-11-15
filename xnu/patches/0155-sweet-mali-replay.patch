@@ -1,0 +1,698 @@
+SWEET MALI job replay (patch 0155, plan oneshot-2 step G2, docs/research/52): boot-arg sweetmali bit 0x100 (alone, without the service bits 1|2:
+sweetmali=0x100 brings the core up exactly like sweetmali=1 but registers no SweetMali service, so no user client can share AS0) replays recorded
+Mesa Panfrost job chains from the GPUJOBS1 container that tools/pack_gpujob.py builds and tools/mkpayload.py --gpujob hands over as
+/chosen/memory-map GPUJOB <pa, size>. Pure parser bsd/dev/sweet_mali_replay.h (container + .malijob v1, fixed-VA reserve, crc32, RT check) is
+host-tested with ASan/UBSan by shim/mali_replay_host_test.c. Per job: BOs in fresh wired kernel memory, mapped at their recorded GPU VAs (refused
+if taken or outside MALI_VA_START..MALI_VA_END), cache clean, chains through sweet_mali_submit/sweet_mali_wait (2 s each), RT crc32 + 3 pixels:
+"SWEET MALI: replay <name>=PASS|FAIL crc=0x...". GPU registers written: only those of sweet_mali_map/unmap/submit and the completion thread
+(the selftest path). Without bit 0x100 nothing changes. Also prints the feature registers Mesa's record transport had to guess (read-only).
+
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index 2fbd94d..6aa9c23 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -20,8 +20,11 @@
+ #include <mach/vm_param.h>
+ #include <pexpert/pexpert.h>
+ #include <stdint.h>
++#include <machine/machine_routines.h>
++#include <pexpert/device_tree.h>
+ #include "sweet_mali_pt.h"
+ #include "sweet_mali.h"
++#include "sweet_mali_replay.h"
+ 
+ extern void flush_dcache64(addr64_t, unsigned, int);
+ extern vm_offset_t kvtophys(vm_offset_t);
+@@ -710,6 +713,265 @@ sm_gic_probe(void)
+ 	printf("SWEET MALI: gic probe done\n");
+ }
+ 
++/* sweetmali bit 0x100 (patch 0155, docs/research/52): replay recorded Mesa Panfrost job chains (.malijob captures in the GPUJOBS1 container that
++ * tools/pack_gpujob.py builds and mkpayload.py --gpujob hands over as /chosen/memory-map GPUJOB <pa, size>). Per job: every BO is copied into fresh
++ * wired kernel memory and mapped at its RECORDED GPU VA (refused if a VA is taken or outside the window), the chains are submitted in order through
++ * sweet_mali_submit/sweet_mali_wait (bounded, 2 s each), then the render target is CRCed and three pixels are checked. GPU registers: only the ones
++ * sweet_mali_map/unmap/submit and the completion thread already write for the selftest (sm_map_at is sweet_mali_map with a fixed VA). The GPU
++ * sees only AS0, whose page tables hold exactly the BOs of this job (the SweetMali service is not registered with sweetmali=0x100, so no user
++ * client can add mappings). Any refusal, fault or timeout prints why and stops the replay; memory the GPU might still reach is leaked, never freed. */
++#define SMR_WAIT_US   2000000ull           /* per chain */
++#define SMR_DRAIN_US  4000000ull           /* after a timeout: the core hard-stops at 3 s (JOB_TIMEOUT_US) and resets 0.5 s later */
++#define SMR_PA_MAX    (SMR_MAX_BO_BYTES / 0x4000ull)
++
++static uint64_t smr_pa[SMR_PA_MAX];       /* replay runs once, from sweet_mali_init: no concurrency */
++static struct {
++	vm_offset_t kva;
++	uint64_t va, size;
++	uint32_t n16k;
++	int mapped;
++} smr_bo[SMR_MAX_BOS];
++
++/* sweet_mali_map at a fixed VA: the same checks, page-table writes and AS0 flush; only the VA comes from the caller (mali_va_reserve).
++ * Contract as sweet_mali_map: ENOMEM/EINVAL/EEXIST = nothing is mapped; EIO/ENXIO = the GPU may still reach the pages (leak them). */
++static int
++sm_map_at(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t va)
++{
++	int e = 0, r;
++
++	if (!sweet_mali_ready()) {
++		return ENXIO;
++	}
++	if (n == 0 || n > 0x10000) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		if ((pa16k[i] & (PAGE_SIZE - 1)) || pa16k[i] >= (1ull << 40) || !pmap_valid_page((ppnum_t)(pa16k[i] >> PAGE_SHIFT))) {
++			printf("SWEET MALI: replay map refused, PA %#llx (page %u of %u) is not managed RAM\n", (unsigned long long)pa16k[i], i, n);
++			return EFAULT;
++		}
++	}
++	lck_mtx_lock(&sm_lock);
++	r = mali_va_reserve(&sm.va, va, n * 4u);
++	if (r) {
++		lck_mtx_unlock(&sm_lock);
++		return r == -2 ? EEXIST : EINVAL;
++	}
++	for (uint32_t i = 0; i < n && !e; i++) {
++		flush_dcache64((addr64_t)pa16k[i], PAGE_SIZE, TRUE);
++		for (uint32_t k = 0; k < 4 && !e; k++) {
++			e = mali_pt_map(&sm.pt, va + (uint64_t)(i * 4u + k) * MALI_PG, pa16k[i] + 0x1000ull * k, flags & SWEET_MALI_EXEC ? MALI_F_EXEC : 0);
++		}
++	}
++	if (e) {
++		for (uint32_t j = 0; j < n * 4u; j++) {
++			(void)mali_pt_unmap(&sm.pt, va + (uint64_t)j * MALI_PG);
++		}
++		(void)mali_va_free(&sm.va, va, n * 4u);
++		sm_pt_clean(va, (uint64_t)n * PAGE_SIZE);
++		lck_mtx_unlock(&sm_lock);
++		return ENOMEM;
++	}
++	sm_pt_clean(va, (uint64_t)n * PAGE_SIZE);
++	if (as_flush(va, (uint64_t)n * PAGE_SIZE)) {
++		sm.dead = 1;
++		printf("SWEET MALI: AS0 flush after replay map did not complete, device marked dead\n");
++		lck_mtx_unlock(&sm_lock);
++		return EIO;
++	}
++	lck_mtx_unlock(&sm_lock);
++	return 0;
++}
++
++/* CPU view of [va, va + len) of this job's BOs (clean+invalidated first), or NULL */
++static const uint8_t *
++smr_cpu(const struct smr_job *j, uint64_t va, uint64_t len)
++{
++	for (unsigned i = 0; i < j->n_bos; i++) {
++		if (smr_bo[i].kva && va >= smr_bo[i].va && va - smr_bo[i].va < smr_bo[i].size && len <= smr_bo[i].size - (va - smr_bo[i].va)) {
++			vm_offset_t p = smr_bo[i].kva + (vm_offset_t)(va - smr_bo[i].va);
++			for (vm_offset_t a = p & ~(vm_offset_t)PAGE_MASK; a < p + len; a += PAGE_SIZE) {
++				flush_dcache64((addr64_t)kvtophys(a), PAGE_SIZE, TRUE);
++			}
++			return (const uint8_t *)p;
++		}
++	}
++	return NULL;
++}
++
++/* 1 = PASS. *stop is set when the replay must not go on (device state unknown or memory leaked). */
++static int
++sm_replay_job(const uint8_t *buf, size_t len, unsigned idx, int *stop)
++{
++	struct sweet_mali_info info;
++	struct smr_job j;
++	int rc, pass = 0, safe = 1;
++	unsigned nb = 0;
++
++	bzero(&info, sizeof(info));
++	if (sweet_mali_query(&info) != 0) {
++		*stop = 1;
++		return 0;
++	}
++	rc = smr_job_parse(buf, len, info.gpu_id, &j);
++	if (rc != 0) {
++		printf("SWEET MALI: replay job%u refused, code %d (GPU_ID %#x)\n", idx, rc, info.gpu_id);
++		*stop = 1;
++		return 0;
++	}
++	printf("SWEET MALI: replay %s: %u chains, %u BOs, %llu bytes, RT %#llx %ux%u stride %u\n", j.name, j.n_chains, j.n_bos,
++	    (unsigned long long)j.bo_bytes, (unsigned long long)j.rt.va, j.rt.width, j.rt.height, j.rt.stride);
++	bzero(smr_bo, sizeof(smr_bo));
++
++	/* BOs: wired kernel memory, recorded contents, cache clean, mapped at the recorded VA */
++	for (nb = 0; nb < j.n_bos; nb++) {
++		struct smr_bo b;
++		vm_offset_t kva = 0;
++		uint32_t n;
++
++		smr_job_bo(&j, nb, &b);
++		n = (uint32_t)(b.size / PAGE_SIZE);
++		if (kmem_alloc(kernel_map, &kva, (vm_size_t)b.size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET MALI: replay %s: no memory for BO %u (%llu bytes)\n", j.name, nb, (unsigned long long)b.size);
++			goto out;
++		}
++		memcpy((void *)kva, buf + b.data_off, (size_t)b.data_len);
++		for (uint32_t k = 0; k < n; k++) {
++			smr_pa[k] = (uint64_t)kvtophys(kva + (vm_offset_t)k * PAGE_SIZE);
++			flush_dcache64((addr64_t)smr_pa[k], PAGE_SIZE, TRUE);
++		}
++		smr_bo[nb].kva = kva;
++		smr_bo[nb].va = b.va;
++		smr_bo[nb].size = b.size;
++		smr_bo[nb].n16k = n;
++		rc = sm_map_at(smr_pa, n, (b.flags & 1u) ? SWEET_MALI_EXEC : 0, b.va);
++		if (rc != 0) {
++			printf("SWEET MALI: replay %s: BO %u (%s) at VA %#llx refused, %d\n", j.name, nb, b.label, (unsigned long long)b.va, rc);
++			if (rc == EIO || rc == ENXIO) {
++				safe = 0;              /* the pages may still be reachable: leak this BO */
++				smr_bo[nb].mapped = 1;
++			} else {
++				kmem_free(kernel_map, kva, (vm_size_t)b.size);
++				smr_bo[nb].kva = 0;
++			}
++			goto out;
++		}
++		smr_bo[nb].mapped = 1;
++	}
++
++	/* chains, in order, each waited for */
++	for (unsigned c = 0; c < j.n_chains; c++) {
++		uint64_t seq = 0;
++		rc = sweet_mali_submit(j.jc[c], (j.req[c] & SMR_REQ_FS) ? SWEET_MALI_REQ_FS : 0, &seq);
++		if (rc != 0) {
++			printf("SWEET MALI: replay %s=FAIL chain %u submit %d\n", j.name, c, rc);
++			goto out;
++		}
++		rc = sweet_mali_wait(seq, SMR_WAIT_US);
++		if (rc == ETIMEDOUT) {
++			printf("SWEET MALI: replay %s=FAIL chain %u timed out after %llu us, draining\n", j.name, c, SMR_WAIT_US);
++			rc = sweet_mali_wait(seq, SMR_DRAIN_US);
++			if (rc != 0 && rc != EIO) {
++				safe = 0;
++			}
++			goto out;
++		}
++		if (rc != 0) {
++			/* the core printed JS_STATUS and, on an MMU fault, AS0_FAULTSTATUS/FAULTADDR; add the job header the GPU wrote back */
++			const uint8_t *h = smr_cpu(&j, j.jc[c], 32);
++			printf("SWEET MALI: replay %s=FAIL chain %u wait %d jc=%#llx header exception_status=%#x first_incomplete=%#x fault_pointer=%#llx\n", j.name, c,
++			    rc, (unsigned long long)j.jc[c], h ? smr_le32(h) : 0u, h ? smr_le32(h + 4) : 0u, h ? (unsigned long long)smr_le64(h + 8) : 0ull);
++			if (rc != EIO) {
++				safe = 0;
++			}
++			goto out;
++		}
++	}
++
++	/* render target */
++	{
++		const uint8_t *rt = smr_cpu(&j, j.rt.va, (uint64_t)j.rt.stride * j.rt.height);
++		uint32_t crc = 0;
++		unsigned bad;
++		if (rt == NULL) {
++			goto out;               /* cannot happen: smr_job_parse placed the RT inside a BO */
++		}
++		bad = smr_rt_check(&j, rt, &crc);
++		pass = bad == 0;
++		printf("SWEET MALI: replay %s=%s crc=%#010x%s px=%#x,%#x,%#x want=%#x,%#x,%#x\n", j.name, pass ? "PASS" : "FAIL", crc,
++		    j.rt.crc_valid ? (crc == j.rt.expect_crc ? " (expected)" : " (UNEXPECTED)") : "",
++		    smr_le32(rt + (size_t)j.rt.px_y[0] * j.rt.stride + (size_t)j.rt.px_x[0] * 4u), smr_le32(rt + (size_t)j.rt.px_y[1] * j.rt.stride + (size_t)j.rt.px_x[1] * 4u),
++		    smr_le32(rt + (size_t)j.rt.px_y[2] * j.rt.stride + (size_t)j.rt.px_x[2] * 4u), j.rt.px_rgba[0], j.rt.px_rgba[1], j.rt.px_rgba[2]);
++	}
++
++out:
++	/* unmap and free only when no job of ours can still run; any unmap failure leaks the rest */
++	for (unsigned i = 0; i < j.n_bos; i++) {
++		if (!smr_bo[i].kva) {
++			continue;
++		}
++		if (safe && smr_bo[i].mapped && sweet_mali_unmap(smr_bo[i].va, smr_bo[i].n16k) != 0) {
++			safe = 0;
++		}
++		if (safe) {
++			kmem_free(kernel_map, smr_bo[i].kva, (vm_size_t)smr_bo[i].size);
++		} else {
++			printf("SWEET MALI: replay %s: BO %u leaked on purpose (GPU may still reach it)\n", j.name, i);
++		}
++		smr_bo[i].kva = 0;
++	}
++	if (!pass || !safe || !sweet_mali_ready()) {   /* a failed job ends the replay: no second job on a GPU that just faulted */
++		*stop = 1;
++	}
++	return pass;
++}
++
++static void
++sm_replay(void)
++{
++	DTEntry mm;
++	void const *p = NULL;
++	unsigned int psize = 0;
++	uint64_t pa, len;
++	struct smr_entry e[SMR_C_MAX_ENTRIES];
++	unsigned n = 0, npass = 0, ran = 0;
++	int rc, stop = 0;
++	struct sweet_mali_info info;
++
++	/* read-only: the registers Mesa's record transport had to guess (docs/research/52 s.4) */
++	bzero(&info, sizeof(info));
++	if (sweet_mali_query(&info) == 0) {
++		printf("SWEET MALI: replay regs GPU_ID=%#x TILER_FEATURES=%#x THREAD_MAX=%#x/%#x/%#x THREAD_FEATURES=%#x TEXTURE_FEATURES=%#x,%#x,%#x,%#x AFBC=%#x\n",
++		    info.gpu_id, info.tiler_features, info.thread_max_threads, info.thread_max_workgroup, info.thread_max_barrier, info.thread_features,
++		    info.texture_features[0], info.texture_features[1], info.texture_features[2], info.texture_features[3], info.afbc_features);
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess || SecureDTGetProperty(mm, "GPUJOB", &p, &psize) != kSuccess) {
++		printf("SWEET MALI: replay: no GPUJOB container in /chosen/memory-map\n");
++		return;
++	}
++	if (psize != 2 * sizeof(uint64_t)) {
++		printf("SWEET MALI: replay: GPUJOB property is %u bytes, refused\n", psize);
++		return;
++	}
++	memcpy(&pa, p, sizeof(pa));
++	memcpy(&len, (uint8_t const *)p + sizeof(pa), sizeof(len));
++	if (len < SMR_C_HDR || len > SMR_C_MAX_BYTES || pa + len < pa) {
++		printf("SWEET MALI: replay: GPUJOB <%#llx, %#llx> out of bounds, refused\n", pa, len);
++		return;
++	}
++	const uint8_t *buf = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
++	rc = smr_container_parse(buf, (size_t)len, e, &n);
++	if (rc != 0) {
++		printf("SWEET MALI: replay: GPUJOB <%#llx, %#llx> refused, code %d\n", pa, len, rc);
++		return;
++	}
++	printf("SWEET MALI: replay: GPUJOB container ok at %#llx, %llu bytes, %u jobs\n", pa, len, n);
++	for (unsigned i = 0; i < n && !stop; i++) {
++		ran++;
++		npass += (unsigned)sm_replay_job(buf + e[i].offset, e[i].length, i, &stop);
++	}
++	printf("SWEET MALI: replay done %u/%u PASS%s\n", npass, n, ran < n ? " (stopped early)" : "");
++}
+ void
+ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+ {
+@@ -723,8 +985,8 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+ 		gic_done = 1;
+ 		sm_gic_probe();       /* read-only; 0x40 alone is a pure read run, before any Mali interrupt mask is touched */
+ 	}
+-	if (started || (mode & 3u) == 0 || (mode & 3u) == 3) {
+-		return;       /* sweetmali = 1 (service) or 2 (service + selftest), | 0x10 skips the kbase config writes */
++	if (started || ((mode & 3u) == 0 && (mode & 0x100u) == 0) || (mode & 3u) == 3) {
++		return;       /* sweetmali = 1 (service) or 2 (service + selftest), | 0x10 skips the kbase config writes; 0x100 = bring-up + job replay (patch 0155) */
+ 	}
+ 	started = 1;
+ 	sm_selftest_reset = (mode & 0x20u) != 0;      /* sweetmali=0x22: selftest + an explicit GPU reset and one more job */
+@@ -734,6 +996,13 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+ 	if ((mode & 3u) == 2) {
+ 		sm_selftest();
+ 	}
++	if (mode & 0x100u) {
++		if ((mode & 3u) != 0) {
++			printf("SWEET MALI: replay refused: sweetmali bit 0x100 only without the service bits 1|2 (no user client may share AS0)\n");
++		} else {
++			sm_replay();
++		}
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_mali_replay.h b/bsd/dev/sweet_mali_replay.h
+new file mode 100644
+index 0000000..d7034c6
+--- /dev/null
++++ b/bsd/dev/sweet_mali_replay.h
+@@ -0,0 +1,376 @@
++/*
++ * Mali job replay (sweetmali bit 0x100, docs/research/52): the pure part of the replay in sweet_mali.c, host-tested by shim/mali_replay_host_test.c
++ * (with ASan/UBSan). Nothing here touches hardware or kernel state other than the struct mali_va bitmap passed in.
++ *
++ * Container (tools/pack_gpujob.py, /chosen/memory-map GPUJOB <pa, size>), the WLANFWB1 layout with another magic and one tag:
++ *   char magic[8] = "GPUJOBS1"; u32 version = 1; u32 count (1..4); entry[count] { char tag[4] = "GPUJ"; u32 length; u32 offset; u32 crc32 }
++ * Entry payload = one .malijob v1 (Mesa sweet backend, record transport; layout docs/research/52 s.6):
++ *   header 64: magic "PIXMJOB1", u32 version 1, header_size 64, gpu_id, n_chains, n_bos, flags (bit 0 RT block); u64 file_size;
++ *              u32 chain_off, rt_off, bo_off, data_off; char name[8]
++ *   chain 16:  u64 jc, u32 req (bit 0 fragment), u32 reserved
++ *   rt 64:     u64 va; u32 width, height, stride, format (1 = RGBA8); u32 expect_crc, crc_valid; 3 x { u16 x, u16 y, u32 rgba }; u32 reserved[2]
++ *   bo 64:     u64 va, size, data_off, data_len; u32 flags (bit 0 exec, 1 no-mmap, 2 heap); u32 reserved; char label[24]
++ * Every length and offset is checked against the buffer before it is used; all arithmetic is 64-bit on values bounded first.
++ * Little endian, read byte by byte (no alignment assumption on the container).
++ */
++#ifndef SWEET_MALI_REPLAY_H
++#define SWEET_MALI_REPLAY_H
++#include <stdint.h>
++#include <stddef.h>
++#include "sweet_mali_pt.h"
++
++#define SMR_C_VERSION      1u
++#define SMR_C_HDR          16u
++#define SMR_C_ENTRY        16u
++#define SMR_C_MAX_ENTRIES  4u
++#define SMR_C_MAX_BYTES    (16u << 20)
++#define SMR_J_HDR          64u
++#define SMR_J_CHAIN        16u
++#define SMR_J_RT           64u
++#define SMR_J_BO           64u
++#define SMR_MAX_CHAINS     8u
++#define SMR_MAX_BOS        64u                    /* the captures hold 8 and 9 BOs */
++#define SMR_MAX_BO_BYTES   (32ull << 20)          /* largest recorded BO: the 16 MiB tiler heap */
++#define SMR_MAX_JOB_BYTES  (64ull << 20)          /* wired memory one replayed job may use */
++#define SMR_MAX_RT_DIM     4096u
++#define SMR_BO_PAGE        0x4000ull              /* XNU page: sweet_mali_map maps 16 KiB pages */
++#define SMR_JOB_ALIGN      128ull                 /* v9 "Job Header" align="128" (Mesa src/panfrost/genxml/v9.xml:1425) */
++#define SMR_JOB_MIN        64ull                  /* MALI_FRAGMENT_JOB_LENGTH, the smallest job a chain can start with */
++#define SMR_BO_FLAGS       7u
++#define SMR_REQ_FS         1u
++
++/* refusal codes (printed by the kernel) */
++#define SMR_E_LEN     10
++#define SMR_E_MAGIC   11
++#define SMR_E_HDR     12
++#define SMR_E_GPU     13
++#define SMR_E_TABLE   14
++#define SMR_E_NAME    15
++#define SMR_E_BO      16
++#define SMR_E_OVERLAP 17
++#define SMR_E_CHAIN   18
++#define SMR_E_RT      19
++
++struct smr_entry {
++	uint32_t length, offset, crc;
++};
++
++struct smr_bo {
++	uint64_t va, size, data_off, data_len;
++	uint32_t flags;
++	char label[24];
++};
++
++struct smr_job {
++	char name[9];
++	uint32_t gpu_id, n_chains, n_bos;
++	uint64_t jc[SMR_MAX_CHAINS];
++	uint32_t req[SMR_MAX_CHAINS];
++	struct {
++		uint64_t va;
++		uint32_t width, height, stride, format, expect_crc, crc_valid;
++		uint16_t px_x[3], px_y[3];
++		uint32_t px_rgba[3];
++	} rt;
++	uint32_t rt_bo;                 /* index of the BO holding the RT */
++	uint64_t rt_off;                /* offset of the RT inside that BO */
++	uint64_t bo_bytes;              /* sum of BO sizes */
++	const uint8_t *buf;
++	size_t len;
++	uint32_t bo_off;
++};
++
++static uint32_t
++smr_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint64_t
++smr_le64(const uint8_t *p)
++{
++	return (uint64_t)smr_le32(p) | (uint64_t)smr_le32(p + 4) << 32;
++}
++
++/* crc32, IEEE polynomial, zlib conventions (crc32(0, buf, n)); chainable */
++static uint32_t
++smr_crc32(uint32_t crc, const uint8_t *p, size_t n)
++{
++	uint32_t c = ~crc;
++	size_t i;
++	int b;
++
++	for (i = 0; i < n; i++) {
++		c ^= p[i];
++		for (b = 0; b < 8; b++) {
++			c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
++		}
++	}
++	return ~c;
++}
++
++/* 0 = ok, e[0..*count) filled, every entry inside the buffer and its crc verified; else 1..6 */
++static int
++smr_container_parse(const uint8_t *buf, size_t len, struct smr_entry e[SMR_C_MAX_ENTRIES], unsigned *count)
++{
++	static const uint8_t magic[8] = { 'G', 'P', 'U', 'J', 'O', 'B', 'S', '1' };
++	unsigned i, n;
++
++	if (len < SMR_C_HDR || len > SMR_C_MAX_BYTES) {
++		return 1;
++	}
++	for (i = 0; i < 8; i++) {
++		if (buf[i] != magic[i]) {
++			return 2;
++		}
++	}
++	n = smr_le32(buf + 12);
++	if (smr_le32(buf + 8) != SMR_C_VERSION || n == 0 || n > SMR_C_MAX_ENTRIES || SMR_C_HDR + SMR_C_ENTRY * n > len) {
++		return 3;
++	}
++	for (i = 0; i < n; i++) {
++		const uint8_t *r = buf + SMR_C_HDR + SMR_C_ENTRY * i;
++
++		if (r[0] != 'G' || r[1] != 'P' || r[2] != 'U' || r[3] != 'J') {
++			return 4;
++		}
++		e[i].length = smr_le32(r + 4);
++		e[i].offset = smr_le32(r + 8);
++		e[i].crc = smr_le32(r + 12);
++		if (e[i].length == 0 || (e[i].offset & 7u) != 0 || e[i].offset < SMR_C_HDR + SMR_C_ENTRY * n || e[i].offset > len ||
++		    e[i].length > len - e[i].offset) {
++			return 5;
++		}
++		if (smr_crc32(0, buf + e[i].offset, e[i].length) != e[i].crc) {
++			return 6;
++		}
++	}
++	*count = n;
++	return 0;
++}
++
++/* table [off, off + size) inside the buffer and after the header; 64-bit arithmetic on 32-bit inputs cannot overflow */
++static int
++smr_in_file(uint64_t off, uint64_t size, size_t len)
++{
++	return off >= SMR_J_HDR && off <= len && size <= len - off;
++}
++
++static void
++smr_job_bo(const struct smr_job *j, unsigned i, struct smr_bo *b)
++{
++	const uint8_t *r = j->buf + j->bo_off + (size_t)SMR_J_BO * i;
++	unsigned k;
++
++	b->va = smr_le64(r);
++	b->size = smr_le64(r + 8);
++	b->data_off = smr_le64(r + 16);
++	b->data_len = smr_le64(r + 24);
++	b->flags = smr_le32(r + 32);
++	for (k = 0; k < 24; k++) {
++		b->label[k] = (char)r[40 + k];
++	}
++	b->label[23] = 0;
++}
++
++/* index of the BO that holds [va, va + size), or -1 */
++static int
++smr_find_bo(const struct smr_job *j, uint64_t va, uint64_t size)
++{
++	struct smr_bo b;
++	unsigned i;
++
++	for (i = 0; i < j->n_bos; i++) {
++		smr_job_bo(j, i, &b);
++		if (va >= b.va && va - b.va < b.size && size <= b.size - (va - b.va)) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* 0 = ok and *j filled; every later use of j (smr_job_bo, the RT, the chains) stays inside buf. Else an SMR_E_* code. */
++static int
++smr_job_parse(const uint8_t *buf, size_t len, uint32_t want_gpu_id, struct smr_job *j)
++{
++	static const uint8_t magic[8] = { 'P', 'I', 'X', 'M', 'J', 'O', 'B', '1' };
++	uint32_t chain_off, rt_off, bo_off, data_off, flags;
++	unsigned i, k;
++	int fs = 0;
++
++	if (len < SMR_J_HDR || len > SMR_C_MAX_BYTES || smr_le64(buf + 32) != len) {
++		return SMR_E_LEN;
++	}
++	for (i = 0; i < 8; i++) {
++		if (buf[i] != magic[i]) {
++			return SMR_E_MAGIC;
++		}
++	}
++	j->buf = buf;
++	j->len = len;
++	j->gpu_id = smr_le32(buf + 16);
++	j->n_chains = smr_le32(buf + 20);
++	j->n_bos = smr_le32(buf + 24);
++	flags = smr_le32(buf + 28);
++	chain_off = smr_le32(buf + 40);
++	rt_off = smr_le32(buf + 44);
++	bo_off = smr_le32(buf + 48);
++	data_off = smr_le32(buf + 52);
++	if (smr_le32(buf + 8) != 1u || smr_le32(buf + 12) != SMR_J_HDR || flags != 1u || j->n_chains == 0 || j->n_chains > SMR_MAX_CHAINS ||
++	    j->n_bos == 0 || j->n_bos > SMR_MAX_BOS) {
++		return SMR_E_HDR;
++	}
++	if (j->gpu_id != want_gpu_id) {
++		return SMR_E_GPU;
++	}
++	if (!smr_in_file(chain_off, (uint64_t)SMR_J_CHAIN * j->n_chains, len) || !smr_in_file(rt_off, SMR_J_RT, len) ||
++	    !smr_in_file(bo_off, (uint64_t)SMR_J_BO * j->n_bos, len) || !smr_in_file(data_off, 0, len)) {
++		return SMR_E_TABLE;
++	}
++	j->bo_off = bo_off;
++	for (k = 0; k < 8; k++) {
++		uint8_t c = buf[56 + k];
++		if (c == 0) {
++			break;
++		}
++		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
++			return SMR_E_NAME;
++		}
++		j->name[k] = (char)c;
++	}
++	if (k == 0) {
++		return SMR_E_NAME;
++	}
++	for (i = k; i < 9; i++) {
++		j->name[i] = 0;
++	}
++	for (i = k; i < 8; i++) {
++		if (buf[56 + i] != 0) {
++			return SMR_E_NAME;
++		}
++	}
++
++	/* BOs: 16 KiB pages inside the GPU VA window, data inside the data area, no overlap, bounded sizes */
++	j->bo_bytes = 0;
++	for (i = 0; i < j->n_bos; i++) {
++		struct smr_bo b;
++		const uint8_t *r = buf + bo_off + (size_t)SMR_J_BO * i;
++
++		smr_job_bo(j, i, &b);
++		if (b.size == 0 || b.size > SMR_MAX_BO_BYTES || (b.size & (SMR_BO_PAGE - 1)) || (b.va & (SMR_BO_PAGE - 1)) || b.va < MALI_VA_START ||
++		    b.va >= MALI_VA_END || b.size > MALI_VA_END - b.va || b.data_len > b.size || (b.flags & ~SMR_BO_FLAGS) || r[63] != 0 ||
++		    b.data_off < data_off || b.data_off > len || b.data_len > len - b.data_off) {
++			return SMR_E_BO;
++		}
++		j->bo_bytes += b.size;
++		if (j->bo_bytes > SMR_MAX_JOB_BYTES) {
++			return SMR_E_BO;
++		}
++		for (k = 0; k < i; k++) {
++			struct smr_bo o;
++			smr_job_bo(j, k, &o);
++			if (b.va < o.va + o.size && o.va < b.va + b.size) {
++				return SMR_E_OVERLAP;
++			}
++		}
++	}
++
++	/* chains: 128-byte aligned job descriptors inside a BO, known requirement bits, at least one fragment chain */
++	for (i = 0; i < j->n_chains; i++) {
++		const uint8_t *r = buf + chain_off + (size_t)SMR_J_CHAIN * i;
++
++		j->jc[i] = smr_le64(r);
++		j->req[i] = smr_le32(r + 8);
++		if ((j->jc[i] & (SMR_JOB_ALIGN - 1)) || (j->req[i] & ~SMR_REQ_FS) || smr_find_bo(j, j->jc[i], SMR_JOB_MIN) < 0) {
++			return SMR_E_CHAIN;
++		}
++		fs |= (j->req[i] & SMR_REQ_FS) != 0;
++	}
++	if (!fs) {
++		return SMR_E_CHAIN;
++	}
++
++	/* render target: RGBA8, stride*height bytes inside one BO, the three pixels inside the RT */
++	{
++		const uint8_t *r = buf + rt_off;
++		int bi;
++
++		j->rt.va = smr_le64(r);
++		j->rt.width = smr_le32(r + 8);
++		j->rt.height = smr_le32(r + 12);
++		j->rt.stride = smr_le32(r + 16);
++		j->rt.format = smr_le32(r + 20);
++		j->rt.expect_crc = smr_le32(r + 24);
++		j->rt.crc_valid = smr_le32(r + 28);
++		if (j->rt.format != 1u || j->rt.width == 0 || j->rt.width > SMR_MAX_RT_DIM || j->rt.height == 0 || j->rt.height > SMR_MAX_RT_DIM ||
++		    (uint64_t)j->rt.stride < (uint64_t)j->rt.width * 4u || j->rt.crc_valid > 1u) {
++			return SMR_E_RT;
++		}
++		bi = smr_find_bo(j, j->rt.va, (uint64_t)j->rt.stride * j->rt.height);
++		if (bi < 0) {
++			return SMR_E_RT;
++		}
++		j->rt_bo = (uint32_t)bi;
++		{
++			struct smr_bo b;
++			smr_job_bo(j, (unsigned)bi, &b);
++			j->rt_off = j->rt.va - b.va;
++		}
++		for (i = 0; i < 3; i++) {
++			j->rt.px_x[i] = (uint16_t)(r[32 + 8 * i] | r[33 + 8 * i] << 8);
++			j->rt.px_y[i] = (uint16_t)(r[34 + 8 * i] | r[35 + 8 * i] << 8);
++			j->rt.px_rgba[i] = smr_le32(r + 36 + 8 * i);
++			if (j->rt.px_x[i] >= j->rt.width || j->rt.px_y[i] >= j->rt.height) {
++				return SMR_E_RT;
++			}
++		}
++	}
++	return 0;
++}
++
++/* rt = CPU view of the RT start (stride*height bytes, guaranteed inside its BO by smr_job_parse). Returns the number of failed checks
++ * (3 pixels, plus the crc when crc_valid) and the crc over height rows of width*4 bytes in *crc. */
++static unsigned
++smr_rt_check(const struct smr_job *j, const uint8_t *rt, uint32_t *crc)
++{
++	unsigned bad = 0, i;
++	uint32_t c = 0, y;
++
++	for (y = 0; y < j->rt.height; y++) {
++		c = smr_crc32(c, rt + (size_t)y * j->rt.stride, (size_t)j->rt.width * 4u);
++	}
++	*crc = c;
++	for (i = 0; i < 3; i++) {
++		if (smr_le32(rt + (size_t)j->rt.px_y[i] * j->rt.stride + (size_t)j->rt.px_x[i] * 4u) != j->rt.px_rgba[i]) {
++			bad++;
++		}
++	}
++	if (j->rt.crc_valid && c != j->rt.expect_crc) {
++		bad++;
++	}
++	return bad;
++}
++
++/* reserve [va, va + npages*4 KiB) at a fixed VA (16 KiB granules: va and npages*4 KiB multiples of 16 KiB). 0 = reserved; -1 = outside the
++ * window or misaligned; -2 = some page is taken (nothing changed). Released with mali_va_free. */
++static int
++mali_va_reserve(struct mali_va *v, uint64_t va, uint32_t npages)
++{
++	uint32_t i, k;
++
++	if (npages == 0 || (npages & 3u) || (va & (SMR_BO_PAGE - 1)) || va < MALI_VA_START || va >= MALI_VA_END ||
++	    (uint64_t)npages * MALI_PG > MALI_VA_END - va) {
++		return -1;
++	}
++	i = (uint32_t)((va - MALI_VA_START) / MALI_PG);
++	for (k = 0; k < npages; k++) {
++		if (mali_va_test(v, i + k)) {
++			return -2;
++		}
++	}
++	for (k = 0; k < npages; k++) {
++		v->bits[(i + k) >> 5] |= 1u << ((i + k) & 31);
++	}
++	return 0;
++}
++#endif

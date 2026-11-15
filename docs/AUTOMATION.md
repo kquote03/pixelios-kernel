@@ -639,3 +639,21 @@ header and at most 2 KiB of console text, printable bytes only, now and 2 s late
 Never written: EP Command (bus master), any BAR2 word after W14, rings, doorbells, host_cap. Left after the run: the firmware running (also after a W16/W17 stop),
 SYS_MEM out of reset, ATU region 2 enabled, cfg 0x84 = 0; a power cycle resets the chip. Reviews: docs/reviews/0150-wlan-fw-ready-review-fable-1.md (SAFE-AFTER-FIXES),
 -2.md (SAFE; G1-G6 L open: glue gate/latch for the release before any later store level, two cite texts, uncovered mutants X2/X3/X8/X9/X11/X15).
+
+## XNU sweetmali=0x100: replay recorded Mesa job chains (patch 0155, plan oneshot-2 step G2; BUILT, UNRUN, review pending)
+
+Captures come from the host Mesa build (docs/research/52, `gpu/capture/run-capture.sh`); pack them in replay order and boot with the container:
+
+```bash
+python3 -I tools/pack_gpujob.py ~/pixelios-artifacts/gpu/capture/gpujob-clear-tri.bin ~/pixelios-artifacts/gpu/capture/clear.malijob ~/pixelios-artifacts/gpu/capture/tri.malijob
+SWEET_USBLOG_PORT=64738 tools/xrun --kernel <kernel> --board oriole --no-camera --gui --rails --cpus 8 --gpu-handover --intent gpu \
+  --gpujob ~/pixelios-artifacts/gpu/capture/gpujob-clear-tri.bin --args 'sweetmali=0x100' \
+  --expect 'SWEET MALI: replay tri=(PASS|FAIL)' --stop-on 'SWEET MALI: replay done' --fail-on 'panic\(' \
+  --label gpu-o3-g2-replay1 --lock-wait 3600 --restart 600,bootloader --hard-timeout 600
+```
+
+`--gpujob FILE` (tools/xrun, tools/build-xnu-image.sh, needs `--gpu-handover`) puts the container in the payload as `/chosen/memory-map GPUJOB`.
+`sweetmali=0x100` = bring-up as `sweetmali=1` without registering the SweetMali service, then the replay; with bit 1 or 2 also set the replay is refused.
+Output: `SWEET MALI: replay regs ...` (read-only feature registers), `replay: GPUJOB container ok ...`, per job `replay <name>: N chains ...` and
+`replay <name>=PASS|FAIL crc=0x...`, then `replay done N/M PASS`. A fault adds the core's `job ... failed JS_STATUS=` / `MMU fault ... FAULTADDR=` lines
+and `replay <name>=FAIL chain K wait E jc=... header exception_status=... fault_pointer=...`; the replay stops there.

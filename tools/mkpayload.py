@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER] [--gpujob CONTAINER]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -33,6 +33,7 @@ import argparse, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import adt, boards  # noqa: E402
 from tools.pack_wlanfw import parse as wlanfw_parse  # noqa: E402
+from tools.pack_gpujob import parse as gpujob_parse  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
@@ -161,7 +162,7 @@ def with_board_args(cmdline, board):
     return ' '.join([cmdline] + add) if add else cmdline
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None, gpujob_path=None):
     unmeasured = boards.provisional(board)
     if unmeasured:
         raise SystemExit(f'board {board}: board.json "provisional" still lists {unmeasured}; measure them first '
@@ -207,6 +208,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
         pieces.append((fw_va, fw_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, fw_pa, len(image), 'WLANFW')
         wlanfw = (hex(fw_pa), hex(len(image)))
+    gpujob = None
+    if gpujob_path:
+        # Mali job captures (tools/pack_gpujob.py, sweetmali bit 0x100): same placement, property GPUJOB <phys, exact size>
+        image = open(gpujob_path, 'rb').read()
+        gpujob_parse(image)
+        gj_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        gj_va = kernel_end
+        kernel_end = gj_va + gj_size
+        gj_pa = gj_va - virt_base + PHYS_BASE
+        pieces.append((gj_va, gj_size, image))
+        adt_blob = add_ramdisk_to_adt(adt_blob, gj_pa, len(image), 'GPUJOB')
+        gpujob = (hex(gj_pa), hex(len(image)))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -228,7 +241,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, gpujob=gpujob, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -242,9 +255,10 @@ if __name__ == '__main__':
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--wlanfw', help='BCM4389 firmware container (tools/pack_wlanfw.py) -> /chosen/memory-map WLANFW')
+    ap.add_argument('--gpujob', help='Mali job captures (tools/pack_gpujob.py) -> /chosen/memory-map GPUJOB (sweetmali bit 0x100)')
     ap.add_argument('--board', choices=sorted(boards.BOARDS), default='sweet')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw, a.gpujob)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
