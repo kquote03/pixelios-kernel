@@ -8,7 +8,7 @@ if taken or outside MALI_VA_START..MALI_VA_END), cache clean, chains through swe
 (the selftest path). Without bit 0x100 nothing changes. Also prints the feature registers Mesa's record transport had to guess (read-only).
 
 diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
-index 2fbd94d..6aa9c23 100644
+index 2fbd94d..c882063 100644
 --- a/bsd/dev/sweet_mali.c
 +++ b/bsd/dev/sweet_mali.c
 @@ -20,8 +20,11 @@
@@ -23,7 +23,7 @@ index 2fbd94d..6aa9c23 100644
  
  extern void flush_dcache64(addr64_t, unsigned, int);
  extern vm_offset_t kvtophys(vm_offset_t);
-@@ -710,6 +713,265 @@ sm_gic_probe(void)
+@@ -710,6 +713,269 @@ sm_gic_probe(void)
  	printf("SWEET MALI: gic probe done\n");
  }
  
@@ -273,6 +273,10 @@ index 2fbd94d..6aa9c23 100644
 +		printf("SWEET MALI: replay: GPUJOB <%#llx, %#llx> out of bounds, refused\n", pa, len);
 +		return;
 +	}
++	if (PAGE_SIZE != SMR_BO_PAGE) {
++		printf("SWEET MALI: replay: page size %lu is not 16 KiB, refused\n", (unsigned long)PAGE_SIZE);   /* review 0155 F3: smr_pa and the 4 x 4 KiB map loop assume 16 KiB */
++		return;
++	}
 +	const uint8_t *buf = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
 +	rc = smr_container_parse(buf, (size_t)len, e, &n);
 +	if (rc != 0) {
@@ -289,7 +293,7 @@ index 2fbd94d..6aa9c23 100644
  void
  sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  {
-@@ -723,8 +985,8 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -723,8 +989,8 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  		gic_done = 1;
  		sm_gic_probe();       /* read-only; 0x40 alone is a pure read run, before any Mali interrupt mask is touched */
  	}
@@ -300,7 +304,7 @@ index 2fbd94d..6aa9c23 100644
  	}
  	started = 1;
  	sm_selftest_reset = (mode & 0x20u) != 0;      /* sweetmali=0x22: selftest + an explicit GPU reset and one more job */
-@@ -734,6 +996,13 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -734,6 +1000,13 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  	if ((mode & 3u) == 2) {
  		sm_selftest();
  	}
@@ -316,10 +320,10 @@ index 2fbd94d..6aa9c23 100644
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_mali_replay.h b/bsd/dev/sweet_mali_replay.h
 new file mode 100644
-index 0000000..d7034c6
+index 0000000..b39ec5a
 --- /dev/null
 +++ b/bsd/dev/sweet_mali_replay.h
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,381 @@
 +/*
 + * Mali job replay (sweetmali bit 0x100, docs/research/52): the pure part of the replay in sweet_mali.c, host-tested by shim/mali_replay_host_test.c
 + * (with ASan/UBSan). Nothing here touches hardware or kernel state other than the struct mali_va bitmap passed in.
@@ -583,6 +587,11 @@ index 0000000..d7034c6
 +		    b.va >= MALI_VA_END || b.size > MALI_VA_END - b.va || b.data_len > b.size || (b.flags & ~SMR_BO_FLAGS) || r[63] != 0 ||
 +		    b.data_off < data_off || b.data_off > len || b.data_len > len - b.data_off) {
 +			return SMR_E_BO;
++		}
++		for (k = 0; k < 24 && r[40 + k] != 0; k++) {
++			if (r[40 + k] < 0x20u || r[40 + k] > 0x7eu) {
++				return SMR_E_BO;        /* review 0155 F2: the label is printed; printable ASCII only */
++			}
 +		}
 +		j->bo_bytes += b.size;
 +		if (j->bo_bytes > SMR_MAX_JOB_BYTES) {

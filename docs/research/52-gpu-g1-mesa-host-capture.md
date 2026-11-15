@@ -189,6 +189,27 @@ First cross build result [obs 2026-11-16]: `ninja -C $A/gpu/build/mesa-ios -k 0`
 libgallium, libpankmod_lib, ...) are only built when a target links them; `ninja ... src/panfrost/lib/kmod/libpankmod_lib.a` built cleanly
 (no warnings) and exports `sweet_kmod_*` and `sweet_iokit_transport_create`. No dylib or executable exists yet (the sweetgl target is the G3 agent's).
 
+## 10. G2 on hardware (2026-11-15, run gpu-o5-g2-replay1, review 0155 SAFE)
+
+[obs] Kernel `xnu-local-lane-g-63384af` (patches to 0155), `--gpu-handover --gpujob gpujob-clear-tri.bin --args sweetmali=0x100`:
+`replay clear=PASS crc=0xff12cb5c (expected)`, `replay tri=PASS crc=0x7a47b674 px=0xff996633,0xff996633,0xff00ff00`, `replay done 2/2 PASS`.
+The first Mesa Panfrost job chains (fragment clear; malloc-vertex/tiler + fragment triangle) ran on the Mali-G78, recorded on the host with
+the record transport's guessed properties. Registers read in that run (settles s.4 open item 1):
+
+| Register | Record transport used | Hardware [obs] |
+|---|---|---|
+| TILER_FEATURES | 0x809 (kbase model) | 0x809 |
+| THREAD_MAX_THREADS / WORKGROUP / BARRIER | 0x180 x3 (kbase model) | 0x400 / 0x200 / 0x200 |
+| THREAD_FEATURES | 0x46000 | 0x48000 |
+| TEXTURE_FEATURES0..3 | 0 | 0xf7fe007e, 0xc3fff7ff, 0xbfe1ff9f, 0x10c6 |
+| AFBC_FEATURES | 0 | 0 |
+
+Review follow-ups (review 0155): F2 BO labels printable ASCII only (kernel parser + `pack_gpujob.check_malijob`, host test + mutant);
+F3 `sm_replay` refuses unless `PAGE_SIZE == SMR_BO_PAGE`; F4 `sweet_malijob --crc` and `tri.malijob` now carries the observed crc
+(`crc_valid = 1`, `expect_crc = 0x7a47b674`; only bytes 216-220 changed): `tri.malijob` sha256 `009c4e89334659c76ca411c7c2eb741250cc798ac902e55fe1d345eb94f67fe6`,
+`gpujob-clear-tri-v2.bin` sha256 `b15fb13b23ce5a657e5422523b48bf965eb1f7034e89d9ba27ca0c2ecc325e87` (7744 B). F1 (submit failure other than EINVAL
+leaks) is in patch 0157, where the second submitter (IRQ path) appears. F5 (print JS_HEAD/TAIL) not done (optional, diagnostic).
+
 ## 11. G3 result (2026-11-16, sub-lane lane-g3; host only, nothing ran on the phone)
 
 Tags as above: **[obs]** a command run here, **[src]** read from the cited file, **[guess]** not verified. Nothing in this section is a

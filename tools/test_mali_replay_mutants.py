@@ -69,6 +69,7 @@ MUTANTS = [
     ("bo data within size", "b.data_len > b.size ||", ""),
     ("bo flags", "(b.flags & ~SMR_BO_FLAGS) ||", ""),
     ("bo label nul", "r[63] != 0 ||", ""),
+    ("bo label printable (F2)", "if (r[40 + k] < 0x20u || r[40 + k] > 0x7eu) {", "if (0) {"),
     ("bo data after tables", "b.data_off < data_off ||", ""),
     ("bo data in file", "|| b.data_len > len - b.data_off) {\n\t\t\treturn SMR_E_BO;", ") {\n\t\t\treturn SMR_E_BO;"),
     ("bo overlap", "if (b.va < o.va + o.size && o.va < b.va + b.size) {", "if (0) {"),

@@ -10,7 +10,7 @@ and MMU interrupts (INTID 452/453 = SPI 420/421, stock oriole DT; GPU INTID 451 
   then masks 0; review 0155 F1: a replay submit failure other than EINVAL leaks the BOs (a job may run); counts printed: "SWEET MALI: irq counts mode=... job=N mmu=N spurious=N unhandled_spi=N". Without bit 0x200 nothing changes.
 
 diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
-index 6aa9c23..4326b6d 100644
+index c882063..f7aa5e2 100644
 --- a/bsd/dev/sweet_mali.c
 +++ b/bsd/dev/sweet_mali.c
 @@ -64,6 +64,7 @@ extern int sweet_gpu_power_on(volatile uint32_t *g);
@@ -181,7 +181,7 @@ index 6aa9c23..4326b6d 100644
  			goto out;
  		}
  		rc = sweet_mali_wait(seq, SMR_WAIT_US);
-@@ -993,6 +1102,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -997,6 +1106,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  	if (sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0)) {
  		return;
  	}
@@ -191,7 +191,7 @@ index 6aa9c23..4326b6d 100644
  	if ((mode & 3u) == 2) {
  		sm_selftest();
  	}
-@@ -1003,6 +1115,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -1007,6 +1119,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  			sm_replay();
  		}
  	}

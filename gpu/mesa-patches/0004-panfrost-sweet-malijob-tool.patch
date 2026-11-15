@@ -21,10 +21,10 @@ index 2d5bef1..f9ddd77 100644
 +)
 diff --git a/src/panfrost/tools/sweet_malijob.c b/src/panfrost/tools/sweet_malijob.c
 new file mode 100644
-index 0000000..198576c
+index 0000000..4fbf433
 --- /dev/null
 +++ b/src/panfrost/tools/sweet_malijob.c
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,297 @@
 +/*
 + * Copyright © 2026 PixOS-Project contributors
 + * SPDX-License-Identifier: MIT
@@ -34,6 +34,7 @@ index 0000000..198576c
 + *   sweet_malijob IN --out OUT [--name N] [checks]   same, then write OUT with the RT block (and name, 1..8 of [a-z0-9_]) filled in:
 + *        --uniform RGBA      every pixel must be RGBA (expected crc32 computed here, 3 pixel checks at corners/centre)
 + *        --px X,Y,RGBA       one pixel check (up to 3), crc reported by the replay but not checked
++ *        --crc CRC           with --px: the expected crc32 (e.g. observed on hardware), then checked by the replay
 + * RGBA is the pixel as a little-endian u32 (R | G<<8 | B<<16 | A<<24). Valhall v9 (Mali-G78) layouts only.
 + */
 +#define PAN_ARCH 9
@@ -205,6 +206,8 @@ index 0000000..198576c
 +{
 +   const char *in = NULL, *out = NULL;
 +   const char *name = NULL;
++   bool have_crc = false;
++   uint32_t want_crc = 0;
 +   bool uniform = false;
 +   uint32_t uni = 0;
 +   struct mj_pixel px[3] = {0};
@@ -215,6 +218,10 @@ index 0000000..198576c
 +         out = argv[++i];
 +      else if (!strcmp(argv[i], "--name") && i + 1 < argc)
 +         name = argv[++i];
++      else if (!strcmp(argv[i], "--crc") && i + 1 < argc) {
++         have_crc = true; /* PixOS review 0155 F4: a crc observed on hardware, checked by later replays */
++         want_crc = (uint32_t)strtoul(argv[++i], NULL, 0);
++      }
 +      else if (!strcmp(argv[i], "--uniform") && i + 1 < argc) {
 +         uniform = true;
 +         uni = parse_rgba(argv[++i]);
@@ -281,6 +288,10 @@ index 0000000..198576c
 +      if (npx != 3)
 +         return fail("need --uniform or three --px");
 +      memcpy(r.px, px, sizeof(px));
++      if (have_crc) {
++         r.expect_crc = want_crc;
++         r.crc_valid = 1;
++      }
 +   }
 +   for (unsigned i = 0; i < 3; i++)
 +      if (r.px[i].x >= rt.width || r.px[i].y >= rt.height)

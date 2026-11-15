@@ -52,6 +52,9 @@ def check_malijob(b, gpu_id=GPU_ID):
         if (size == 0 or size > MAX_BO or size % PAGE or va % PAGE or not VA_START <= va < VA_END or size > VA_END - va or dlen > size
                 or fl & ~7 or b[bo_off + 64 * i + 63] != 0 or doff < data_off or doff > n or dlen > n - doff):
             raise ValueError(f'bo {i}')
+        label = b[bo_off + 64 * i + 40:bo_off + 64 * i + 64].split(b'\0', 1)[0]
+        if any(c < 0x20 or c > 0x7e for c in label):
+            raise ValueError(f'bo {i} label')   # review 0155 F2: printable ASCII only (the kernel prints it)
         for ova, osz in bos:
             if va < ova + osz and ova < va + size:
                 raise ValueError(f'bo {i} overlaps')

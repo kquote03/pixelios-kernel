@@ -47,7 +47,8 @@ class Malijob(unittest.TestCase):
                 put(64, '<Q', 0x03054340), put(64, '<Q', 0x03010000), put(72, '<I', 2), put(88, '<I', 0),
                 put(192, '<Q', 0x03104000), put(192 + 16, '<I', 255), put(192 + 20, '<I', 2), put(192 + 32, '<H', 64),
                 put(256, '<Q', 0x01ffc000), put(256 + 64, '<Q', 0x02ffc000), put(256 + 128 + 8, '<Q', 0x5000), put(256 + 64 + 24, '<Q', 0x10001),
-                put(256 + 32, '<I', 8)]
+                put(256 + 32, '<I', 8),
+                put(256 + 40, '<4s', b'b\nX\0'), put(256 + 40, '<4s', b'b\x7f\0\0'), put(256 + 40, '<4s', b'b\xc3\0\0')]  # review 0155 F2
         for i, b in enumerate(bad):
             with self.assertRaises(ValueError, msg=f'case {i}'):
                 g.check_malijob(b)

@@ -335,6 +335,19 @@ main(void)
 		f[e + 63] = 'x';                                      /* label must be NUL-terminated */
 		assert(parse(f, n) != 0);
 		f[e + 63] = 0;
+		f[e + 41] = (char)0x0a;                               /* review 0155 F2: a control byte in the label (fake log lines) */
+		assert(parse(f, n) != 0);
+		f[e + 41] = (char)0x7f;
+		assert(parse(f, n) != 0);
+		f[e + 41] = (char)0xc3;
+		assert(parse(f, n) != 0);
+		f[e + 41] = 0x7e;                                     /* printable: fine (bytes after the NUL are ignored) */
+		assert(parse(f, n) == 0);
+		f[e + 41] = (char)0;
+		f[e + 45] = (char)0x0a;                               /* after the terminating NUL: ignored */
+		assert(parse(f, n) == 0);
+		f[e + 45] = 0;
+		f[e + 41] = (char)0x6f;                               /* back to "bo%d" */
 	}
 	expect_refused64(f, n, 256 + 24, n);                        /* BO 0 data would reach past the file */
 	expect_refused64(f, n, 256 + 64 + 16, 64);                  /* BO data inside the tables */
