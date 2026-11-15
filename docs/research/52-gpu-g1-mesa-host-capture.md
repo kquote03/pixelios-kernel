@@ -153,3 +153,32 @@ Wired memory the replay needs: 17.4 MiB (clear) / 18.4 MiB (tri), dominated by t
   `sweet_mali_submit`/`sweet_mali_wait` (2 s each; a timeout waits 4 s more for the core's 3 s hard stop + reset), invalidate, crc32 of the RT
   rows and the three pixels. Output `SWEET MALI: replay <name>=PASS|FAIL crc=0x...`. A failure stops the replay; BOs are freed only after a
   clean unmap with no job running, else leaked. Read-only extra: `replay regs ...` prints TILER_FEATURES / THREAD_* / TEXTURE_FEATURES (s.4 open item 1).
+
+## 9. G3 state at hand-over (2026-11-15, lane G; the rest of G3 is owned by another agent from here)
+
+What exists [obs unless tagged]:
+
+| Item | Where | Note |
+|---|---|---|
+| Host tools for the cross stage | `$A/gpu/install-host/bin/{mesa_clc,vtn_bindgen2,panfrost_compile}` | `ninja -C $A/gpu/build/mesa install` (host build of s.2, patches 0001-0004); run inside `gpu/nix/shell.nix` (they link nix LLVM) |
+| theos cctools wrappers | `$A/gpu/ios/bin/{ld,ldid,libtool,lipo,otool,nm}` | made by `gpu/ios/mk-wrappers.sh`; `ld -v` = ld64-609 |
+| Cross toolchain check | - | nix clang 21.1.8 `--target=arm64-apple-ios16.0 -isysroot iPhoneOS16.5.sdk` + wrapped ld64: a hello world is `Mach-O 64-bit arm64 executable`, `otool -L` = `/usr/lib/libSystem.B.dylib` only |
+| meson cross / native files | `gpu/ios/ios-arm64.cross`, `gpu/ios/host-tools.native` (copies of `$A/gpu/ios/`) | `-fuse-ld` must NOT be in the compiler args (meson's argument probes then fail with -Wunused-command-line-argument) and meson ignores it for the Apple-linker probe: ld64 is found as `ld` through PATH instead |
+| Configure script | `gpu/ios/configure-ios.sh` -> `$A/gpu/build/mesa-ios` | doc 32 s.4.2 option set + `-Ddarwin-sweet=true`; configure succeeds, detects `ld64 609` for host links |
+| Mesa patch 0005 | `gpu/mesa-patches/0005-panfrost-sweet-darwin-ios-build.patch` (also `$A/gpu/patches/`) | `include/darwin-sweet/xf86drm.h` (declarations only), meson option `darwin-sweet` (dep_libdrm = that header), kmod on Darwin = pan_kmod + panthor_kmod + sweet_kmod + `sweet_iokit.c` (no panfrost_kmod: eventfd/timerfd), `sweet_kmod_wait_idle()` for the syncobj stand-in, iokit transport auto-selected on `__APPLE__` |
+| iokit transport | `src/panfrost/lib/kmod/sweet_iokit.c` (in 0005) | selectors 0-4 of patch 0105; BO CPU map = `IOConnectMapMemory64(type = handle, kIOMapWriteCombineCache)`; unrun |
+
+Not done (owner: the G3 agent): the gallium frontend/target `src/gallium/targets/sweetgl` (no GLX/EGL on iOS: es2api is not built, so the dylib must
+carry the GLES entry points itself; `panfrost_create_screen(fd, config, NULL)` needs a `driOptionCache` built from `driinfo_panfrost.h` because
+xmlconfig is disabled), the libdrm/syncobj implementation (`sweet_drm.c`, syncobj waits -> `sweet_kmod_wait_idle`), the EAGL/IOSurface shim,
+`libsweetgl.dylib`, `sweetgl_selftest`, ldid signing. Result of the first cross `ninja -k 0`: see the row added below when it finishes.
+
+Rebuild from scratch:
+```
+cd $A/gpu/src/mesa && git checkout -- . && for p in <repo>/gpu/mesa-patches/000[1-5]*.patch; do git apply $p; done
+<repo>/gpu/ios/mk-wrappers.sh
+nix-shell $A/gpu/nix/shell.nix --run 'bash <repo>/gpu/nix/configure-host.sh' && flock $A/scratch/heavy.lock nix-shell $A/gpu/nix/shell.nix --run 'ninja -C $A/gpu/build/mesa install'
+nix-shell $A/gpu/nix/shell.nix --run 'bash <repo>/gpu/ios/configure-ios.sh'
+flock $A/scratch/heavy.lock nix-shell $A/gpu/nix/shell.nix --run 'export PATH=$A/gpu/ios/bin:$PATH; ninja -C $A/gpu/build/mesa-ios -k 0'
+```
+[guess] 0005 changes the kmod meson for Linux too (panfrost_kmod.c moved into the non-Darwin branch); the host build was not rebuilt with 0005 yet.

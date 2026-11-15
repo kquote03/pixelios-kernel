@@ -1,0 +1,4 @@
+[binaries]
+mesa_clc = '/home/kenan1099/pixelios-artifacts/gpu/install-host/bin/mesa_clc'
+vtn_bindgen2 = '/home/kenan1099/pixelios-artifacts/gpu/install-host/bin/vtn_bindgen2'
+panfrost_compile = '/home/kenan1099/pixelios-artifacts/gpu/install-host/bin/panfrost_compile'
