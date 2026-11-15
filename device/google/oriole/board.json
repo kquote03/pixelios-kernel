@@ -17,6 +17,10 @@
     "0x880000000",
     "0x100000000"
   ],
+  "aoc_carveout": [
+    "0x94000000",
+    "0x3000000"
+  ],
   "fb_base": "0xfac00000",
   "fb_size": "0x9e3400",
   "fb_width": 1080,
@@ -142,6 +146,7 @@
     "xnu_bootargs_default": "OBSERVED on the phone: the touch recipe of run oriole-gui7 (2026-11-14, CI kernel xnu-b6697f7 sha256 of PORT.md, --rails): mux driven, CS as GPIO, USI11 on the oscillator / div 5 (patch 0093 poke grammar m:ADDR=MASK=VAL), reset before the SPI pads (patch 0146). tools/mkpayload.py appends each one unless the cmdline already sets that key.",
     "dram_banks": "OBSERVED on the phone (run oriole-probe1 (2026-11-12, probe shim git 36cacae, image sha256 981284da), capture device/google/oriole/hardware/probe-log-2026-11-12-oriole-probe1.txt): /memory banks 0x80000000, 0x880000000, 0x900000000, 0x980000000, 2 GiB each; the high three are contiguous and merged here; no reserved range lies above 0x880000000. Android CP1A.260405.005, bootloader slider-17.0-15681480.",
     "xnu_ram": "Deliberately the same 4 GiB window as bluejay (the XNU memory path is observed only with this size); it must lie inside a hole-free bank with no reserved range inside. Growing it to 6 GiB is a later, separate change.",
+    "aoc_carveout": "OBSERVED in the stock recovery capture oriole-ref1 (~/pixelios-artifacts/ref/oriole/20261114T072643Z): dmesg:21 reserved memory aoc@94000000, 49152 KiB, nomap; iomem.txt:186-187 '94000000-96ffffff : 19000000.aoc' inside '93000000-973fffff : reserved'; dmesg:2067 'found aoc ... dram:[mem 0x94000000-0x96ffffff]'. Read from source: memory-region = <&aoc_reserve> (Google devices/google/gs101 a9b5edb gs101-aoc.dtsi:48); the AOC image body goes to its base and the GSA locks it (kernel/google-modules/soc/gs include/linux/gsa/gsa_aoc.h:26-41), docs/research/50 sections 5-6, 8. It lies in the low DRAM bank, outside xnu_ram, so XNU never allocates it (tools/test_aoc_carveout.py); XNU code that touches it maps it itself.",
     "fb_base": "OBSERVED on the phone (run oriole-probe1, 2026-11-12, probe shim git 36cacae): the shim draws its console at 0xfac00000 (FDT has no framebuffer node: 'FB board fallback') and the user saw the text on screen. Source: mainline Linux gs101-oriole.dts cont_splash_mem reg <0x0 0xfac00000 (1080*2400*4)>, framebuffer0 1080x2400 stride 1080*4 a8r8g8b8.",
     "usb_dma_range": "OBSERVED on the phone (run oriole-probe1 (2026-11-12, probe shim git 36cacae, image sha256 981284da), capture device/google/oriole/hardware/probe-log-2026-11-12-oriole-probe1.txt): reserved-memory abl@f8800000, no-map, 16 MiB (same as bluejay); ABL's DWC3 event buffer GEVNTADR 0xF8D1B000 (4 KiB) lies inside it ('USB EVBUF in reserved abl@f8800000').",
     "key_pins": "read from source: same gpio-keys as bluejay. Google raviole gs101-oriole-common.dtsi -> gs101-raviole.dtsi:8 includes gs101/gs101-common.dtsi (bluejay: gs101-bluejay.dtsi:8, the same file); mainline gs101-pixel-common.dtsi gpio-keys (gpa7-3, gpa8-1, gpa10-1, GPIO_ACTIVE_LOW) is the oriole tree. Bank offsets as in device/google/bluejay/board.json notes.",
