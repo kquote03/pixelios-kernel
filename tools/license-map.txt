@@ -52,6 +52,8 @@ tools/gen-ufsphy-tables.py	MIT	UNRESOLVED: generator for Linux phy-gs101-ufs.c f
 # AOSP tools: gitignored, fetched by tools/fetch-android-tools.sh (THIRD_PARTY row 19); listed so a stray tracked copy is checked
 tools/third_party/avbtool.py	MIT	AOSP external/avb, THIRD_PARTY row 19 (LICENSES/MIT-AOSP-avbtool.txt)
 tools/third_party/*	Apache-2.0	AOSP mkbootimg + gki certificate, THIRD_PARTY row 19
+# Mesa (MIT): patches against mesa-26.2.5 (ddaf85e); context lines are Mesa code, added lines are ours, THIRD_PARTY row 21
+gpu/mesa-patches/*	MIT	Mesa 26.2.5 (MIT, per-file headers, e.g. Collabora) + pixos modifications, THIRD_PARTY row 21
 # everything else written by this project (THIRD_PARTY row 1 / PLAN-STANDALONE): explicit top-level paths, no catch-all
 shim/usbgadget.[ch]	MIT	pixos; constants/state machine from ios-sweet 0073 (= our 0071), THIRD_PARTY row 2
 shim/*	MIT	pixos
@@ -65,6 +67,7 @@ docs/*	MIT	pixos
 xnu/AGENTS.md	MIT	pixos
 xnu/qr/*	MIT	pixos
 .github/*	MIT	pixos
+gpu/*	MIT	pixos
 .gitignore	MIT	pixos
 AGENTS.md	MIT	pixos
 CODE_OF_CONDUCT.md	MIT	pixos

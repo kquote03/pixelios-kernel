@@ -1,0 +1,300 @@
+diff --git a/src/panfrost/tools/meson.build b/src/panfrost/tools/meson.build
+index 2d5bef1..f9ddd77 100644
+--- a/src/panfrost/tools/meson.build
++++ b/src/panfrost/tools/meson.build
+@@ -23,3 +23,16 @@ panfrost_texfeatures = executable(
+   build_by_default : true,
+   install: true
+ )
++
++# PixOS: check/decode/finalize .malijob captures of the sweet backend's record transport
++sweet_malijob = executable(
++  'sweet_malijob',
++  files('sweet_malijob.c'),
++  c_args : [c_msvc_compat_args, no_override_init_args, compile_args_panfrost],
++  gnu_symbol_visibility : 'hidden',
++  include_directories : [inc_include, inc_src, inc_panfrost],
++  dependencies: [libpanfrost_dep, idep_pan_packers],
++  link_with: [libpanfrost_compiler],
++  build_by_default : true,
++  install: true
++)
+diff --git a/src/panfrost/tools/sweet_malijob.c b/src/panfrost/tools/sweet_malijob.c
+new file mode 100644
+index 0000000..5e1e2af
+--- /dev/null
++++ b/src/panfrost/tools/sweet_malijob.c
+@@ -0,0 +1,273 @@
++/*
++ * Copyright © 2026 PixOS-Project contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * sweet_malijob: check, decode and finalize a .malijob capture (lib/kmod/sweet_malijob.h, PixOS docs/research/52).
++ *   sweet_malijob IN                       validate, pandecode every chain (stderr), print the render target found
++ *   sweet_malijob IN --out OUT [checks]    same, then write OUT with the RT block filled in:
++ *        --uniform RGBA      every pixel must be RGBA (expected crc32 computed here, 3 pixel checks at corners/centre)
++ *        --px X,Y,RGBA       one pixel check (up to 3), crc reported by the replay but not checked
++ * RGBA is the pixel as a little-endian u32 (R | G<<8 | B<<16 | A<<24). Valhall v9 (Mali-G78) layouts only.
++ */
++#define PAN_ARCH 9
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "decode.h"
++#include "genxml/gen_macros.h"
++#include "kmod/sweet_malijob.h"
++#include "pan_compiler.h"
++
++static uint8_t *file;
++static size_t file_len;
++static struct mj_header *hdr;
++static struct mj_bo *bos;
++static uint8_t **mem; /* per BO: size bytes, data then zeros */
++
++static uint32_t
++crc32_ieee(uint32_t crc, const void *buf, size_t n)
++{
++   const uint8_t *p = buf;
++   crc = ~crc;
++   while (n--) {
++      crc ^= *p++;
++      for (int k = 0; k < 8; k++)
++         crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
++   }
++   return ~crc;
++}
++
++static int
++fail(const char *what)
++{
++   fprintf(stderr, "sweet_malijob: invalid file: %s\n", what);
++   return 1;
++}
++
++static int
++load(const char *path)
++{
++   FILE *f = fopen(path, "rb");
++   if (!f)
++      return fail("cannot open");
++   fseek(f, 0, SEEK_END);
++   long n = ftell(f);
++   fseek(f, 0, SEEK_SET);
++   if (n < (long)MJ_HDR_SIZE || n > (64l << 20)) {
++      fclose(f);
++      return fail("size");
++   }
++   file_len = (size_t)n;
++   file = malloc(file_len);
++   if (!file || fread(file, 1, file_len, f) != file_len) {
++      fclose(f);
++      return fail("read");
++   }
++   fclose(f);
++
++   hdr = (struct mj_header *)file;
++   if (memcmp(hdr->magic, MJ_MAGIC, 8) || hdr->version != MJ_VERSION ||
++       hdr->header_size != MJ_HDR_SIZE)
++      return fail("magic/version");
++   if (hdr->file_size != file_len)
++      return fail("file_size");
++   if (hdr->n_chains == 0 || hdr->n_chains > MJ_MAX_CHAINS || hdr->n_bos == 0 ||
++       hdr->n_bos > MJ_MAX_BOS)
++      return fail("counts");
++   if ((uint64_t)hdr->chain_off + hdr->n_chains * MJ_CHAIN_SIZE > file_len ||
++       (uint64_t)hdr->bo_off + (uint64_t)hdr->n_bos * MJ_BO_SIZE > file_len ||
++       hdr->data_off > file_len)
++      return fail("table offsets");
++   if ((hdr->flags & MJ_F_RT) && (uint64_t)hdr->rt_off + MJ_RT_SIZE > file_len)
++      return fail("rt offset");
++
++   bos = (struct mj_bo *)(file + hdr->bo_off);
++   mem = calloc(hdr->n_bos, sizeof(*mem));
++   for (unsigned i = 0; i < hdr->n_bos; i++) {
++      const struct mj_bo *b = &bos[i];
++      if (b->size == 0 || (b->size & 0x3fff) || (b->va & 0x3fff) ||
++          b->va < 0x02000000ull || b->va + b->size > 0x100000000ull ||
++          b->data_len > b->size || b->data_off < hdr->data_off ||
++          b->data_off + b->data_len > file_len)
++         return fail("bo entry");
++      for (unsigned j = 0; j < i; j++) {
++         if (b->va < bos[j].va + bos[j].size && bos[j].va < b->va + b->size)
++            return fail("bo overlap");
++      }
++      mem[i] = calloc(1, b->size);
++      memcpy(mem[i], file + b->data_off, b->data_len);
++   }
++   return 0;
++}
++
++static void *
++gpu_ptr(uint64_t va, uint64_t len)
++{
++   for (unsigned i = 0; i < hdr->n_bos; i++) {
++      if (va >= bos[i].va && va + len <= bos[i].va + bos[i].size)
++         return mem[i] + (va - bos[i].va);
++   }
++   return NULL;
++}
++
++struct rt_info {
++   uint64_t va;
++   uint32_t width, height, stride, clear0;
++   unsigned block_format, writeback_format;
++};
++
++static int
++find_rt(struct rt_info *rt)
++{
++   const struct mj_chain *ch = (const struct mj_chain *)(file + hdr->chain_off);
++   const struct mj_chain *frag = NULL;
++   for (unsigned i = 0; i < hdr->n_chains; i++)
++      if (ch[i].req & MJ_REQ_FS)
++         frag = &ch[i];
++   if (!frag)
++      return fail("no fragment chain");
++
++   const void *job = gpu_ptr(frag->jc, pan_size(FRAGMENT_JOB));
++   if (!job)
++      return fail("fragment job not in a BO");
++   pan_section_unpack(job, FRAGMENT_JOB, HEADER, h);
++   if (h.type != MALI_JOB_TYPE_FRAGMENT)
++      return fail("FS chain does not start with a fragment job");
++   pan_section_unpack(job, FRAGMENT_JOB, PAYLOAD, s);
++   const uint64_t *fbp = &s.framebuffer;
++   pan_cast_and_unpack(fbp, FRAMEBUFFER_POINTER, ptr);
++
++   const void *fb = gpu_ptr(ptr.pointer, pan_size(FRAMEBUFFER));
++   if (!fb)
++      return fail("FBD not in a BO");
++   pan_section_unpack(fb, FRAMEBUFFER, PARAMETERS, params);
++   uint64_t rt_va = ptr.pointer + pan_size(FRAMEBUFFER) +
++                    (params.has_zs_crc_extension ? pan_size(ZS_CRC_EXTENSION) : 0);
++   const void *rtp = gpu_ptr(rt_va, pan_size(RENDER_TARGET));
++   if (!rtp)
++      return fail("RT descriptor not in a BO");
++   pan_unpack((const struct mali_render_target_packed *)rtp, RENDER_TARGET, r);
++
++   rt->va = r.rgb.writeback_buffer.base;
++   rt->stride = r.rgb.writeback_buffer.row_stride;
++   rt->width = params.width;
++   rt->height = params.height;
++   rt->clear0 = r.rgb.clear.color_0;
++   rt->block_format = r.rgb.writeback_block_format;
++   rt->writeback_format = r.rgb.writeback_format;
++   printf("RT0: base=%#" PRIx64 " row_stride=%u fb=%ux%u rt_count=%u zs_crc=%d block_format=%u writeback_format=%u clear_color0=%#x\n",
++          rt->va, rt->stride, rt->width, rt->height, params.render_target_count,
++          params.has_zs_crc_extension, rt->block_format, rt->writeback_format,
++          rt->clear0);
++   return 0;
++}
++
++static unsigned
++parse_rgba(const char *s)
++{
++   return (unsigned)strtoul(s, NULL, 0);
++}
++
++int
++main(int argc, char **argv)
++{
++   const char *in = NULL, *out = NULL;
++   bool uniform = false;
++   uint32_t uni = 0;
++   struct mj_pixel px[3] = {0};
++   unsigned npx = 0;
++
++   for (int i = 1; i < argc; i++) {
++      if (!strcmp(argv[i], "--out") && i + 1 < argc)
++         out = argv[++i];
++      else if (!strcmp(argv[i], "--uniform") && i + 1 < argc) {
++         uniform = true;
++         uni = parse_rgba(argv[++i]);
++      } else if (!strcmp(argv[i], "--px") && i + 1 < argc && npx < 3) {
++         unsigned x, y, c;
++         if (sscanf(argv[++i], "%u,%u,%i", &x, &y, (int *)&c) != 3)
++            return fail("--px X,Y,RGBA");
++         px[npx++] = (struct mj_pixel){.x = (uint16_t)x, .y = (uint16_t)y, .rgba = c};
++      } else if (!in)
++         in = argv[i];
++      else
++         return fail("usage");
++   }
++   if (!in || load(in))
++      return 1;
++
++   printf("file %s: gpu_id=%#x chains=%u bos=%u size=%" PRIu64 "\n", in,
++          hdr->gpu_id, hdr->n_chains, hdr->n_bos, hdr->file_size);
++   for (unsigned i = 0; i < hdr->n_bos; i++)
++      printf("  bo %2u va=%#010" PRIx64 " size=%#9" PRIx64 " data=%#8" PRIx64 " flags=%#x %s\n",
++             i, bos[i].va, bos[i].size, bos[i].data_len, bos[i].flags, bos[i].label);
++
++   struct pandecode_context *ctx = pandecode_create_context(true);
++   pandecode_set_disassemble(ctx, pan_disassemble);
++   for (unsigned i = 0; i < hdr->n_bos; i++)
++      pandecode_inject_mmap(ctx, bos[i].va, mem[i], (unsigned)bos[i].size, bos[i].label);
++   const struct mj_chain *ch = (const struct mj_chain *)(file + hdr->chain_off);
++   for (unsigned i = 0; i < hdr->n_chains; i++) {
++      printf("  chain %u jc=%#" PRIx64 " req=%#x\n", i, ch[i].jc, ch[i].req);
++      fprintf(stderr, "==== chain %u jc=%#" PRIx64 " req=%#x ====\n", i, ch[i].jc, ch[i].req);
++      pandecode_jc(ctx, ch[i].jc, hdr->gpu_id);
++   }
++   fflush(stderr);
++   pandecode_destroy_context(ctx);
++
++   struct rt_info rt;
++   if (find_rt(&rt))
++      return 1;
++   if (rt.block_format != MALI_BLOCK_FORMAT_LINEAR)
++      return fail("RT is not linear (run with PAN_MESA_DEBUG=linear)");
++   if (rt.stride < rt.width * 4 || !gpu_ptr(rt.va, (uint64_t)rt.stride * rt.height))
++      return fail("RT does not fit in a BO");
++
++   if (!out)
++      return 0;
++
++   struct mj_rt r = {
++      .va = rt.va, .width = rt.width, .height = rt.height, .stride = rt.stride,
++      .format = MJ_FMT_RGBA8,
++   };
++   if (uniform) {
++      uint32_t c = 0, *row = malloc(rt.width * 4);
++      for (unsigned x = 0; x < rt.width; x++)
++         row[x] = uni;
++      for (unsigned y = 0; y < rt.height; y++)
++         c = crc32_ieee(c, row, rt.width * 4);
++      free(row);
++      r.expect_crc = c;
++      r.crc_valid = 1;
++      r.px[0] = (struct mj_pixel){0, 0, uni};
++      r.px[1] = (struct mj_pixel){(uint16_t)(rt.width - 1), (uint16_t)(rt.height - 1), uni};
++      r.px[2] = (struct mj_pixel){(uint16_t)(rt.width / 2), (uint16_t)(rt.height / 2), uni};
++   } else {
++      if (npx != 3)
++         return fail("need --uniform or three --px");
++      memcpy(r.px, px, sizeof(px));
++   }
++   for (unsigned i = 0; i < 3; i++)
++      if (r.px[i].x >= rt.width || r.px[i].y >= rt.height)
++         return fail("pixel outside the RT");
++
++   hdr->flags |= MJ_F_RT;
++   hdr->rt_off = MJ_HDR_SIZE + MJ_MAX_CHAINS * MJ_CHAIN_SIZE;
++   if (hdr->rt_off + MJ_RT_SIZE > hdr->bo_off)
++      return fail("no room for the RT block");
++   memcpy(file + hdr->rt_off, &r, sizeof(r));
++
++   FILE *f = fopen(out, "wb");
++   if (!f || fwrite(file, 1, file_len, f) != file_len || fclose(f))
++      return fail("write");
++   printf("wrote %s: rt va=%#" PRIx64 " %ux%u stride=%u crc_valid=%u expect_crc=%#x px=(%u,%u,%#x) (%u,%u,%#x) (%u,%u,%#x)\n",
++          out, r.va, r.width, r.height, r.stride, r.crc_valid, r.expect_crc,
++          r.px[0].x, r.px[0].y, r.px[0].rgba, r.px[1].x, r.px[1].y, r.px[1].rgba,
++          r.px[2].x, r.px[2].y, r.px[2].rgba);
++   return 0;
++}

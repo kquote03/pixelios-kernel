@@ -30,6 +30,7 @@ HOLDERS = [
     (r"cambus", "BSD-2-Clause", None, "Spleen-BSD-2-Clause.txt"),
     (r"android open source|\baosp\b", None, "AOSP", "MIT-AOSP-avbtool.txt"),
     (r"pornin", "MIT", None, "MIT-BearSSL.txt"),
+    (r"collabora", "MIT", "Mesa", "MIT-Mesa.txt"),
 ]
 # device/** must not carry identifiers of the phone (AGENTS.md rule 4): serial, IMEI, a globally administered MAC
 DEVICE_LEAKS = [
