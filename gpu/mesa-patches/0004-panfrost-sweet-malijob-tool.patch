@@ -21,17 +21,17 @@ index 2d5bef1..f9ddd77 100644
 +)
 diff --git a/src/panfrost/tools/sweet_malijob.c b/src/panfrost/tools/sweet_malijob.c
 new file mode 100644
-index 0000000..5e1e2af
+index 0000000..198576c
 --- /dev/null
 +++ b/src/panfrost/tools/sweet_malijob.c
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,286 @@
 +/*
 + * Copyright © 2026 PixOS-Project contributors
 + * SPDX-License-Identifier: MIT
 + *
 + * sweet_malijob: check, decode and finalize a .malijob capture (lib/kmod/sweet_malijob.h, PixOS docs/research/52).
 + *   sweet_malijob IN                       validate, pandecode every chain (stderr), print the render target found
-+ *   sweet_malijob IN --out OUT [checks]    same, then write OUT with the RT block filled in:
++ *   sweet_malijob IN --out OUT [--name N] [checks]   same, then write OUT with the RT block (and name, 1..8 of [a-z0-9_]) filled in:
 + *        --uniform RGBA      every pixel must be RGBA (expected crc32 computed here, 3 pixel checks at corners/centre)
 + *        --px X,Y,RGBA       one pixel check (up to 3), crc reported by the replay but not checked
 + * RGBA is the pixel as a little-endian u32 (R | G<<8 | B<<16 | A<<24). Valhall v9 (Mali-G78) layouts only.
@@ -204,6 +204,7 @@ index 0000000..5e1e2af
 +main(int argc, char **argv)
 +{
 +   const char *in = NULL, *out = NULL;
++   const char *name = NULL;
 +   bool uniform = false;
 +   uint32_t uni = 0;
 +   struct mj_pixel px[3] = {0};
@@ -212,6 +213,8 @@ index 0000000..5e1e2af
 +   for (int i = 1; i < argc; i++) {
 +      if (!strcmp(argv[i], "--out") && i + 1 < argc)
 +         out = argv[++i];
++      else if (!strcmp(argv[i], "--name") && i + 1 < argc)
++         name = argv[++i];
 +      else if (!strcmp(argv[i], "--uniform") && i + 1 < argc) {
 +         uniform = true;
 +         uni = parse_rgba(argv[++i]);
@@ -283,6 +286,16 @@ index 0000000..5e1e2af
 +      if (r.px[i].x >= rt.width || r.px[i].y >= rt.height)
 +         return fail("pixel outside the RT");
 +
++   memset(hdr->name, 0, sizeof(hdr->name));
++   if (name) {
++      size_t nl = strlen(name);
++      if (nl == 0 || nl > sizeof(hdr->name))
++         return fail("--name: 1..8 characters");
++      for (size_t k = 0; k < nl; k++)
++         if (!((name[k] >= 'a' && name[k] <= 'z') || (name[k] >= '0' && name[k] <= '9') || name[k] == '_'))
++            return fail("--name: [a-z0-9_] only");
++      memcpy(hdr->name, name, nl);
++   }
 +   hdr->flags |= MJ_F_RT;
 +   hdr->rt_off = MJ_HDR_SIZE + MJ_MAX_CHAINS * MJ_CHAIN_SIZE;
 +   if (hdr->rt_off + MJ_RT_SIZE > hdr->bo_off)

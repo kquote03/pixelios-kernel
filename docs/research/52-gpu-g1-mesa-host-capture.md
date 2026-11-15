@@ -9,8 +9,8 @@ Tags: **[obs]** a command run here, **[src]** read from the cited file, **[guess
 |---|---|
 | Mesa | 26.2.5, `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3` (doc 49), clone `$A/gpu/src/mesa`, plus `gpu/mesa-patches/0001-0004` |
 | Build | `$A/gpu/build/mesa`, 1457/1457 targets, including `mesa_clc`, `vtn_bindgen2`, `panfrost_compile` (the host tools G3 needs) [obs] |
-| `clear.malijob` | 2960 B, sha256 `c0582e31d76fb66c05cea99049ba58713831fddc4a708a9cae52e8fa5863c77c` [obs] |
-| `tri.malijob` | 4736 B, sha256 `582442fa82ac1356c6a02bb3db2b3228cfa6e4740e504e014b9bee72e9c9abb1` [obs] |
+| `clear.malijob` | 2960 B, sha256 `d4fb280db52c8185239dc0b2d544f1f9857cdfe6826cff16c0a936bfe6a83e90` [obs] |
+| `tri.malijob` | 4736 B, sha256 `e195bd8e3f0680c5a77ca69dec9167028cb8b09677ae407543b1c5a6c958ff14` [obs] |
 | Location | `$A/gpu/capture/` (not in git), with `*.pandecode.txt` and `*.summary.txt` next to them |
 | G1 pass | PASS: pandecode decodes the files themselves (not just Mesa's live state) without an assertion; clear = one Fragment job whose RT0 `Clear: Color 0: 0xff996633`; triangle = `Malloc vertex` job (Valhall vertex+tiler job with Tiler Job Payload, Tiler Heap, Tiler Context) then a Fragment job [obs] |
 
@@ -89,8 +89,8 @@ gives EGL a render node to open the panfrost driver with; every BO and submit go
 MC20 (Panfrost)`, log `sweet-record: submit jc=0x3054180 req=0x1`, then `jc=0x3054300 req=0` + `jc=0x3054680 req=0x1`].
 `linear` forces a linear RT (the replay CRCs it), `nocrc` turns off transaction elimination (no CRC buffers).
 
-Finalize: `sweet_malijob cap000.malijob --out clear.malijob --uniform 0xff996633` (expected crc32 0xff12cb5c, cross-checked with Python
-`zlib.crc32` [obs]; checks at (0,0), (255,255), (128,128)); `sweet_malijob cap001.malijob --out tri.malijob --px 2,2,0xff996633 --px
+Finalize: `sweet_malijob cap000.malijob --out clear.malijob --name clear --uniform 0xff996633` (expected crc32 0xff12cb5c, cross-checked with Python
+`zlib.crc32` [obs]; checks at (0,0), (255,255), (128,128)); `sweet_malijob cap001.malijob --out tri.malijob --name tri --px 2,2,0xff996633 --px
 253,253,0xff996633 --px 128,128,0xff00ff00` (no expected CRC: the replay reports it; rasterisation is not predicted on the host).
 Both: RT0 base 0x3014000, row stride 1024, 256x256, block format Linear, R8G8B8A8 [obs].
 
@@ -108,7 +108,7 @@ Little-endian, offsets from the start of the file. The kernel replay (G2) parses
 
 | Part | Offset | Size | Fields |
 |---|---|---|---|
-| header | 0 | 64 | `magic[8]` = `PIXMJOB1`; u32 `version` = 1, `header_size` = 64, `gpu_id`, `n_chains` (1..8), `n_bos` (1..4096), `flags` (bit 0 = RT block present); u64 `file_size`; u32 `chain_off`, `rt_off`, `bo_off`, `data_off`; u32 reserved[2] |
+| header | 0 | 64 | `magic[8]` = `PIXMJOB1`; u32 `version` = 1, `header_size` = 64, `gpu_id`, `n_chains` (1..8), `n_bos` (1..4096), `flags` (bit 0 = RT block present); u64 `file_size`; u32 `chain_off`, `rt_off`, `bo_off`, `data_off`; char `name[8]` at +56 (`[a-z0-9_]`, NUL-padded, set by `sweet_malijob --name`; the replay prints it) |
 | chains | `chain_off` (64) | 16 x 8 slots | u64 `jc` (GPU VA of the first job descriptor); u32 `req` (bit 0 = fragment chain, JS0; else JS1); u32 reserved. Only `n_chains` are used, submitted in order |
 | rt | `rt_off` (192) | 64 | u64 `va`; u32 `width`, `height`, `stride`, `format` (1 = R8G8B8A8_UNORM, pixel as LE u32 = R \| G<<8 \| B<<16 \| A<<24); u32 `expect_crc`, `crc_valid`; 3 x {u16 `x`, u16 `y`, u32 `rgba`}; u32 reserved[2]. The crc is crc32 (IEEE/zlib) over `height` rows of `width*4` bytes |
 | bos | `bo_off` (256) | 64 x `n_bos` | u64 `va`, `size` (multiple of 16 KiB), `data_off`, `data_len` (<= size; bytes after it are zero); u32 `flags` (bit 0 exec, bit 1 never CPU-mapped, bit 2 tiler heap); u32 reserved; char `label[24]` (NUL-terminated, Mesa's BO label) |

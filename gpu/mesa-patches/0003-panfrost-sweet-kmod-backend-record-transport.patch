@@ -623,7 +623,7 @@ index 0000000..4fee93b
 +#endif
 diff --git a/src/panfrost/lib/kmod/sweet_malijob.h b/src/panfrost/lib/kmod/sweet_malijob.h
 new file mode 100644
-index 0000000..e741ca3
+index 0000000..74c0a7e
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/sweet_malijob.h
 @@ -0,0 +1,72 @@
@@ -634,7 +634,7 @@ index 0000000..e741ca3
 + * .malijob capture file, version 1 (PixOS docs/research/52). All fields little-endian, every offset is from the start
 + * of the file. The PixOS kernel replay (sweetmali=0x100) parses the same layout; keep the two in sync.
 + *
-+ *   header   64 B  at 0
++ *   header   64 B  at 0 (name[8] at +56: the job name the replay prints, e.g. "clear")
 + *   chains   16 B  x n_chains at chain_off (submit order; the kernel submits them one by one, in order)
 + *   rt       64 B  at rt_off when flags & MJ_F_RT (added by the finalize tool, never by the recorder)
 + *   bos      64 B  x n_bos at bo_off
@@ -668,7 +668,7 @@ index 0000000..e741ca3
 +   uint32_t version, header_size, gpu_id, n_chains, n_bos, flags;
 +   uint64_t file_size;
 +   uint32_t chain_off, rt_off, bo_off, data_off;
-+   uint32_t reserved[2];
++   char name[8]; /* [a-z0-9_], NUL-padded; set by the finalize tool, the replay prints it */
 +};
 +
 +struct mj_chain {
