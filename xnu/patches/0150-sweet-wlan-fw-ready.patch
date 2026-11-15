@@ -10,7 +10,7 @@ W17: read pciedev_shared_t bytes 0x00..0x3F (flags/version at 0, console_addr 0x
      (new bytes). Every chip-supplied pointer, size and index is checked against the RAM before use (swl_bp_rd: [0x200000, ram_end - 4], word aligned).
 No BAR2 store after W14, no EP Command (bus master) write, no ring, doorbell or host_cap write. The only other stores are cfg 0x84 (0 <-> 0x400000, two reusable tuples SWT_W84_*_E, need W15) for
 the reads above 0x400000 and the run A window select. x->done is 64-bit now (34 tuples). The firmware is left running at the end (no restore for a successful release; the chip is reset by the
-next power cycle). Tests: shim/wlan_wr_host_test.c rune() (fake firmware), tools/test_wlan_wr_mutants.py. HW-WRITE path: review docs/reviews/0150-wlan-fw-ready-review-fable-*.md.
+next power cycle). A stop in W16/W17 also leaves the CA7 released and the firmware running (swl_left reports "ca7=RELEASED"); W16 ends on window 0 (review 0150 F1). Tests: shim/wlan_wr_host_test.c rune() (fake firmware), tools/test_wlan_wr_mutants.py. HW-WRITE path: review docs/reviews/0150-wlan-fw-ready-review-fable-*.md.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 --- a/bsd/dev/sweet_wlan.c
@@ -143,27 +143,29 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
  		n = swl_wr_ok_from((unsigned)t + 1u, space, win, off, val);
  		if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {      /* n < 0: none; the search only moves forward */
  			return first;
-@@ -721,12 +752,14 @@
+@@ -721,12 +752,15 @@
  {
  	const char *r2, *sm, *ca, *w84;
  
 -	r2 = !(x->done & (1u << SWT_ATU_CR2)) ? "untouched" : (x->rs_ok & SWW_RG_ATU2) ? "disabled again" : "ENABLED";
 -	sm = (x->done & (1u << SWT_SM_RELEASE)) && !(x->rs_ok & SWW_RG_SM) ? "OUT OF RESET" : (x->done & (1u << SWT_SM_ASSERT)) ? "in reset" : "untouched";
 -	ca = (x->done & (1u << SWT_CA_RELEASE)) && !(x->rs_ok & SWW_RG_CA) ? "OUT OF RESET, CPUHALT" : (x->done & (1u << SWT_CA_ASSERT)) ? "in reset" : "untouched";
+-	w84 = !(x->armed_at_stop & SWW_RG_W84) ? "0" : (x->rs_ok & SWW_RG_W84) ? "0 (restored)" : "TAIL WINDOW (restore not done)";
+-	printf("SWEET WLAN: left after stop: atu_r2=%s sys_mem=%s ca7=%s cfg84=%s cfg80=last window selected; armed %#x restored %#x tuples %#x\n",
+-	    r2, sm, ca, w84, x->armed_at_stop, x->rs_ok, x->done);
 +	r2 = !(x->done & SWT_BIT(SWT_ATU_CR2)) ? "untouched" : (x->rs_ok & SWW_RG_ATU2) ? "disabled again" : "ENABLED";
 +	sm = (x->done & SWT_BIT(SWT_SM_RELEASE)) && !(x->rs_ok & SWW_RG_SM) ? "OUT OF RESET" : (x->done & SWT_BIT(SWT_SM_ASSERT)) ? "in reset" : "untouched";
 +	/* patch 0150: after the W15 release the firmware runs (no restore puts it back: the next power cycle resets the chip); a stop inside W15 restores RESET_CTL := 1 (in reset) */
++	/* review 0150 F1: in run E the live cfg 0x84 is x->w84 (the step functions keep it); a tail window there without a done restore is reported as such */
 +	ca = (x->done & SWT_BIT(SWT_CAR_RELEASE)) && !(x->rs_ok & SWW_RG_CA) ? "RELEASED (firmware running)" : (x->done & SWT_BIT(SWT_CAR_ASSERT)) ? "in reset" :
 +	     (x->done & SWT_BIT(SWT_CA_RELEASE)) && !(x->rs_ok & SWW_RG_CA) ? "OUT OF RESET, CPUHALT" : (x->done & SWT_BIT(SWT_CA_ASSERT)) ? "in reset" : "untouched";
- 	w84 = !(x->armed_at_stop & SWW_RG_W84) ? "0" : (x->rs_ok & SWW_RG_W84) ? "0 (restored)" : "TAIL WINDOW (restore not done)";
--	printf("SWEET WLAN: left after stop: atu_r2=%s sys_mem=%s ca7=%s cfg84=%s cfg80=last window selected; armed %#x restored %#x tuples %#x\n",
--	    r2, sm, ca, w84, x->armed_at_stop, x->rs_ok, x->done);
++	w84 = !(x->armed_at_stop & SWW_RG_W84) ? ((x->flags & SWF_W15) && x->w84 ? "TAIL WINDOW (run E, restore not armed)" : "0") : (x->rs_ok & SWW_RG_W84) ? "0 (restored)" : "TAIL WINDOW (restore not done)";
 +	printf("SWEET WLAN: left after stop: atu_r2=%s sys_mem=%s ca7=%s cfg84=%s cfg80=last window selected; armed %#x restored %#x tuples %#llx\n",
 +	    r2, sm, ca, w84, x->armed_at_stop, x->rs_ok, (unsigned long long)x->done);
  }
  
  /* the first failure latches STOPPED, records the row and runs the restore; returns the negative code */
-@@ -764,10 +797,10 @@
+@@ -764,10 +798,10 @@
  	if ((int)p->run > x->level - SWW_LEVEL0) {
  		return swl_stop(x, SWW_E_LEVEL);
  	}
@@ -176,7 +178,7 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
  		return swl_stop(x, SWW_E_ORDER);
  	}
  	if ((x->flags & p->need) != p->need) {
-@@ -841,7 +874,7 @@
+@@ -841,7 +875,7 @@
  		x->tn[p->kind]++;
  		return 0;
  	}
@@ -185,7 +187,7 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
  	if (p->flags & SWT_BANK) {
  		x->nbank++;
  	}
-@@ -1419,6 +1452,223 @@
+@@ -1419,6 +1453,224 @@
  	return swl_done(x, SWF_W14);
  }
  
@@ -193,14 +195,14 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
 + * Sources: DHD bcm4389 (865527e) dhd_pcie.c, aiutils.c, include/bcmpcie.h, include/hnd_cons.h; OpenBSD if_bwfm_pci.c/.h (9d8cbe8, ISC); Linux v6.18 brcmfmac pcie.c (cross-check).
 + * After W15 nothing is stored to the chip except cfg 0x84 (the BAR2 window, 0 or SWW_WIN_TAIL) and, only if the release itself stops, the CA7 reset restore. No bus-master enable, no ring, no
 + * doorbell, no host_cap write (bwfm writes HOST_CAP at if_bwfm_pci.c:542-558; that is the next step's job, not this one). Every address taken from the chip is checked against the RAM before it is read. */
-+#define SWW_FWUP_POLLS  100u            /* polls of the last RAM word: bwfm 100 x 50 ms (if_bwfm_pci.c:868-874), brcmfmac BRCMF_PCIE_FW_UP_TIMEOUT 5000 ms in 50 ms steps, DHD 5 s (dhd_pcie.c:13636-13647) */
++#define SWW_FWUP_POLLS  100u            /* polls of the last RAM word: bwfm 100 x 50 ms (if_bwfm_pci.c:869-875), brcmfmac BRCMF_PCIE_FW_UP_TIMEOUT 5000 ms in 50 ms steps; DHD's loop dhd_pcie.c:13636-13647 uses a 2 s timeout in this build (:594-598, review 0150 F5) */
 +#define SWW_FWUP_US     50000u
 +#define SWW_SH_WORDS    16u             /* pciedev_shared_t bytes 0x00..0x3F (include/bcmpcie.h:358-...; bwfm BWFM_SHARED_* up to 0x48, if_bwfm_pci.h:111-143) */
 +#define SWW_SH_CONSOLE  5u              /* word index of console_addr: flags, trap_addr, assert_exp_addr, assert_file_addr, assert_line, console_addr (bcmpcie.h:360-366; BWFM_SHARED_CONSOLE_ADDR 0x14) */
 +#define SWW_SH_FWID     7u              /* fwid after msgtrace_addr (bcmpcie.h:368-370) */
 +#define SWW_SH_RINGINFO 12u             /* BWFM_SHARED_RING_INFO_ADDR 0x30 (if_bwfm_pci.h:137) */
 +#define SWW_SH_VER_MASK 0xFFu           /* PCIE_SHARED_VERSION_MASK (bcmpcie.h:54) */
-+#define SWW_SH_VER_MIN  5u              /* PCIE_SHARED_VERSION_5 .. _9 (bcmpcie.h:43-47); bwfm accepts 5..7 (if_bwfm_pci.h:112-113) */
++#define SWW_SH_VER_MIN  5u              /* PCIE_SHARED_VERSION_5 .. _9 (bcmpcie.h:45-49); bwfm accepts 5..7 (if_bwfm_pci.h:112-113) */
 +#define SWW_SH_VER_MAX  9u
 +#define SWW_CON_BUF     0x08u           /* hnd_cons_t: vcons_in, vcons_out, then hnd_log_t log = { buf, buf_size, idx, ... } (hnd_cons.h:60-92; BWFM_CONSOLE_BUFADDR/BUFSIZE/WRITEIDX if_bwfm_pci.h:156-158) */
 +#define SWW_CON_SIZE    0x0Cu
@@ -229,7 +231,7 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
 +	return swl_done(x, SWF_W15);
 +}
 +
-+/* One RAM word by backplane address, READ only: a must be a word inside [SWW_RAM_BASE, ram_end - 4] (bwfm's range rule, if_bwfm_pci.c:876-877; DHD :13698-13699); window 0 below SWW_TCM_BYTES,
++/* One RAM word by backplane address, READ only: a must be a word inside [SWW_RAM_BASE, ram_end - 4] (bwfm's range rule, if_bwfm_pci.c:880-881; DHD :13698-13699); window 0 below SWW_TCM_BYTES,
 + * SWW_WIN_TAIL above (DHD_BUS_BAR1_BPWIN). cfg 0x84 is moved only through the two run E tuples, and only when the word needs the other window. 0 = read. */
 +static inline int
 +swl_bp_rd(struct swl_wx *x, uint32_t a, uint32_t *v)
@@ -306,6 +308,7 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
 +		return swl_stop(x, SWW_E_SHARED);
 +	}
 +	x->shared = v;
++	SWW_TRY(swl_w84_zero(x));        /* review 0150 F1: every step after W16 starts on window 0 (swl_done disarms the cfg 0x84 restore group) */
 +	return swl_done(x, SWF_W16);
 +}
 +
@@ -402,14 +405,14 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
 +		return swl_stop(x, SWW_E_PRE);
 +	}
 +	SWW_TRY(swl_w84_zero(x));
-+	printf("SWEET WLAN: W17 done, %u console bytes, cfg84 back at 0, bus master untouched\n", x->con_bytes);
++	printf("SWEET WLAN: W17 done, %u console bytes, cfg84 back at 0 (no EP Command write exists in run E)\n", x->con_bytes);
 +	return swl_done(x, SWF_W17);
 +}
 +
  /* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
  static inline int
  swl_stage3(struct swl_wx *x)
-@@ -1476,10 +1726,19 @@
+@@ -1476,10 +1728,19 @@
  	if (x->level >= SWW_LEVEL0 + 4) {
  		rc = rc ? rc : swl_w14(x);
  	}

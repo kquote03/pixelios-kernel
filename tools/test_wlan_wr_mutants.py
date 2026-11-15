@@ -638,6 +638,9 @@ MUTANTS = [
     ("run E W17: no 2 KiB cap", [("\tn = e0 < SWW_CON_MAX ? e0 : SWW_CON_MAX;", "\tn = e0;")], None),
     ("run E W17: second look over budget", [("\t\t\tn = n < SWW_CON_MAX - x->con_bytes ? n : SWW_CON_MAX - x->con_bytes;\n", "")], None),
     ("run E W17: window not put back", [("\tSWW_TRY(swl_w84_zero(x));\n\tprintf(\"SWEET WLAN: W17 done", "\tprintf(\"SWEET WLAN: W17 done")], None),
+    ("run E W15 restore: no CA7 reset restore group", [("{ .row = 15, .run = 5, .space = SWW_BAR0, .rgrp = SWW_RG_CA,", "{ .row = 15, .run = 5, .space = SWW_BAR0,")], None),   # review 0150 F2
+    ("run E W16: ends on the tail window", [("\tSWW_TRY(swl_w84_zero(x));        /* review 0150 F1", "\t(void)0;        /* review 0150 F1")], None),
+    ("run E con_out: no line cap", [("if (ch == '\\n' || len == SWW_CON_LINE) {", "if (ch == '\\n') {")], None),   # review 0150 F6
     ("run E con_out: non-printables printed", [("\t\tif (ch >= 0x20 && ch < 0x7F) {", "\t\tif (ch != '\\n') {")], None),
 ]
 

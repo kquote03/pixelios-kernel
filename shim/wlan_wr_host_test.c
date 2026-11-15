@@ -2488,8 +2488,29 @@ static void rune(void)
 			obsb(&f, 336); fw_default(&f);
 			f.fail_wr_at = base + k;
 			CHECK(rune_run(&f, &x, len, pin) < 0 && x.row == 15 && f.released == 0 && f.bar2_stores_after_rel == 0);
-			CHECK(x.restore == SWW_RS_NONE || (f.ca.ctl & 1u));
+			/* review 0150 F2: a fault at the window select restores nothing; at any of the four release stores the CA7 goes back into reset, stored and read back */
+			CHECK(k == 1 ? (x.restore == SWW_RS_NONE && f.ca.ctl == 0) : (x.restore == SWW_RS_OK && (f.ca.ctl & 1u) && (x.rs_ok & SWW_RG_CA) && strstr(logbuf, "ca7=in reset") != 0));
 		}
+	}
+	/* review 0150 F1: W16 ends on window 0 even when the shared area is above 0x400000, so a later stop never leaves the tail window unarmed */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	x.level = 7;
+	CHECK(swl_w15(&x) == 0 && swl_w16(&x) == 0 && f.win2 == 0 && x.w84 == 0 && x.armed == 0 && x.shared == 0x480000u);
+	/* review 0150 F6: a console line longer than the line buffer is cut into pieces of at most 120 characters */
+	{
+		static char longl[400];
+		const char *p;
+		unsigned run, worst = 0;
+
+		memset(longl, 'q', 300); longl[300] = 0;
+		obsb(&f, 336); fw_default(&f); f.con_txt = longl; f.fw_idx = 300;
+		CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 300);
+		for (p = logbuf, run = 0; *p; p++) {
+			run = *p == 'q' ? run + 1 : 0;
+			worst = run > worst ? run : worst;
+		}
+		CHECK(worst == 120 && count_str("fwcon: q") == 3);
 	}
 	/* a console buffer that straddles the window boundary is read across it */
 	obsb(&f, 336); fw_default(&f); f.fw_con = 0x470000u; f.fw_buf = 0x3FFF90u;
