@@ -2392,7 +2392,7 @@ static void rune(void)
 	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x480002u;
 	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6));
 	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x49FFC4u;            /* 0x40 bytes would reach the last word */
-	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6));
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6) && strstr(logbuf, "W16 shared pointer 0x49ffc4 outside RAM") != 0);
 	obsb(&f, 336); fw_default(&f); f.fw_ptr = f.fw_shared = 0x49FFBCu;   /* the last place that fits */
 	CHECK(rune_run(&f, &x, len, pin) == 0 && left_ok(&f, n6) && x.shared == 0x49FFBCu);
 	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x4A0000u;
