@@ -4,7 +4,7 @@ Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in 
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
 EQUIVALENT with the clause that implies it (CR-02). A pattern that matches nothing fails too (the header changed under the mutant list).
 Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; patch 0131 (run C: W11 NVRAM text, W12 length token, W13 rTLV) changes them again; patch 0132 (run D: W14 reset vector, firmware identity pin) once more; the texts under test are the files
-after 0124, 0128, 0129, 0130, 0131, 0132, 0147 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
+after 0124, 0128, 0129, 0130, 0131, 0132, 0147 (0149, glue only), 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
 process_nvram_vars port); a mutant is killed when either fails.
 Run: python3 -B tools/test_wlan_wr_mutants.py  (also picked up by `unittest discover -s tools -p 'test_*.py'`)."""
 import concurrent.futures
@@ -26,6 +26,8 @@ PATCH0130 = os.path.join(ROOT, "xnu", "patches", "0130-sweet-wlan-image-copy.pat
 PATCH0131 = os.path.join(ROOT, "xnu", "patches", "0131-sweet-wlan-nvram-rtlv.patch")
 PATCH0132 = os.path.join(ROOT, "xnu", "patches", "0132-sweet-wlan-reset-vector.patch")
 PATCH0147 = os.path.join(ROOT, "xnu", "patches", "0147-sweet-wlan-fw-ident.patch")
+PATCH0149 = os.path.join(ROOT, "xnu", "patches", "0149-sweet-pcie1-mmu-probe.patch")
+PATCH0150 = os.path.join(ROOT, "xnu", "patches", "0150-sweet-wlan-fw-ready.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
 TEST_NV = os.path.join(ROOT, "shim", "wlan_nv_host_test.c")
 HDR_PATH = "bsd/dev/sweet_wlan_wr.h"
@@ -64,7 +66,7 @@ def apply_chain(path, patches):
 
 
 def final_header():
-    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147))
+    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150))
 
 
 def glue_before():
@@ -72,7 +74,7 @@ def glue_before():
 
 
 def glue_after():
-    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147))
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0149, PATCH0150))
 
 
 def new_file(patch, path):
@@ -255,8 +257,8 @@ MUTANTS = [
     ("level gate of swl_wr removed", [("if ((int)p->run > x->level - SWW_LEVEL0) {\n\t\treturn swl_stop(x, SWW_E_LEVEL);", "if (0) {\n\t\treturn swl_stop(x, SWW_E_LEVEL);")], None),
     ("level gate of the reads removed", [("(int)swl_rt[i].run > x->level - SWW_LEVEL0", "0")], None),
     ("stage 3 below level 3 allowed", [("if (x->level < SWW_LEVEL0 + 1) {", "if (0) {")], None),
-    ("tuple consumed more than once", [("if ((p->flags & SWT_ONCE) && (x->done & (1u << t))) {", "if (0) {")], None),
-    ("predecessor not required", [("if (p->pred1 && !(x->done & (1u << (p->pred1 - 1u)))) {", "if (0) {")], None),
+    ("tuple consumed more than once", [("if ((p->flags & SWT_ONCE) && (x->done & SWT_BIT(t))) {", "if (0) {")], None),
+    ("predecessor not required", [("if (p->pred1 && !(x->done & SWT_BIT(p->pred1 - 1u))) {", "if (0) {")], None),
     ("phase flags not required", [("if ((x->flags & p->need) != p->need) {", "if (0) {")], None),
     ("bank state: nrb pin of swl_wr", [("(p->flags & SWT_BANK) && (x->nrb != SWW_NRB || ", "(p->flags & SWT_BANK) && (")], None),
     ("bank state: nb pin of swl_wr", [("|| x->nb != SWW_NB || x->nbank >= x->nb ||", "|| x->nbank >= x->nb ||")], None),
@@ -276,7 +278,7 @@ MUTANTS = [
     ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {"), ("if ((rb ^ val) & p->vmask) {", "if (0) {")], None),
     ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0) {")], None),
     ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\t\treturn swl_stop(x, SWW_E_RD);")], None),
-    ("done bit not recorded", [("\tx->done |= 1u << t;\n", "")], None),
+    ("done bit not recorded", [("\tx->done |= SWT_BIT(t);\n", "")], None),
     ("bank count not recorded", [("\t\tx->nbank++;\n", "")], None),
     # --- the 0124 preconditions inside swl_wpre
     ("link precondition dropped", [("\treturn swl_pre_link(iso, ltssm, a0, a1);", "\treturn 0;")], None),  # patch 0147: in swl_lpre
@@ -472,7 +474,7 @@ MUTANTS = [
     ("run C words: type word", [("#define SWW_RTLV_RNGSIG 0xFEEDC0DEu ", "#define SWW_RTLV_RNGSIG 0xFEEDFE51u ")], None),
     ("run C words: token is not the stored word", [("\tif (k == SWK_TOKEN) {\n\t\treturn x->tok;\n\t}", "\tif (k == SWK_TOKEN) {\n\t\treturn ~x->tok;\n\t}")], None),
     # --- run C: swl_wr / pick / table
-    ("run C pick: tuple not replaced when consumed", [("(((swl_wt[t].flags & SWT_ONCE) && (x->done & (1u << t))) || ((swl_wt[t].flags & SWT_TW)", "((0) || ((swl_wt[t].flags & SWT_TW)")], None),
+    ("run C pick: tuple not replaced when consumed", [("(((swl_wt[t].flags & SWT_ONCE) && (x->done & SWT_BIT(t))) || ((swl_wt[t].flags & SWT_TW)", "((0) || ((swl_wt[t].flags & SWT_TW)")], None),
     ("run C pick: tuple not replaced by kind", [("|| ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)))) {", "|| 0)) {")], None),
     ("run C pick: kind taken from the offset", [("swl_wt[t].kind != swl_tw_kind(x, win + off)", "swl_wt[t].kind != swl_tw_kind(x, off)")], None),
     ("run C pick: takeover at a level that does not allow it", [("if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {", "if (n <= t) {")], None),
@@ -612,6 +614,32 @@ MUTANTS = [
     ("run D W14: stored value is not image word 0", [("rc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 0));", "rc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 1));")], None),
     ("run D swl_wr: read-back word not kept (failure)", [("\t\tx->rb = rb;     /* run D logs the word that did not stick */\n", "")], None),
     ("run D swl_wr: read-back word not kept (success)", [("\t}\n\tx->rb = rb;\n", "\t}\n")], None),
+    # --- patch 0150, run E: the CA7 release (W15), the firmware-ready poll (W16), the read-only dump (W17)
+    ("run E tuple: release from any IOCTL", [(".coff = SWL_AGENT_IOCTL, .cmask = SWW_IOCTL_MASK, .cval = 0x21u, .need = SWF_W14 },", ".need = SWF_W14 },")], None),
+    ("run E tuple: release while in reset", [(".omask = 1u, .oval = 0u, .coff = SWL_AGENT_IOCTL", ".coff = SWL_AGENT_IOCTL")], None),
+    ("run E tuple: release before the reset vector", [(".cval = 0x21u, .need = SWF_W14 },", ".cval = 0x21u, .need = SWF_W13 },")], None),
+    ("run E tuple: release at level 6", [("{ .row = 15, .run = 5, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_RESET_CTL, .val = 1u,", "{ .row = 15, .run = 4, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_RESET_CTL, .val = 1u,")], None),
+    ("run E tuple: IOCTL before the assert", [(".pred1 = SWT_CAR_ASSERT + 1, ", "")], None),
+    ("run E window tuple: before the release", [(".omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W15 },", ".omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W14 },")], None),
+    ("run E window tuple: from any old window", [(".omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W15 },", ".need = SWF_W15 },")], None),
+    ("run E stage: run E at level 6", [("if (x->level >= SWW_LEVEL0 + 5) {      /* run E", "if (x->level >= SWW_LEVEL0 + 4) {      /* run E")], None),
+    ("run E W15: halted state not checked", [("\tif ((io & SWW_IOCTL_MASK) != 0x21u || (ctl & 1u) != 0 || st != 0) {\n\t\treturn swl_stop(x, SWW_E_STATE);\n\t}\n\tSWW_TRY(swl_core_reset(x, SWW_WIN_CA7WRAP, 0x3u, 0x1u));", "\tSWW_TRY(swl_core_reset(x, SWW_WIN_CA7WRAP, 0x3u, 0x1u));")], None),
+    ("run E W16: no link check per poll", [("\t\tif (swl_lpre(x)) {\n\t\t\tprintf(\"SWEET WLAN: W16 link", "\t\tif (0) {\n\t\t\tprintf(\"SWEET WLAN: W16 link")], None),
+    ("run E W16: the token taken as the pointer", [("\t\tif (v != x->tok && v != 0u) {\n\t\t\tbreak;", "\t\tif (v != 0u) {\n\t\t\tbreak;")], None),
+    ("run E W16: pointer range not checked", [("\tif ((v & 3u) || v < SWW_RAM_BASE || v > last - 4u * SWW_SH_WORDS) {", "\tif (0) {")], None),
+    ("run E W16: pointer may reach the last word", [("v > last - 4u * SWW_SH_WORDS) {", "v > last) {")], None),
+    ("run E W16: fewer polls", [("#define SWW_FWUP_POLLS  100u", "#define SWW_FWUP_POLLS  10u")], None),
+    ("run E W16: all-ones accepted", [("\tif (v == 0xFFFFFFFFu) {\n\t\treturn swl_stop(x, SWW_E_DEAD);\n\t}\n\tif ((v & 3u)", "\tif ((v & 3u)")], None),
+    ("run E bp_rd: no bounds", [("\tif ((a & 3u) || x->ram_bytes < 4u || a < SWW_RAM_BASE || a - SWW_RAM_BASE > x->ram_bytes - 4u) {", "\tif (0) {")], None),
+    ("run E bp_rd: end bound one word late", [("a - SWW_RAM_BASE > x->ram_bytes - 4u) {", "a - SWW_RAM_BASE > x->ram_bytes) {")], None),
+    ("run E bp_rd: wrong window above 4 MiB", [("\twant = a >= SWW_TCM_BYTES ? SWW_WIN_TAIL : 0u;", "\twant = 0u;")], None),
+    ("run E W17: console buffer size not bounded", [(" || x->con_size > last - x->con_buf", "")], None),
+    ("run E W17: console index not bounded", [(" || e0 >= x->con_size) {", ") {")], None),
+    ("run E W17: console pointer not checked", [("\tif ((x->con & 3u) || x->con < SWW_RAM_BASE || x->con > last - SWW_CON_IDX) {", "\tif (0) {")], None),
+    ("run E W17: no 2 KiB cap", [("\tn = e0 < SWW_CON_MAX ? e0 : SWW_CON_MAX;", "\tn = e0;")], None),
+    ("run E W17: second look over budget", [("\t\t\tn = n < SWW_CON_MAX - x->con_bytes ? n : SWW_CON_MAX - x->con_bytes;\n", "")], None),
+    ("run E W17: window not put back", [("\tSWW_TRY(swl_w84_zero(x));\n\tprintf(\"SWEET WLAN: W17 done", "\tprintf(\"SWEET WLAN: W17 done")], None),
+    ("run E con_out: non-printables printed", [("\t\tif (ch >= 0x20 && ch < 0x7F) {", "\t\tif (ch != '\\n') {")], None),
 ]
 
 

@@ -577,6 +577,10 @@ else
 	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0147-sweet-wlan-fw-ident.patch > $O/sweet_wlan_wr.0147.diff
 	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0147.diff || { echo "FAIL patch 0147 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
 	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
+	# patch 0150 (run E: CA7 release, firmware-ready poll, read-only shared/console dump) changes it once more: the same way, on top of the text after 0147
+	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0150-sweet-wlan-fw-ready.patch > $O/sweet_wlan_wr.0150.diff
+	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0150.diff || { echo "FAIL patch 0150 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
+	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
 	chk "wlan_wr_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_wr_host_test wlan_wr_host_test.c
 	chk "wlan_wr_host_test" $O/wlan_wr_host_test
 	# the pure NVRAM part of the same header (process_nvram_vars port): known answers, no bus
