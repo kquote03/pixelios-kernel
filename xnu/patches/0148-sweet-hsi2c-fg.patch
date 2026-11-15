@@ -24,7 +24,7 @@ diff --git a/bsd/dev/sweet_hsi2c.c b/bsd/dev/sweet_hsi2c.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_hsi2c.c
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,258 @@
 +/*
 + * xnu patch 0148: READ-ONLY MAX77759 fuel-gauge reader over HSI2C12 (oriole), glue for bsd/dev/sweet_hsi2c_fg.h. Inert unless boot-arg
 + * sweetbatt=1 AND the ADT node /sweet-batt (tools/mkadt.py, boards whose board.json has an fg block): without both nothing is mapped and
@@ -48,6 +48,7 @@ new file mode 100644
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
 +extern int hz;
 +void sweet_batt_init(void);
++int sweet_batt_sample(uint32_t *soc_centi, uint32_t *mv, int32_t *ma, int32_t *t_deci);
 +
 +#define SB_COMPAT       "google,gs101-hsi2c-fg"
 +#define SB_FIRST_S      20      /* the first read set, after the touch thread has started (sweet_ufs_init calls both) */
@@ -253,12 +254,40 @@ new file mode 100644
 +	    SFG_DEV_ADDR7, SB_FIRST_S, SB_PERIOD_S);
 +}
 +
++/*
++ * C5 (plan oneshot-2): the last plausible read set for SweetBattery.cpp (iokit/Kernel/arm), memory only, no hardware access.
++ * 0 = the values are fresh from a set that passed sfg_plausible and the reader is still running; -1 = none (not armed, no set
++ * yet, implausible, stopped). The reader thread is the only writer: two copies with the same seq and valid = 1 are consistent.
++ */
++int
++sweet_batt_sample(uint32_t *soc_centi, uint32_t *mv, int32_t *ma, int32_t *t_deci)
++{
++	const struct sfg_sample *l = &sb.st.last;
++	struct sfg_sample a, b;
++
++	if (sb.i2c == NULL || __atomic_load_n(&sb.st.stopped, __ATOMIC_ACQUIRE))
++		return -1;
++#define SB_LD(x) __atomic_load_n(&l->x, __ATOMIC_ACQUIRE)
++	a.seq = SB_LD(seq); a.valid = SB_LD(valid); a.soc_centi = SB_LD(soc_centi); a.mv = SB_LD(mv); a.ma = SB_LD(ma); a.t_deci = SB_LD(t_deci);
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	b.seq = SB_LD(seq); b.valid = SB_LD(valid); b.soc_centi = SB_LD(soc_centi); b.mv = SB_LD(mv); b.ma = SB_LD(ma); b.t_deci = SB_LD(t_deci);
++#undef SB_LD
++	if (a.seq == 0u || a.seq != b.seq || !a.valid || !b.valid || a.soc_centi != b.soc_centi || a.mv != b.mv || a.ma != b.ma ||
++	    a.t_deci != b.t_deci)
++		return -1;
++	*soc_centi = a.soc_centi;
++	*mv = a.mv;
++	*ma = a.ma;
++	*t_deci = a.t_deci;
++	return 0;
++}
++
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_hsi2c_fg.h b/bsd/dev/sweet_hsi2c_fg.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_hsi2c_fg.h
-@@ -0,0 +1,967 @@
+@@ -0,0 +1,1026 @@
 +/*
 + * sweet_hsi2c_fg.h - xnu patch 0148: READ-ONLY fuel-gauge reader over HSI2C12 (MAX77759 fuel gauge, 7-bit 0x36), boot-arg sweetbatt=1.
 + * Pure C: no MMIO, no kernel call. Every bus access goes through struct sfg_ops (bsd/dev/sweet_hsi2c.c maps the blocks); every store goes
@@ -1110,10 +1139,68 @@ new file mode 100644
 +	sfg_emit(r->o, &b);
 +}
 +
++/* C5 (plan oneshot-2): the last read set as numbers, for the iOS power source (SweetBattery.cpp via sweet_batt_sample in sweet_hsi2c.c).
++ * Pure arithmetic on the raw words sfg_set already read; no hardware access. valid = 1 only when the set passes sfg_plausible
++ * (review 0148-3 H2: an implausible or changed-DevName set is logged but never published). */
++struct sfg_sample {
++	uint32_t valid;		/* 1: the fields below may be published */
++	uint32_t seq;		/* read sets that reached this point (written last; readers check it did not change) */
++	uint32_t soc_centi;	/* RepSOC, 0.01 % */
++	uint32_t mv;		/* VCell, mV */
++	int32_t ma;		/* AvgCurrent, mA, register sign: negative = discharging (max1720x_battery.c:1147,1152 report it negated) */
++	int32_t t_deci;		/* Temp, 0.1 C */
++	uint32_t devname;	/* DevName, latched from the first plausible set */
++};
++
 +struct sfg_state {
 +	int stopped;		/* latched: no hardware access ever again this boot */
 +	unsigned sets;		/* read sets done */
++	struct sfg_sample last;	/* C5 */
 +};
++
++/* soc 0..100 %, VCell 2800..4600 mV (a 1S Li-ion cell; the same bounds as the PM6150 path in SweetBattery.cpp), Temp -20..70 C */
++static int
++sfg_plausible(const struct sfg_sample *s)
++{
++	return s->soc_centi <= 10000u && s->mv >= 2800u && s->mv <= 4600u && s->t_deci >= -200 && s->t_deci <= 700;
++}
++
++static void
++sfg_sample_set(struct sfg_state *st, const struct sfg_ops *o, const struct sfg_cfg *c, const uint32_t *raw)
++{
++	struct sfg_sample s;
++	struct sfg_buf b;
++	int32_t temp = (int32_t)(int16_t)(uint16_t)raw[SFG_R_TEMP], cur = (int32_t)(int16_t)(uint16_t)raw[SFG_R_AVGCURRENT];
++
++	s.soc_centi = raw[SFG_R_REPSOC] * 100u / c->repsoc_lsb;		/* the summary line's formulas (sfg_battery_line) */
++	s.mv = (uint32_t)((uint64_t)raw[SFG_R_VCELL] * c->vcell_nv / 1000000u);
++	s.ma = (int32_t)((int64_t)cur * (int64_t)c->curr_na / 1000000);
++	s.t_deci = temp * 10 / (int32_t)c->temp_lsb;
++	s.devname = raw[SFG_R_DEVNAME] & 0xFFFFu;
++	s.valid = (uint32_t)sfg_plausible(&s);
++	if (s.valid && st->last.devname == 0u)
++		st->last.devname = s.devname;
++	if (s.valid && s.devname != st->last.devname) {
++		sfg_start(&b, "sample not published (DevName ");
++		sfg_hex(&b, s.devname, 4);
++		sfg_txt(&b, " != ");
++		sfg_hex(&b, st->last.devname, 4);
++		sfg_txt(&b, ")");
++		sfg_emit(o, &b);
++		s.valid = 0;
++	}
++	s.devname = st->last.devname;
++	s.seq = st->last.seq + 1u;
++	st->last.valid = 0;			/* the reader in another thread sees valid = 0 while the fields change */
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	st->last.soc_centi = s.soc_centi;
++	st->last.mv = s.mv;
++	st->last.ma = s.ma;
++	st->last.t_deci = s.t_deci;
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	st->last.valid = s.valid;
++	st->last.seq = s.seq;
++}
 +
 +static int
 +sfg_refuse(struct sfg_state *st, const struct sfg_ops *o, const char *why)
@@ -1222,6 +1309,7 @@ new file mode 100644
 +	sfg_battery_line(&r, raw);
 +	if (!restored)
 +		return sfg_refuse(st, o, "restore=FAILED");
++	sfg_sample_set(st, o, c, raw);			/* C5: only after a verified restore */
 +	return 0;
 +}
 +

@@ -344,7 +344,7 @@ static void world(void)
 	ops.say = f_say;
 	ops.freq_hz = 24576000ull;
 	ops.ctx = NULL;
-	st.stopped = 0;
+	memset(&st, 0, sizeof(st));
 	st.sets = 0;
 	h.mode = 0x4; h.ipclk = 0x00200000; h.pclk = 0x00200000; h.qch = 0x003F0002;
 	h.pcon = 0x00220000u; h.pdat = 0x30u;
@@ -491,6 +491,9 @@ int main(void)
 	nw = 0; nl = 0; nruns = 0;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && violations == 0 && nw == 7 * 17 + 6 && nl == 1 && st.sets == 2);
 	EXPECT(!strcmp(lines[0], "SWEET BATTERY: soc=62.42% v=3974 mV i=-144.6 mA t=29.4 C src=fg"));
+	/* C5: the last plausible set is kept for the iOS power source (sweet_batt_sample); no hardware access */
+	EXPECT(st.last.valid == 1 && st.last.soc_centi == 6242 && st.last.mv == 3974 && st.last.ma == -144 && st.last.t_deci == 294 && st.last.devname == 0x6200);
+	EXPECT(st.last.seq == 2);
 
 	/* MASTER_RUN stays set after a transfer (the other guess) -> the same writes, still ok */
 	world(); h.run_sticks = 1;
@@ -503,6 +506,16 @@ int main(void)
 	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && has("soc=0.00% v=3974 mV i=-0.3 mA t=-0.1 C src=fg"));
 	world(); fgv[0x06] = 0xFFFF; fgv[0x09] = 0xFFFF; fgv[0x0B] = 0x0000; fgv[0x08] = 0x0000;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && has("soc=255.99% v=5119 mV i=+0.0 mA t=0.0 C src=fg"));
+	EXPECT(st.last.valid == 0);	/* C5 (review H2): soc > 100 %, v > 4600 mV: logged, never published */
+	world(); fgv[0x08] = 0xFE80; fgv[0x06] = 0x0140; fgv[0x0B] = 0x0010; fgv[0x09] = 0x0000;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && st.last.valid == 0);	/* 0 mV: not plausible */
+	/* DevName latches on the first plausible set; a different one later is not published */
+	world();
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && st.last.valid == 1);
+	fgv[0x21] = 0x1234;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && st.last.valid == 0 && has("SWEET BATTERY: sample not published (DevName 1234 != 6200)"));
+	fgv[0x21] = 0x6200;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && st.last.valid == 1);
 
 	/* refusals: ZERO writes, the reason, stopped */
 	world(); ops.freq_hz = 0; refused("refused no timer");
