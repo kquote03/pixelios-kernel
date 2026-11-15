@@ -136,3 +136,20 @@ Wired memory the replay needs: 17.4 MiB (clear) / 18.4 MiB (tri), dominated by t
 1. TILER_FEATURES and THREAD_* of the real chip (s.4 table); `sweet_mali_query` already reads them, a read-only print would settle them.
 2. G78 tilebuffer sizes (0001, [guess]).
 3. Syncobj emulation and `bo_import` for the iOS side (G3/G6).
+
+## 8. G2: kernel replay (patch 0155, `sweetmali=0x100`; built, unrun, review pending)
+
+- Container: `tools/pack_gpujob.py OUT clear.malijob tri.malijob` = the WLANFWB1 layout of `tools/pack_wlanfw.py` (now a generic
+  `pack_container`/`parse_container`, WLANFW output byte-identical [obs]) with magic `GPUJOBS1`, tag `GPUJ` (repeatable, <= 4, length + crc32).
+  `mkpayload.py --gpujob` puts it in `/chosen/memory-map GPUJOB <pa, size>`; `tools/xrun --gpujob` / `build-xnu-image.sh --gpujob` (needs
+  `--gpu-handover`). `$A/gpu/capture/gpujob-clear-tri.bin`: 7744 B, sha256 `f1f568d7a0fb2a9eddc3e3b1fc9074e46533a9c63098a8c39a01c23d12266fba` [obs].
+- Parser `bsd/dev/sweet_mali_replay.h` (pure, the rules of s.6 plus kernel limits: <= 64 BOs, <= 32 MiB per BO, <= 64 MiB per job, RT <= 4096^2,
+  job descriptors 128-byte aligned (`v9.xml:1425`) with >= 64 bytes inside a BO, GPU_ID must equal the chip's). Host test
+  `shim/mali_replay_host_test.c` (plain + ASan/UBSan, exact-size heap copies, 200k random corruptions), `tools/test_mali_replay_mutants.py`
+  (48 guards removed one by one, all killed [obs]).
+- Kernel (`sweet_mali.c`): `sweetmali=0x100` without bits 1|2 = bring-up as `sweetmali=1` but no SweetMali service (its `start()` needs bit 1|2),
+  so AS0 holds only the replay's BOs. Per job: `kmem_alloc` wired zeroed memory per BO, copy `data_len` bytes, clean+invalidate, `sm_map_at`
+  (= `sweet_mali_map` with `mali_va_reserve` at the recorded VA; refused when taken or outside the window), chains through
+  `sweet_mali_submit`/`sweet_mali_wait` (2 s each; a timeout waits 4 s more for the core's 3 s hard stop + reset), invalidate, crc32 of the RT
+  rows and the three pixels. Output `SWEET MALI: replay <name>=PASS|FAIL crc=0x...`. A failure stops the replay; BOs are freed only after a
+  clean unmap with no job running, else leaked. Read-only extra: `replay regs ...` prints TILER_FEATURES / THREAD_* / TEXTURE_FEATURES (s.4 open item 1).
