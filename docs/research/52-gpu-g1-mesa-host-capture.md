@@ -188,3 +188,120 @@ First cross build result [obs 2026-11-16]: `ninja -C $A/gpu/build/mesa-ios -k 0`
 `Mach-O 64-bit arm64 object`, LC_BUILD_VERSION platform ios, minos 16.0, sdk 16.4. Libraries that are not built by default (libmesa,
 libgallium, libpankmod_lib, ...) are only built when a target links them; `ninja ... src/panfrost/lib/kmod/libpankmod_lib.a` built cleanly
 (no warnings) and exports `sweet_kmod_*` and `sweet_iokit_transport_create`. No dylib or executable exists yet (the sweetgl target is the G3 agent's).
+
+## 11. G3 result (2026-11-16, sub-lane lane-g3; host only, nothing ran on the phone)
+
+Tags as above: **[obs]** a command run here, **[src]** read from the cited file, **[guess]** not verified. Nothing in this section is a
+device result: `sweetgl_selftest` has **not** been run (no phone work in this step), so "PASS" below means the host-checkable criteria only.
+
+### 11.1 Outputs (`$A/gpu/out/`, not in git)
+
+| File | Type [obs `file`] | Size | sha256 (after `ldid -S`) |
+|---|---|---|---|
+| `libsweetgl.dylib` | Mach-O 64-bit arm64 dynamically linked shared library, TWOLEVEL, NOUNDEFS | 20920496 B | `f2b31a68a0021178d48e0debfc0704d026e5affb272fa194117e8409ba54d452` |
+| `sweetgl_selftest` | Mach-O 64-bit arm64 executable, TWOLEVEL, PIE | 68544 B | `67733d40c5fee7ed531861fc85880f5f1a930da0180d803261446475e8e3caab` |
+
+Both: `LC_BUILD_VERSION platform ios, minos 16.0, sdk 16.5` [obs `llvm-objdump --macho --private-headers`]; ad-hoc signed with theos `ldid -S`
+(selftest CodeDirectory v=20400, sha256 hashes [obs `ldid -h`]). Install name of the dylib: `/usr/lib/libsweetgl.dylib`.
+`$A/gpu/out/check-sdk-symbols.txt` holds the full check output.
+
+### 11.2 Pass criteria (host) [obs]
+
+| Criterion | Result |
+|---|---|
+| `file` = Mach-O 64-bit arm64, both | PASS (11.1) |
+| linked libraries only from iPhoneOS16.5.sdk | PASS. dylib: `IOKit.framework/Versions/A/IOKit`, `IOSurface.framework/IOSurface`, `/usr/lib/libobjc.A.dylib`, `/usr/lib/libSystem.B.dylib`, `/usr/lib/libc++.1.dylib`; selftest: `IOSurface`, `CoreFoundation`, `libSystem.B` (it `dlopen`s libsweetgl, so it does not link it) |
+| every undefined symbol resolves against the SDK `.tbd` files | PASS: `gpu/ios/check-sdk-symbols.py` -> dylib 219 undefined / 0 unresolved, selftest 29 / 0, `RESULT PASS`. The script reads the arm64-ios blocks of each tbd v4 document, follows re-exported libraries (libSystem -> libsystem_*), skips the image's own `LC_ID_DYLIB`, requires a two-level namespace, and has a negative control (`_eventfd` must not resolve in libSystem) |
+| exports | 14 `sweetgl_*` + 1300 `gl[A-Z]*` (libglapi_bridge public entries) [obs `llvm-nm -gU`]; nothing else |
+
+Limitation [guess]: tbd files carry no per-symbol availability, so a symbol introduced after iOS 16.0 would still "resolve"; the binaries
+target minos 16.0 against the 16.5 SDK, and the phone runs 16.7, so this only matters for 16.0-16.4 devices.
+
+### 11.3 Build commands
+
+```
+# Mesa clone: pristine 26.2.5 + gpu/mesa-patches/0001..0006 in order (all six apply with git apply --check on HEAD [obs])
+nix-shell $A/gpu/nix/shell.nix --run 'bash <repo>/gpu/ios/configure-ios.sh'      # unchanged (lane G); meson picks up targets/sweetgl
+flock $A/scratch/heavy.lock nix-shell $A/gpu/nix/shell.nix --run 'export PATH=$A/gpu/ios/bin:$PATH; ninja -C $A/gpu/build/mesa-ios -j6 \
+   src/gallium/targets/sweetgl/libsweetgl.dylib src/gallium/targets/sweetgl/sweetgl_selftest'
+cp $A/gpu/build/mesa-ios/src/gallium/targets/sweetgl/{libsweetgl.dylib,sweetgl_selftest} $A/gpu/out/
+PATH=$A/gpu/ios/bin:$PATH ldid -S $A/gpu/out/libsweetgl.dylib; ldid -S $A/gpu/out/sweetgl_selftest
+nix-shell $A/gpu/nix/shell.nix --run 'python3 <repo>/gpu/ios/check-sdk-symbols.py $A/localbuild/theos/sdks/iPhoneOS16.5.sdk $A/gpu/out/libsweetgl.dylib $A/gpu/out/sweetgl_selftest'
+```
+Step 1 of G3 (the Mesa libraries) needed **no further Darwin patch**: lane G's first `ninja -k 0` (278 targets, `ninja-ios.log`) and the
+remaining 898 targets (libmesa, libgallium, glsl, nir, glapi, glapi_bridge, panfrost compiler/lib/decode/winsys, `ninja-ios2.log`) built
+with 0 FAILED [obs]. Link: no unresolved symbol; ld64 warnings only for static initializers (glsl builtins, the shim's constructor).
+
+### 11.4 Patch 0006 (`gpu/mesa-patches/0006-panfrost-sweet-libsweetgl-target-iosurface-import.patch`, also `$A/gpu/patches/`)
+
+sha256 `7f30d2fd08f655b0873de9ed0efe67624086ca9abac5c5af880654536703dee6`, 2590 lines, on top of 0001-0005 (exported through a temporary
+index; the clone's HEAD stays pristine 26.2.5).
+
+| Part | What |
+|---|---|
+| `sweet_kmod.h` / `sweet_iokit.c` | transport gains optional `import_surface` (selector 5: in IOSurface id; out handle, GPU VA, length, bytesPerRow, width, height, pixelFormat [src patch 0105 `importSurface`]) and `bo_cache_sync` (selector 6) |
+| `sweet_kmod.c` | `sweet_kmod_import_surface()` maps a surface and parks `{handle, va, size, cpu}` (64 slots); `bo_import` takes the parked entry (CPU access = the caller's own surface mapping, else `NO_MMAP`); `sweet_kmod_import_drop()`, `sweet_kmod_import_size()`, `sweet_kmod_bo_cache_sync()` |
+| `pan_kmod.c` | `pan_kmod_bo_import`: on the sweet backend the size comes from the parked import instead of `lseek()` on a dma-buf (1 hunk) |
+| `src/gallium/meson.build` | `subdir('targets/sweetgl')` when `-Ddarwin-sweet=true`, Darwin, panfrost |
+| `src/gallium/targets/sweetgl/` | the new target, below |
+
+### 11.5 The pieces (all in `src/gallium/targets/sweetgl/`, MIT)
+
+* **(b) frontend `sweetgl_frontend.c`**, modelled on `frontends/hgl/hgl.c` [src]: a `pipe_frontend_screen` over `panfrost_drm_screen_create(open("/dev/null"))`
+  (the sweet backend's iokit transport is selected by `sweet_kmod_get_transport()` before any DRM call), a hand-built `driOptionCache` from
+  `driinfo_gallium.h` + `driinfo_panfrost.h` (xmlconfig is disabled, doc 32 s.7 item 8), `st_api_create_context(API_OPENGLES2, 2.0..3.1)` with an
+  empty visual (surfaceless; `st_api_make_current(st, NULL, NULL)`), `get_egl_image` returning IOSurface resources. API in `sweetgl.h`.
+  IOSurface path: selector 5 -> placeholder "prime fd" registered in `sweet_drm.c` -> `resource_from_handle(WINSYS_HANDLE_TYPE_FD, stride = bytesPerRow,
+  DRM_FORMAT_MOD_LINEAR)` -> `pan_kmod_bo_import` -> parked handle. Formats: `'BGRA'` -> B8G8R8A8_UNORM, `'RGBA'` -> R8G8B8A8_UNORM.
+* **(a) libdrm stand-in `sweet_drm.c`**: every `xf86drm.h` function of 0005. Syncobjs are a 1024-entry userland table; **every wait is a wait for the
+  whole SweetMali queue** (`sweet_kmod_wait_idle`, absolute `os_time_get_nano` deadline). Reason [src `pan_jm.c` sweet branch of 0003]: the sweet submit
+  path does not pass `out_sync`, and `ctx->syncobj` is created signalled and reused for every batch, so a per-syncobj "signalled" flag would let a
+  fence return before its work ran. Over-waits, never under-waits. Sync-file fds are real fds (`/dev/null`) because Mesa `close()`s them. `drmIoctl`,
+  prime export, caps: ENOSYS/EINVAL. `drmGetVersion` returns name `"sweet"` (never reached: the backend is chosen before it).
+* **(c) EAGL shim `sweetgl_eagl.c`** (C on the Objective-C runtime, no Foundation): replaces, on `EAGLContext` only if the class itself defines them
+  (`class_copyMethodList`, so an inherited NSObject method is never swizzled), `initWithAPI:properties:` (API 2/3 -> our context, ES 3.1 for API 3;
+  failure falls through to Apple's init so CA keeps its CPU renderer), `dealloc`, `API` (3), `setParameter:to:` (YES), `getMacroContextPrivate`
+  (`{rctx, disp[1036]}`), both `texImageIOSurface:` forms, `attachImage:toCoreSurface:invertedRender:`, `+setCurrentContext:`, `+currentContext`
+  (doc 18 s.1.2, doc 33 s.2.1/s.4 P0). IOSurface images in a 32-entry LRU keyed by (id, base address, w, h, bytesPerRow); sampled surfaces that cannot be
+  imported fall back to a CPU copy (`glTexImage2D`, BGRA/RGBA only); render targets have no fallback. Installed by a constructor only in `backboardd`
+  (or `SWEETGL_EAGL=1`), via `_dyld_register_func_for_add_image` so it waits until OpenGLES has registered the class.
+  GLI wrappers: `gen_gli_wrappers.py` generates one typed wrapper per `dispatch.h` typedef (1639) from Mesa's own generated header, so the arm64
+  `(rctx, args...)` shift is done by the compiler; `sweetgl_gli.c` adds the doc 33 s.2.2 specials (ARB shader objects -> ES, `glFlush` = `glFinish`,
+  `glFinishObjectAPPLE`, `glTestObjectAPPLE`, `glFramebufferParameterivAPPLE` no-op, `glGetString(0x8a1e)` -> NULL without error, client state no-op)
+  and a lookup that also strips ARB/EXT/OES/APPLE/KHR. Unmapped slots go to 1036 per-slot traps (log once, return 0).
+* **The two doc 36 crash causes, designed around:** (1) every GLI wrapper and special calls `sweetgl_gli_ensure()`, which makes rctx current (taking it
+  over from the creating thread if needed) and then checks **Mesa's own TLS** (`_mesa_glapi_get_context()`); without a context the call is skipped and
+  logged, never run on NULL. `sweetgl_context_create` does not leave the context bound, `sweetgl_get_current` cross-checks `st_api_get_current()` and the
+  owner thread. (2) an IOSurface whose width/height/bytesPerRow/base read as zero (the sel-6 zero-reply client) is refused in the shim before any use;
+  surfaces the kernel reports with zero or inconsistent geometry are refused in the frontend too.
+* **(d) `libsweetgl.dylib`**: meson `shared_library` linking libmesa, libgallium, libglapi, `link_whole` libglapi_bridge, `driver_panfrost`;
+  `-exported_symbols_list sweetgl.exports`, `-dead_strip`, frameworks IOKit, IOSurface, CoreFoundation, `-lobjc`.
+* **(e) `sweetgl_selftest`**: `dlopen`s libsweetgl (argument, `SWEETGL_DYLIB`, next to the executable, `/usr/lib`), context ES 3.1/3.0/2.0, 256x256
+  `GL_RGBA8` renderbuffer FBO; clear (0.2, 0.4, 0.6, 1) -> all 65536 pixels must read `33 66 99 ff`; triangle (-0.5,-0.5)(0.5,-0.5)(0,0.5) green ->
+  (128,128) `00 ff 00 ff`, (2,2) and (253,253) the clear colour (same scene as the G1 capture, s.5); last line
+  `sweetgl selftest: clear=PASS|FAIL|SKIP tri=...`, exit 0 only for two PASS. `--iosurface` repeats both into a 256x256 BGRA IOSurface (256 KiB =
+  16 pages, selector-5 rule) and reads the surface memory after `sweetgl_image_sync_for_cpu` (glFinish + selector 6).
+* **(f)** both signed with `ldid -S` (11.1).
+
+### 11.6 Open issues
+
+1. **Not run.** `sweetgl_selftest` on the phone is the next step (needs SweetMali service with patches 0104/0105 and a phone slot). First
+   expected trouble points [guess]: `IOServiceOpen` permission for a root CLI; the one-client rule of 0105 (backboardd must not hold it).
+2. **GLI slot map missing (the EAGL shim does not install without it).** Apple's slot -> name table (sailfish `ios-dispatch.txt`, reverse engineered
+   from GLEngine `_gliInitDispatchTable`) is not on this host (`~/pixelios-artifacts/refs/ios-sailfish` and the dsc extraction `work/dsc` are absent
+   [obs]) and must not be invented (AGENTS.md rule 7). Only 6 slots are cited in docs 33/36 (98, 104, 117, 779, 781, 1024). The shim loads the map at
+   run time from `SWEETGL_GLI_MAP` or `/usr/share/sweetgl/gli-slots.txt` (`<slot> <glName>` lines); with no map `sweetgl_eagl_install` returns
+   `-ENOTSUP` and leaves Apple's EAGLContext alone. Re-deriving the map from the 20H392 cache (doc 33 method) is a separate RE task.
+3. **Declined in this step** (one line each): `GL_TEXTURE_RECTANGLE`/`sampler2DRect` emulation and GLSL rewriting (doc 33 s.4 P1 item 7: needs CA's shader
+   texts and a device trace to check); the shared-cache binary patch of CA's four texture functions (P1 item 8: needs the cache and refuse-on-mismatch
+   addresses, not on this host).
+4. Syncobj emulation over-waits (any fence = whole queue) [src reasoning, 11.5 a]; correct but serialises CPU and GPU per fence.
+5. Context take-over between threads (`sweetgl_make_current_steal`) assumes the previous thread no longer issues GL calls; the old thread's Mesa TLS
+   still names the context [guess: CA creates on one thread and renders on its render thread only, doc 36 s.2].
+6. IOSurface import requires the kernel's rules (16 KiB-paged length, `IOBufferMemoryDescriptor` surfaces) and Panfrost's linear-import pitch rules
+   (`pan_layout` strict import); a refusal falls back to a copy for sampled surfaces only. Real CA pitches are untested [guess].
+7. Cache maintenance: imported surfaces are cleaned+invalidated by the kernel at import and by `sweetgl_image_sync_for_cpu`; CA's own CPU writes to a
+   surface after import are not flushed before GPU sampling [guess: needs a selector-6 call per CA update, or uncached surfaces].
+8. The host (Linux) build was not rebuilt with 0005+0006 (`pan_kmod.c` now calls `sweet_kmod_import_size`, defined in `sweet_kmod.c`, which the host
+   build also compiles [src]; not built [guess that it links]).
+9. `check-sdk-symbols.py` cannot see API availability (11.2 limitation).
