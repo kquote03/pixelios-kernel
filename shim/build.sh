@@ -593,6 +593,12 @@ else
 	awk '$0=="+++ b/bsd/dev/sweet_mali_pt.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0104-sweet-mali-driver-core.patch > $O/sweet_mali_pt.h
 	chk "mali_pt_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/mali_pt_host_test mali_pt_host_test.c
 	chk "mali_pt_host_test" $O/mali_pt_host_test
+	# Trusty version probe of xnu patch 0156 (new-file hunk of bsd/dev/sweet_trusty.h) against a fake monitor: plain and ASan/UBSan
+	awk '$0=="+++ b/bsd/dev/sweet_trusty.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0156-sweet-trusty-probe.patch > $O/sweet_trusty.h
+	chk "trusty_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/trusty_host_test trusty_host_test.c
+	chk "trusty_host_test" $O/trusty_host_test
+	chk "trusty_asan_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/trusty_asan_host_test trusty_host_test.c
+	chk "trusty_asan_host_test" $O/trusty_asan_host_test
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
 	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c

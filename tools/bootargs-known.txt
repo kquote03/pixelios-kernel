@@ -504,6 +504,7 @@ sweettouchrstfirst	patch:0146
 sweettouchspi4	patch:0145
 sweettouchsysinfo	patch:0145
 sweettouchvar	patch:0090
+sweettrusty	patch:0156
 sweetusb	patch:0070
 sweetusbdma	patch:0082
 sweetusblog	patch:0075

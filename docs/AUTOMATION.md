@@ -639,3 +639,15 @@ header and at most 2 KiB of console text, printable bytes only, now and 2 s late
 Never written: EP Command (bus master), any BAR2 word after W14, rings, doorbells, host_cap. Left after the run: the firmware running (also after a W16/W17 stop),
 SYS_MEM out of reset, ATU region 2 enabled, cfg 0x84 = 0; a power cycle resets the chip. Reviews: docs/reviews/0150-wlan-fw-ready-review-fable-1.md (SAFE-AFTER-FIXES),
 -2.md (SAFE; G1-G6 L open: glue gate/latch for the release before any later store level, two cite texts, uncovered mutants X2/X3/X8/X9/X11/X15).
+
+## XNU `sweettrusty=1`: Trusty version probe (patch 0156, plan step A3)
+
+Two version fastcalls only (`SMC_FC_GET_VERSION_STR`, `SMC_FC_API_VERSION` with 5), as the stock driver's probe does first; no std-call, no
+shared memory, no MMIO. Logic and allowlist: `bsd/dev/sweet_trusty.h`, host test `shim/trusty_host_test.c` (plain + ASan in `shim/build.sh`).
+```
+SWEET_USBLOG_PORT=64738 tools/xrun --kernel ~/pixelios-artifacts/xnu-local-audio-<tag>/kernel.development.sweet --board oriole --no-camera --gui --rails --cpus 8 \
+  --args 'sweettrusty=1' --expect 'SWEET TRUSTY: (api=|stop )' --label o5-a3-trusty --restart 600,bootloader --lock-wait 3600
+```
+Pass: `SWEET TRUSTY: api=5 version='Project: slider, Build: ...'` then `SWEET TRUSTY: probe done smc=N`. A `stop undefined-smc` line means the
+monitor does not route Trusty calls from XNU: steps A4-A6 and A8-A10 are skipped (never retried with other arguments, plan stop H9).
+Status: *not run yet* (built and host-tested 2026-11-16).
