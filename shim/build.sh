@@ -599,6 +599,12 @@ else
 	chk "mali_replay_host_test" $O/mali_replay_host_test
 	chk "mali_replay_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/mali_replay_asan_host_test mali_replay_host_test.c
 	chk "mali_replay_asan_host_test" $O/mali_replay_asan_host_test
+	# GIC SPI table of xnu patch 0157 (new-file hunk of pexpert/arm/sweet_spi.h): allowlist 452/453, offsets, attach preconditions, dispatch
+	awk '$0=="+++ b/pexpert/arm/sweet_spi.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0157-sweet-mali-irq.patch > $O/sweet_spi.h
+	chk "sweet_spi_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/sweet_spi_host_test sweet_spi_host_test.c
+	chk "sweet_spi_host_test" $O/sweet_spi_host_test
+	chk "sweet_spi_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/sweet_spi_asan_host_test sweet_spi_host_test.c
+	chk "sweet_spi_asan_host_test" $O/sweet_spi_asan_host_test
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
 	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c

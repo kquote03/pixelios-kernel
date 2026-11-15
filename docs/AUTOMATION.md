@@ -657,3 +657,18 @@ SWEET_USBLOG_PORT=64738 tools/xrun --kernel <kernel> --board oriole --no-camera 
 Output: `SWEET MALI: replay regs ...` (read-only feature registers), `replay: GPUJOB container ok ...`, per job `replay <name>: N chains ...` and
 `replay <name>=PASS|FAIL crc=0x...`, then `replay done N/M PASS`. A fault adds the core's `job ... failed JS_STATUS=` / `MMU fault ... FAULTADDR=` lines
 and `replay <name>=FAIL chain K wait E jc=... header exception_status=... fault_pointer=...`; the replay stops there.
+
+## XNU sweetmali bit 0x200: Mali JOB/MMU interrupts (patch 0157, plan oneshot-2 step G4; BUILT, UNRUN, review pending)
+
+First run: one CPU, selftest only (doc 35 s.8 item 8):
+
+```bash
+SWEET_USBLOG_PORT=64738 tools/xrun --kernel <kernel> --board oriole --no-camera --gui --rails --cpus 1 --gpu-handover --intent gpu \
+  --args 'sweetmali=0x202' --expect 'SWEET MALI: irq counts' --fail-on 'panic\(' \
+  --label gpu-o3-g4-irq1 --lock-wait 3600 --restart 600,bootloader --hard-timeout 600
+```
+
+Lines: `SWEET MALI: irq attach INTID 452 -> 0 ISENABLER14=... IGROUPR14=... IROUTER=...` (and 453), `irq mode on`, the usual
+`selftest RESULT js0=PASS js1=PASS`, then `irq counts mode=irq job=N mmu=0 spurious=0 unhandled_spi=0 last_unhandled=0`.
+Pass = selftest PASS, job >= 2, spurious 0, unhandled_spi 0. Any attach refusal (`-> 1` precheck, `-> 5` did not stick) leaves `mode=poll` and the
+old polling; nothing is written for a refused precheck. Then with the replay: `--gpujob ... --args 'sweetmali=0x300'`, same `replay tri=PASS`.
