@@ -4,7 +4,7 @@ Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in 
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
 EQUIVALENT with the clause that implies it (CR-02). A pattern that matches nothing fails too (the header changed under the mutant list).
 Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; patch 0131 (run C: W11 NVRAM text, W12 length token, W13 rTLV) changes them again; patch 0132 (run D: W14 reset vector, firmware identity pin) once more; the texts under test are the files
-after 0124, 0128, 0129, 0130, 0131, 0132, 0147 (0149, glue only), 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
+after 0124, 0128, 0129, 0130, 0131, 0132, 0147, 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
 process_nvram_vars port); a mutant is killed when either fails.
 Run: python3 -B tools/test_wlan_wr_mutants.py  (also picked up by `unittest discover -s tools -p 'test_*.py'`)."""
 import concurrent.futures
@@ -26,7 +26,6 @@ PATCH0130 = os.path.join(ROOT, "xnu", "patches", "0130-sweet-wlan-image-copy.pat
 PATCH0131 = os.path.join(ROOT, "xnu", "patches", "0131-sweet-wlan-nvram-rtlv.patch")
 PATCH0132 = os.path.join(ROOT, "xnu", "patches", "0132-sweet-wlan-reset-vector.patch")
 PATCH0147 = os.path.join(ROOT, "xnu", "patches", "0147-sweet-wlan-fw-ident.patch")
-PATCH0149 = os.path.join(ROOT, "xnu", "patches", "0149-sweet-pcie1-mmu-probe.patch")
 PATCH0150 = os.path.join(ROOT, "xnu", "patches", "0150-sweet-wlan-fw-ready.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
 TEST_NV = os.path.join(ROOT, "shim", "wlan_nv_host_test.c")
@@ -74,7 +73,7 @@ def glue_before():
 
 
 def glue_after():
-    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0149, PATCH0150))
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150))
 
 
 def new_file(patch, path):
