@@ -74,7 +74,7 @@ static uint32_t rfault_off;
 static unsigned wfault_n, ignore_from;
 static uint32_t ignore_off;
 static int ignore_any;
-static unsigned nack_at, timeout_at, rxtimeout_at, abort_at, err_at, lose_mid_at, lose_left;
+static unsigned nack_at, timeout_at, rxtimeout_at, abort_at, err_at, lose_mid_at, lose_left, mid_state = 0xCu;
 static int ist_sticky, busy_after_read;
 static uint64_t ticks, tick_step;
 static char lines[512][SFG_LINE + 8];
@@ -127,7 +127,7 @@ static int f_rd32(void *ctx, int sp, uint32_t off, uint32_t *v)
 	case R_TRANS:
 		*v = h.trans;
 		if (lose_left > 0) {	/* observed c4-batt3: TRANS_STATUS master state 0xC (LOSE) while the read completes, no TRANS_ABORT interrupt */
-			*v = (h.trans & ~0xfu) | 0xCu;
+			*v = (h.trans & ~0xfu) | mid_state;	/* 0xC LOSE (c4-batt3) or 0xB NO_ACK (c6-chg1) */
 			lose_left--;
 		}
 		if (busy_after_read > 0 && (h.trans & MBUSY) && h.nrx == 0 && !h.held && --busy_after_read == 0)
@@ -357,6 +357,7 @@ static void world(void)
 	ignore_off = 0;
 	ignore_any = 0;
 	nack_at = timeout_at = rxtimeout_at = abort_at = err_at = lose_mid_at = lose_left = 0;
+	mid_state = 0xCu;
 	ist_sticky = busy_after_read = 0;
 	ticks = 1000;
 	tick_step = 100;
@@ -650,6 +651,11 @@ int main(void)
 	/* c4-batt3 (observed): master state LOSE (0xC) in TRANS_STATUS while the 2-byte read completes, INT_STATUS has TRANS_DONE and no
 	 * TRANS_ABORT. Linux v6.18 i2c-exynos5.c:521-541 (EXYNOS7 path) decides on INT_STATUS only and checks LOSE only before a transfer
 	 * (:670-693), so this read must succeed */
+	/* c6-chg1 (observed): master state NO_ACK (0xB) during the read of 0x0A, RX empty, INT_STATUS 0, the bus still busy at the restore:
+	 * a state the transfer passes, not a NACK. The SGS polling read (exynos5_i2c_xfer_msg) looks at RX empty and its deadline only; a real
+	 * NACK still ends in NO_DEV_ACK / NO_DEV in INT_STATUS (nack_at tests) or in the 10 ms timeout. This read must succeed. */
+	world(); lose_mid_at = 2; mid_state = 0xBu;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && violations == 0 && has("src=fg") && !has("refused") && restore_tail() && as_before());
 	world(); lose_mid_at = 2;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && violations == 0 && has("src=fg") && !has("refused") && restore_tail() && as_before());
 	world(); abort_at = 2;
