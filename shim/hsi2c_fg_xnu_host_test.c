@@ -47,6 +47,10 @@
 #define MBUSY		0x20000u	/* TRANS_STATUS MASTER_BUSY bit 17 */
 
 static const uint8_t SEVEN[7] = { 0x06, 0x08, 0x09, 0x0A, 0x0B, 0x35, 0x21 };	/* RepSOC Temp VCell Current AvgCurrent FullCapRep DevName */
+/* C6: the charger 0x69 bytes (INT_OK DETAILS_00..03 CNFG_00 CNFG_02 CNFG_09, BMS max77759_A1_regs.h) */
+static const uint8_t CHG8[8] = { 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBB, 0xC2 };
+#define ADDR_FG		0x0000D800u	/* 0x36 << 10 */
+#define ADDR_CHG	0x0001A400u	/* 0x69 << 10 */
 
 /* ---- the fake controller ---- */
 static struct {
@@ -56,7 +60,10 @@ static struct {
 	int held;
 	int run_sticks;
 	unsigned ptr; int have_ptr;
+	uint32_t ptr_addr;	/* ADDR when the pointer byte went out */
 } h;
+static uint8_t cgv[256];
+static int cgv_known[256];
 static uint16_t fgv[256];
 static int fgv_known[256];
 static struct { uint32_t off, v; } wlog[512];
@@ -146,8 +153,8 @@ static void start(uint32_t a)
 	unsigned len = a & 0xffffu;
 
 	nruns++;
-	if (h.addr != 0x0000D800u)
-		violate("MASTER_RUN while ADDR does not hold exactly 0x36 << 10");
+	if (h.addr != ADDR_FG && h.addr != ADDR_CHG)
+		violate("MASTER_RUN while ADDR holds neither 0x36 << 10 nor 0x69 << 10");
 	if (len == 0 || len > 2)
 		violate("a transfer length other than 1 (pointer) or 2 (data)");
 	if (nack_at == nruns) {
@@ -176,17 +183,25 @@ static void start(uint32_t a)
 		violate("read message without RXCHON only");
 	if (!(a & STOP))
 		violate("the data read must STOP");
-	if (len != 2)
-		violate("the data read must be 2 bytes");
+	if (h.addr != h.ptr_addr)
+		violate("a read from another device than the pointer write");
+	if (len != (h.addr == ADDR_CHG ? 1u : 2u))
+		violate("the data read must be 2 bytes (gauge) or 1 byte (charger)");
 	h.held = 0;
 	if (rxtimeout_at == nruns)
 		return;
-	if (!h.have_ptr || !fgv_known[h.ptr])
-		violate("read of a register the fake gauge does not have");
-	if (lose_mid_at == nruns)
-		lose_left = 4;
-	h.rx[h.nrx++] = (uint8_t)(fgv[h.ptr] & 0xff);
-	h.rx[h.nrx++] = (uint8_t)(fgv[h.ptr] >> 8);
+	if (h.addr == ADDR_CHG) {
+		if (!h.have_ptr || !cgv_known[h.ptr])
+			violate("read of a register the fake charger does not have");
+		h.rx[h.nrx++] = cgv[h.ptr];
+	} else {
+		if (!h.have_ptr || !fgv_known[h.ptr])
+			violate("read of a register the fake gauge does not have");
+		if (lose_mid_at == nruns)
+			lose_left = 4;
+		h.rx[h.nrx++] = (uint8_t)(fgv[h.ptr] & 0xff);
+		h.rx[h.nrx++] = (uint8_t)(fgv[h.ptr] >> 8);
+	}
 	h.ist |= DONE;
 	if (!busy_after_read)
 		h.trans &= ~MBUSY;
@@ -222,10 +237,18 @@ static int f_wr32(void *ctx, uint32_t off, uint32_t v)
 	case R_TX: {
 		int ok = 0;
 
-		for (unsigned i = 0; i < 7; i++)
-			ok |= v == SEVEN[i];
-		if (!ok)
-			violate("a register pointer outside the seven");
+		if (h.addr == ADDR_CHG) {
+			for (unsigned i = 0; i < 8; i++)
+				ok |= v == CHG8[i];
+			if (!ok)
+				violate("a charger register pointer outside the eight");
+		} else {
+			for (unsigned i = 0; i < 7; i++)
+				ok |= v == SEVEN[i];
+			if (!ok)
+				violate("a register pointer outside the seven");
+		}
+		h.ptr_addr = h.addr;
 		if (!(h.aconf & RUN) && !h.run_sticks)
 			violate("TX byte with no write message running");
 		if (h.nrx || (h.aconf & RW))
@@ -352,6 +375,11 @@ static void world(void)
 	h.trans = 0x00080001; h.addr = 0x00009400; h.inten = 0x80; h.ist = 0; h.err = 0; h.usicon = 0;
 	memset(fgv, 0, sizeof(fgv));
 	memset(fgv_known, 0, sizeof(fgv_known));
+	memset(cgv, 0, sizeof(cgv));
+	memset(cgv_known, 0, sizeof(cgv_known));
+	cgv[0xB4] = 0x58; cgv[0xB5] = 0x60; cgv[0xB6] = 0x34; cgv[0xB7] = 0x20; cgv[0xB8] = 0x00; cgv[0xB9] = 0x05; cgv[0xBB] = 0x14; cgv[0xC2] = 0x13;
+	for (unsigned i = 0; i < 8; i++)
+		cgv_known[CHG8[i]] = 1;
 	fgv[0x06] = 0x3E6D;	/* oriole-fg1: 62.42 % */
 	fgv[0x08] = 0x1D79;	/* 29.4 C */
 	fgv[0x09] = 0xC6B8;	/* 3974 mV */
@@ -494,6 +522,34 @@ int main(void)
 	/* C5: the last plausible set is kept for the iOS power source (sweet_batt_sample); no hardware access */
 	EXPECT(st.last.valid == 1 && st.last.soc_centi == 6242 && st.last.mv == 3974 && st.last.ma == -144 && st.last.t_deci == 294 && st.last.devname == 0x6200);
 	EXPECT(st.last.seq == 2);
+
+	EXPECT(!has("SWEET CHARGER"));	/* C6 off (sweetbatt=1): no charger traffic */
+
+	/* C6 (sweetbatt=2): the seven gauge reads, then the eight charger bytes from 0x69, one byte each; no other device, no write to 0x69 */
+	world(); st.chg = 1;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && violations == 0 && nruns == 2 * 7 + 2 * 8 && nw == 15 * 17 + 6 && restore_tail() && as_before());
+	EXPECT(has("SWEET CHARGER: raw B4=58 B5=60 B6=34 B7=20 B8=00 B9=05 BB=14 C2=13"));
+	EXPECT(has("SWEET CHARGER: mode=0x5 chgin_dtls=3 chg_dtls=0x4 bat_dtls=3 chgin_sts=1 chgcc=0x14 chgin_ilim=0x13"));
+	EXPECT(has("src=fg") && st.last.valid == 1 && st.stopped == 0);
+	/* a charger NACK stops the reader like a gauge NACK */
+	world(); st.chg = 1; nack_at = 2 * 7 + 1;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && has("refused CHG INT_OK reg=0xB4 nack") && restore_tail() && st.stopped);
+	/* the allowlist binds each pointer set to its device and each read length to its device */
+	world();
+	{
+		uint32_t fs = 0x01000100u;	/* FIFO_STATUS: TX empty, level 0 */
+		EXPECT(sfg_w32_allowed(&cfg, R_TX, fs, 0xB9u, ADDR_CHG, 0) == 1);
+		EXPECT(sfg_w32_allowed(&cfg, R_TX, fs, 0x06u, ADDR_CHG, 0) == 0);
+		EXPECT(sfg_w32_allowed(&cfg, R_TX, fs, 0xB9u, ADDR_FG, 0) == 0);
+		EXPECT(sfg_w32_allowed(&cfg, R_TX, fs, 0x06u, ADDR_FG, 0) == 1);
+		EXPECT(sfg_w32_allowed(&cfg, R_TX, fs, 0xB0u, ADDR_CHG, 0) == 0);	/* clear-on-read interrupt byte: never */
+		EXPECT(sfg_w32_allowed(&cfg, R_ADDR, 0, ADDR_CHG, 0, 0x9400u) == 1);
+		EXPECT(sfg_w32_allowed(&cfg, R_ADDR, 0, 0x66u << 10, 0, 0x9400u) == 0);	/* the PMIC: never */
+		EXPECT(sfg_w32_allowed(&cfg, R_AUTO, cfg.v_auto_rc, cfg.v_auto_rc | cfg.v_run, ADDR_CHG, 0x00030001u) == 1);
+		EXPECT(sfg_w32_allowed(&cfg, R_AUTO, cfg.v_auto_rc, cfg.v_auto_rc | cfg.v_run, ADDR_FG, 0x00030001u) == 0);
+		EXPECT(sfg_w32_allowed(&cfg, R_AUTO, cfg.v_auto_r, cfg.v_auto_r | cfg.v_run, ADDR_CHG, 0x00030001u) == 0);
+		EXPECT(sfg_w32_allowed(&cfg, R_AUTO, cfg.v_auto_w, cfg.v_auto_w | cfg.v_run, ADDR_CHG, 0x00030001u) == 1);
+	}
 
 	/* MASTER_RUN stays set after a transfer (the other guess) -> the same writes, still ok */
 	world(); h.run_sticks = 1;
@@ -647,11 +703,13 @@ int main(void)
 		/* no other device: every 7-bit address but 0x36 in the master field is refused (0x69 charger, 0x66 PMIC, 0x57, 0x35 OVP). The one
 		 * exception is the snapshot itself: the bootloader leaves ADDR = 0x9400 (= 0x25 << 10, the TCPC, runs oriole-peri1/fg1), and the
 		 * restore writes it back WITHOUT MASTER_RUN (no transfer; RUN needs ADDR = 0xD800, checked below), exactly as the shim does. */
+		/* C6: 0x69 (the charger) is the second allowed address, for its read-only status bytes (the TX and AUTO_CONF checks bind
+		 * pointers and lengths to it, test above) */
 		for (uint32_t a = 0; a < 0x80; a++)
-			if (a != 0x36 && a != 0x25)
+			if (a != 0x36 && a != 0x25 && a != 0x69)
 				EXPECT(sfg_w32(&r, 0x70, a << 10) == -2);
 		EXPECT(nw == 0);
-		EXPECT(sfg_w32(&r, 0x70, 0x69u << 10) == -2 && sfg_w32(&r, 0x70, 0x66u << 10) == -2 &&
+		EXPECT(sfg_w32(&r, 0x70, 0x66u << 10) == -2 &&
 		       sfg_w32(&r, 0x70, 0x57u << 10) == -2 && sfg_w32(&r, 0x70, 0x35u << 10) == -2 && sfg_w32(&r, 0x70, 0x0000D801) == -2 &&
 		       sfg_w32(&r, 0x70, 0x0700D800) == -2);
 		/* AUTO_CONF: no write message with data bytes (length 2 without READ_WRITE), no RUN without the config write and ADDR = 0x36 */

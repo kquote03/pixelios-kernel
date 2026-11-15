@@ -22,13 +22,13 @@ PATCH = os.path.join(ROOT, "xnu", "patches", "0148-sweet-hsi2c-fg.patch")
 
 # sha256[:16] of the whitespace-free text of each pinned function (signature through closing brace, comments stripped)
 PINNED = {
-    "sfg_w32_allowed": "343886a3aece0816",
-    "sfg_w32": "d67bb34482274caa",
+    "sfg_w32_allowed": "0b63417b0393e2f6",
+    "sfg_w32": "8daafcc139367d3f",
     "sfg_reg_writable": "1d158f119ae3aa13",
     "sfg_rd_ok": "b6b7959a760d7362",
-    "sfg_derive": "505319c0f7f55498",
+    "sfg_derive": "a87da7fa10e58434",
     "sfg_restore": "182e9de8d5de0440",
-    "sfg_msg_start": "24cd1f91ce953cc1",
+    "sfg_msg_start": "2a64ec3689e2b192",
 }
 F5_NOBUS = ("sfg_stage", "sfg_stage_name", "sfg_why_name", "sfg_diag_lines", "sfg_late")
 W32_SITES = {"sfg_msg_start": 7, "sfg_xfer": 3, "sfg_restore": 6}
@@ -37,10 +37,10 @@ REGS_TEXT = ("#define SFG_REGS(X) X(REPSOC, 0x06u) X(TEMP, 0x08u) X(VCELL, 0x09u
 # every loop of the header, per function: fixed-count loops (cfg checks, the seven registers, two bytes), the text helpers, and the three
 # waits that are bounded by SFG_POLLS / SFG_TICK_SPINS AND the counter
 LOOPS_OK = {"sfg_cfg_load": 4, "sfg_txt": 1, "sfg_hex": 1, "sfg_dec": 2, "sfg_wait": 1, "sfg_xfer": 1, "sfg_idle_wait": 1, "sfg_counter_runs": 1,
-            "sfg_set": 3}
+            "sfg_set": 5, "sfg_charger_lines": 1}   # C6: sfg_set +2 (craw zeroing, the charger reads), the charger print loop
 SET_ORDER = ["if(st->stopped)return1;", "if(!o->freq_hz)returnsfg_refuse(", "if(!sfg_counter_runs(&r))returnsfg_refuse(", "why=sfg_gate(&r);",
              "why=sfg_pads(&r);", "if(!sfg_r32(&r,SFG_SP_I2C,c->o_ctl,&r.s.ctl)", "why=sfg_precondition(c,&r.s);", "if(why)returnsfg_refuse(st,o,why);",
-             "for(i=0;i<SFG_NREGS&&e==SFG_OK;i++){", "restored=sfg_restore(&r,first||e!=SFG_OK);"]
+             "for(i=0;i<SFG_NREGS&&e==SFG_OK;i++){", "for(i=0;st->chg&&i<SFG_NCREGS&&e==SFG_OK;i++){", "restored=sfg_restore(&r,first||e!=SFG_OK);"]
 
 
 def new_file(text, path):
@@ -145,7 +145,11 @@ def check_header(src, pinned=PINNED):
     if (REGS_TEXT + chr(10)) not in src or "_Static_assert(SFG_NREGS == 7," not in src or "#define SFG_DEV_ADDR7\t0x36u" not in src:
         raise AssertionError("header: the device allowlist {0x36} and the seven registers are pinned")
     n = norm(code)
-    for need in ('_Static_assert(SFG_DEV_ADDR7==0x36u,', "SFG_DEV_ADDR7!=0x69u&&SFG_DEV_ADDR7!=0x66u&&SFG_DEV_ADDR7!=0x25u&&SFG_DEV_ADDR7!=0x57u&&SFG_DEV_ADDR7!=0x35u",
+    # C6 (sweetbatt=2): the allowlist is {0x36, 0x69}; the charger part is reads of the eight pinned status bytes, one data byte each
+    for need in ('_Static_assert(SFG_DEV_ADDR7==0x36u&&SFG_CHG_ADDR7==0x69u,', "#defineSFG_CHG_ADDR70x69u", "#defineSFG_CHG_BYTES1u",
+                 "#defineSFG_CREGS(X)X(INT_OK,0xB4u)X(DETAILS_00,0xB5u)X(DETAILS_01,0xB6u)X(DETAILS_02,0xB7u)X(DETAILS_03,0xB8u)X(CNFG_00,0xB9u)", "X(CNFG_02,0xBBu)X(CNFG_09,0xC2u)#defineSFG_CHG_BYTES1u",
+                 "#defineSFG_CRANGE(n,r)_Static_assert((r)>=0xB4u&&(r)<=0xCCu,", "_Static_assert(SFG_NCREGS==8,",
+                 "SFG_CHG_ADDR7!=0x66u&&SFG_CHG_ADDR7!=0x25u&&SFG_CHG_ADDR7!=0x57u&&SFG_CHG_ADDR7!=0x35u", "SFG_DEV_ADDR7!=0x69u&&SFG_DEV_ADDR7!=0x66u&&SFG_DEV_ADDR7!=0x25u&&SFG_DEV_ADDR7!=0x57u&&SFG_DEV_ADDR7!=0x35u",
                  "#defineSFG_RANGE(n,r)_Static_assert((r)<=0x4Fu,", "#defineSFG_LEN_PTR1u", "#defineSFG_VAL_BYTES2u",
                  "if(c->addr7!=SFG_DEV_ADDR7)return", "if(c->regs[i]!=sfg_reg_ptr(i))return"):
         if need not in n:
@@ -159,8 +163,9 @@ def check_header(src, pinned=PINNED):
     if len(re.findall(r"\bsfg_r32\s*\(", code[pa:pb])) != 4 or re.search(r"\bsfg_w32\s*\(", code[pa:pb]):
         raise AssertionError("header: sfg_poll reads exactly INT_STATUS, FIFO_STATUS, TRANS_STATUS, ERR_STATUS and writes nothing")
     xa, xb = func_span(code, "sfg_xfer")
-    if not norm(code[xa:xb]).startswith("staticintsfg_xfer(conststructsfg_run*r,enumsfg_regreg,uint32_t*raw)"):
-        raise AssertionError("header: sfg_xfer takes an enum sfg_reg (no pointer byte or data byte from the caller)")
+    # C6: an index into the pinned table of r->dev; the pointer byte and the read length are looked up, never passed in
+    if not norm(code[xa:xb]).startswith("staticintsfg_xfer(conststructsfg_run*r,unsignedidx,uint32_t*raw){constuint32_tptr=r->dev?sfg_creg_ptr(idx):sfg_reg_ptr(idx);constunsignednbytes=r->dev?SFG_CHG_BYTES:SFG_VAL_BYTES;"):
+        raise AssertionError("header: sfg_xfer takes a register index (no pointer byte or data byte from the caller)")
     loops = len(re.findall(r"\b(?:while|for)\b", code))
     if loops != sum(LOOPS_OK.values()):
         raise AssertionError(f"header: exactly {sum(LOOPS_OK.values())} loops (bounded waits, text helpers, fixed-count loops), found {loops}")
@@ -237,7 +242,14 @@ HDR_MUTANTS = [
     ("no stop latch", "\tif (st->stopped)\n\t\treturn 1;\n\tr.o = o;", "\tr.o = o;"),
     ("gate after the controller reads", "\twhy = sfg_gate(&r);\n\tif (why)\n\t\treturn sfg_refuse(st, o, why);\n", ""),
     ("restore only on success", "restored = sfg_restore(&r, first || e != SFG_OK);", "restored = e == SFG_OK ? sfg_restore(&r, first) : 1;"),
-    ("a data byte from the caller", "sfg_xfer(const struct sfg_run *r, enum sfg_reg reg, uint32_t *raw)", "sfg_xfer(const struct sfg_run *r, uint32_t reg, uint32_t *raw)"),
+    ("a data byte from the caller", "\tconst uint32_t ptr = r->dev ? sfg_creg_ptr(idx) : sfg_reg_ptr(idx);", "\tconst uint32_t ptr = idx;"),
+    # C6 (charger 0x69, reads only)
+    ("C6 1-byte read towards the gauge", "(v == (c->v_auto_rc | c->v_run) && addr == c->v_addr_c)", "(v == (c->v_auto_rc | c->v_run))"),
+    ("C6 charger pointer to any device", "(addr == c->v_addr_c && sfg_is_creg_ptr(v))", "sfg_is_creg_ptr(v)"),
+    ("C6 2-byte read towards the charger", "(v == (c->v_auto_r | c->v_run) && addr == c->v_addr)", "(v == (c->v_auto_r | c->v_run))"),
+    ("C6 an interrupt byte", "X(INT_OK, 0xB4u)", "X(INT_OK, 0xB0u)"),
+    ("C6 charger reads without sweetbatt=2", "for (i = 0; st->chg && i < SFG_NCREGS", "for (i = 0; i < SFG_NCREGS"),
+    ("C6 the PMIC address", "#define SFG_CHG_ADDR7\t0x69u", "#define SFG_CHG_ADDR7\t0x66u"),
     ("F5 diag reads a register", "\tuint64_t dt = r->o->now(r->o->ctx) - t0;\n", "\tuint64_t dt = r->o->now(r->o->ctx) - t0;\n\tuint32_t x = 0;\n\n\t(void)sfg_r32(r, SFG_SP_I2C, r->c->o_ctl, &x);\n"),
     ("F5 diag prints with a bus write", "\tsfg_txt(&b, \" ERR=\");\n", "\t(void)sfg_w32(0, 0u, 0u);\n\tsfg_txt(&b, \" ERR=\");\n"),
     ("a fifth poll read", "sfg_r32(r, SFG_SP_I2C, c->o_err, &err);\n", "sfg_r32(r, SFG_SP_I2C, c->o_err, &err) && sfg_r32(r, SFG_SP_I2C, c->o_conf, &err);\n"),

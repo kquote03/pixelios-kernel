@@ -116,7 +116,7 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
  	fReal = real == 1 && sweet_spmi_init() == 0;
 +	int gauge = 0;
 +	(void)PE_parse_boot_argn("sweetbatt", &gauge, sizeof(gauge));
-+	fGauge = !fReal && gauge == 1;	/* patch 0153: sweetbatt=1 (0148 reader) feeds this source */
++	fGauge = !fReal && (gauge == 1 || gauge == 2);	/* patch 0153: sweetbatt=1 or 2 (0148 reader) feeds this source */
  	/* Publish a complete source BEFORE registerService wakes powerd. */
  	poll();
 -	if (fReal) {

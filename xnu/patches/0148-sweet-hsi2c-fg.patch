@@ -24,7 +24,7 @@ diff --git a/bsd/dev/sweet_hsi2c.c b/bsd/dev/sweet_hsi2c.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_hsi2c.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,259 @@
 +/*
 + * xnu patch 0148: READ-ONLY MAX77759 fuel-gauge reader over HSI2C12 (oriole), glue for bsd/dev/sweet_hsi2c_fg.h. Inert unless boot-arg
 + * sweetbatt=1 AND the ADT node /sweet-batt (tools/mkadt.py, boards whose board.json has an fg block): without both nothing is mapped and
@@ -208,10 +208,11 @@ new file mode 100644
 +	if (!PE_parse_boot_argn("sweetbatt", &on, sizeof(on)) || on == 0) {
 +		return;         /* default: no map, no read */
 +	}
-+	if (on != 1) {
-+		printf("SWEET BATTERY: refused sweetbatt=%u (only 1 is defined), not touched\n", on);
++	if (on != 1 && on != 2) {
++		printf("SWEET BATTERY: refused sweetbatt=%u (only 1 and 2 are defined), not touched\n", on);
 +		return;
 +	}
++	sb.st.chg = on == 2;    /* C6: 2 = also the charger 0x69 status bytes (reads only) */
 +	if (SecureDTLookupEntry(NULL, "/sweet-batt", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
 +	    compat == NULL || csize < sizeof(SB_COMPAT) || strncmp(compat, SB_COMPAT, sizeof(SB_COMPAT)) != 0) {
@@ -287,7 +288,7 @@ diff --git a/bsd/dev/sweet_hsi2c_fg.h b/bsd/dev/sweet_hsi2c_fg.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_hsi2c_fg.h
-@@ -0,0 +1,1026 @@
+@@ -0,0 +1,1138 @@
 +/*
 + * sweet_hsi2c_fg.h - xnu patch 0148: READ-ONLY fuel-gauge reader over HSI2C12 (MAX77759 fuel gauge, 7-bit 0x36), boot-arg sweetbatt=1.
 + * Pure C: no MMIO, no kernel call. Every bus access goes through struct sfg_ops (bsd/dev/sweet_hsi2c.c maps the blocks); every store goes
@@ -326,7 +327,21 @@ new file mode 100644
 +#define SFG_LEN_PTR	1u		/* reg_bits 8: one pointer byte (BMS max_m5.c:1616) */
 +#define SFG_VAL_BYTES	2u		/* val_bits 16 (BMS max_m5.c:1617) */
 +
-+_Static_assert(SFG_DEV_ADDR7 == 0x36u, "the device allowlist is exactly {0x36}");
++/* C6 (plan oneshot-2), boot-arg sweetbatt=2: READ-only charger status bytes. MAX77759 charger at 0x69 on the same hsi2c_12 (VDT
++ * gs101-raviole-battery.dtsi:208-211); regmap reg_bits 8, val_bits 8 (BMS max77759_charger.c:2909-2913): one pointer byte, then ONE data
++ * byte with a repeated start. Only registers inside max77759_chg_is_reg 0xB0..0xCC (:2904-2907), never the clear-on-read interrupt bytes
++ * 0xB0..0xB3; addresses BMS max77759_A1_regs.h:1379 (INT_OK), :1454/:1505/:1543/:1588 (DETAILS_00..03), :1632 (CNFG_00), :1729 (CNFG_02),
++ * :2024 (CNFG_09). Nothing is ever written to 0x69 except these pointer bytes. */
++#define SFG_CHG_ADDR7	0x69u
++#define SFG_CREGS(X) X(INT_OK, 0xB4u) X(DETAILS_00, 0xB5u) X(DETAILS_01, 0xB6u) X(DETAILS_02, 0xB7u) X(DETAILS_03, 0xB8u) X(CNFG_00, 0xB9u) \
++	X(CNFG_02, 0xBBu) X(CNFG_09, 0xC2u)
++#define SFG_CHG_BYTES	1u
++#define SFG_CRANGE(n, r) _Static_assert((r) >= 0xB4u && (r) <= 0xCCu, #n " must lie in 0xB4..0xCC (max77759_chg_is_reg, no interrupt byte)");
++SFG_CREGS(SFG_CRANGE)
++#undef SFG_CRANGE
++
++_Static_assert(SFG_DEV_ADDR7 == 0x36u && SFG_CHG_ADDR7 == 0x69u, "the device allowlist is exactly {0x36, 0x69 (C6, reads only)}");
++_Static_assert(SFG_CHG_ADDR7 != 0x66u && SFG_CHG_ADDR7 != 0x25u && SFG_CHG_ADDR7 != 0x57u && SFG_CHG_ADDR7 != 0x35u, "never the PMIC, TCPC, PCA9468 or OVP");
 +_Static_assert(SFG_DEV_ADDR7 != 0x69u && SFG_DEV_ADDR7 != 0x66u && SFG_DEV_ADDR7 != 0x25u && SFG_DEV_ADDR7 != 0x57u && SFG_DEV_ADDR7 != 0x35u,
 +    "never the charger 0x69, the PMIC 0x66, the TCPC 0x25, the PCA9468 0x57 or the OVP 0x35 (board.json notes.fg)");
 +#define SFG_RANGE(n, r) _Static_assert((r) <= 0x4Fu, #n " must lie in the plain readable range 0x00..0x4F of max_m5_is_reg (BMS max_m5.c:1595)");
@@ -358,6 +373,41 @@ new file mode 100644
 +	SFG_REGS(SFG_ISPTR)
 +#undef SFG_ISPTR
 +	return 0;
++}
++
++enum sfg_creg {
++#define SFG_CENUM(n, r) SFG_C_##n,
++	SFG_CREGS(SFG_CENUM)
++#undef SFG_CENUM
++	SFG_NCREGS
++};
++_Static_assert(SFG_NCREGS == 8, "eight charger bytes");
++
++static uint32_t
++sfg_creg_ptr(unsigned i)
++{
++#define SFG_CPTR(n, r) if (i == SFG_C_##n) return (r);
++	SFG_CREGS(SFG_CPTR)
++#undef SFG_CPTR
++	return 0xFFu;
++}
++
++static int
++sfg_is_creg_ptr(uint32_t v)
++{
++#define SFG_ISCPTR(n, r) if (v == (r)) return 1;
++	SFG_CREGS(SFG_ISCPTR)
++#undef SFG_ISCPTR
++	return 0;
++}
++
++static const char *
++sfg_creg_name(unsigned i)
++{
++#define SFG_CNAME(n, r) if (i == SFG_C_##n) return #n;
++	SFG_CREGS(SFG_CNAME)
++#undef SFG_CNAME
++	return "?";
 +}
 +
 +/* ---- bus spaces the glue maps; the header asks only for the words sfg_rd_ok() names ---- */
@@ -392,6 +442,7 @@ new file mode 100644
 +	/* derived once by sfg_cfg_load() (formulas in sfg_derive) */
 +	uint32_t v_ctl_tx, v_ctl_rx, v_fifo_w, v_fifo_r, v_int_en, v_addr, v_auto_w, v_auto_r, v_run, ctl_ch, int_nack, int_errs, conf_modes,
 +	    fs_fulls, tr_busy, addr_mas_mask;
++	uint32_t v_addr_c, v_auto_rc, v_fifo_rc;	/* C6: the charger 0x69 and its one-byte read */
 +};
 +
 +/* the u32 properties: X(field, "name", count) */
@@ -445,6 +496,9 @@ new file mode 100644
 +	c->v_addr = SFG_DEV_ADDR7 << c->f_mas_shift;
 +	c->v_auto_w = SFG_LEN_PTR;
 +	c->v_auto_r = SFG_BIT(c->b_rw) | SFG_BIT(c->b_stop) | SFG_VAL_BYTES;
++	c->v_addr_c = SFG_CHG_ADDR7 << c->f_mas_shift;
++	c->v_auto_rc = SFG_BIT(c->b_rw) | SFG_BIT(c->b_stop) | SFG_CHG_BYTES;
++	c->v_fifo_rc = SFG_BIT(c->b_rxfifo_en) | SFG_BIT(c->b_txfifo_en) | (SFG_CHG_BYTES << c->f_rx_trig) | (SFG_CHG_BYTES << c->f_tx_trig);
 +	c->v_run = SFG_BIT(c->b_run);
 +	c->ctl_ch = SFG_BIT(c->b_txchon) | SFG_BIT(c->b_rxchon);
 +	c->int_nack = SFG_BIT(c->b_nodevack) | SFG_BIT(c->b_nodev);
@@ -503,7 +557,7 @@ new file mode 100644
 +	if (c->b_master == c->b_rxchon || c->b_master == c->b_txchon || c->b_rxchon == c->b_txchon || c->b_rw == c->b_stop || c->b_rw == c->b_run ||
 +	    c->b_stop == c->b_run || c->b_done == c->b_nodevack || c->b_mbusy == c->b_sbusy)
 +		return "two bits of one register are equal";
-+	if (c->f_mas_shift >= 32u || c->f_addr_mask < SFG_DEV_ADDR7 || ((c->f_addr_mask << c->f_mas_shift) >> c->f_mas_shift) != c->f_addr_mask ||
++	if (c->f_mas_shift >= 32u || c->f_addr_mask < SFG_CHG_ADDR7 || ((c->f_addr_mask << c->f_mas_shift) >> c->f_mas_shift) != c->f_addr_mask ||
 +	    c->f_rx_trig > 24u || c->f_tx_trig > 24u || c->f_rx_lvl > 24u ||
 +	    c->f_lvl_mask == 0u || c->f_lvl_mask > 0xFFu || c->tx_depth == 0u || c->tx_depth > c->f_lvl_mask || c->f_len_mask < SFG_VAL_BYTES ||
 +	    c->f_st_mask == 0u || c->f_st_mask > 0xFFu)
@@ -665,6 +719,7 @@ new file mode 100644
 +	const struct sfg_cfg *c;
 +	struct sfg_snap s;
 +	struct sfg_diag *d;
++	int dev;		/* C6: 0 = the gauge 0x36, 1 = the charger 0x69 (selects ADDR, read length, pointer set) */
 +};
 +
 +/* the words a read may target; everything else is refused before the bus (RX_DATA only through sfg_rx_pop, TX_DATA never) */
@@ -727,18 +782,19 @@ new file mode 100644
 +	if (off == c->o_ctl)
 +		return v == c->v_ctl_tx || v == c->v_ctl_rx || (v == rv && (v & ~c->ctl_ch) == SFG_BIT(c->b_master));
 +	if (off == c->o_fifo_ctl)
-+		return v == c->v_fifo_w || v == c->v_fifo_r || v == rv;
++		return v == c->v_fifo_w || v == c->v_fifo_r || v == c->v_fifo_rc || v == rv;
 +	if (off == c->o_int_en)
 +		return v == c->v_int_en || v == rv;
 +	if (off == c->o_addr)
-+		return v == c->v_addr || (v == rv && (v & ~c->addr_mas_mask) == 0u);
-+	if (off == c->o_auto)
-+		return v == c->v_auto_w || v == c->v_auto_r || (v == rv && (v & c->v_run) == 0u) ||
-+		       ((v == (c->v_auto_w | c->v_run) || v == (c->v_auto_r | c->v_run)) && addr == c->v_addr && old == (v & ~c->v_run));
++		return v == c->v_addr || v == c->v_addr_c || (v == rv && (v & ~c->addr_mas_mask) == 0u);
++	if (off == c->o_auto)	/* C6: a 2-byte read only towards 0x36, a 1-byte read only towards 0x69, the pointer write towards either */
++		return v == c->v_auto_w || v == c->v_auto_r || v == c->v_auto_rc || (v == rv && (v & c->v_run) == 0u) ||
++		       (old == (v & ~c->v_run) && ((v == (c->v_auto_w | c->v_run) && (addr == c->v_addr || addr == c->v_addr_c)) ||
++		       (v == (c->v_auto_r | c->v_run) && addr == c->v_addr) || (v == (c->v_auto_rc | c->v_run) && addr == c->v_addr_c)));
 +	if (off == c->o_int_st)
 +		return v == old;		/* write-1-to-clear of exactly the bits read (SGS :369-373, LX :272-276) */
-+	if (off == c->o_tx)
-+		return sfg_is_reg_ptr(v) && (old & c->f_lvl_mask) < c->tx_depth;
++	if (off == c->o_tx)	/* C6: the pointer set of the device ADDR names */
++		return ((addr == c->v_addr && sfg_is_reg_ptr(v)) || (addr == c->v_addr_c && sfg_is_creg_ptr(v))) && (old & c->f_lvl_mask) < c->tx_depth;
 +	return 0;
 +}
 +
@@ -753,7 +809,7 @@ new file mode 100644
 +		return -2;			/* not one of the seven registers: not even read */
 +	if (!sfg_r32(r, SFG_SP_I2C, off == c->o_tx ? c->o_fifo_st : off, &old))
 +		return -1;			/* TX_DATA: the TX FIFO level is read, never the data register */
-+	if (off == c->o_auto && !sfg_r32(r, SFG_SP_I2C, c->o_addr, &addr))
++	if ((off == c->o_auto || off == c->o_tx) && !sfg_r32(r, SFG_SP_I2C, c->o_addr, &addr))
 +		return -1;
 +	if (!sfg_w32_allowed(c, off, old, v, addr, sfg_snap_of(c, &r->s, off)))
 +		return -2;
@@ -841,23 +897,23 @@ new file mode 100644
 +	const struct sfg_cfg *c = r->c;
 +	uint32_t ist = 0, a = 0;
 +
-+	if (sfg_w32(r, c->o_fifo_ctl, rd ? c->v_fifo_r : c->v_fifo_w))			/* ref: SGS :815-825 (trigger = len, both FIFOs enabled) */
++	if (sfg_w32(r, c->o_fifo_ctl, rd ? (r->dev ? c->v_fifo_rc : c->v_fifo_r) : c->v_fifo_w))			/* ref: SGS :815-825 (trigger = len, both FIFOs enabled) */
 +		return SFG_ERROR;
 +	if (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &ist) || sfg_w32(r, c->o_int_st, ist))	/* ref: SGS :845 exynos5_i2c_clr_pend_irq, :369-373 */
 +		return SFG_ERROR;
 +	if (!sfg_r32(r, SFG_SP_I2C, c->o_int_st, &ist) || ist)				/* deviation: nothing may be pending when the transfer starts */
 +		return SFG_ERROR;
-+	if (sfg_w32(r, c->o_addr, c->v_addr))						/* ref: SGS :855-863 (MAS field = 0x36 << 10); LX :747-752 */
++	if (sfg_w32(r, c->o_addr, r->dev ? c->v_addr_c : c->v_addr))						/* ref: SGS :855-863 (MAS field = 0x36 << 10); LX :747-752 */
 +		return SFG_ERROR;
 +	if (sfg_w32(r, c->o_ctl, rd ? c->v_ctl_rx : c->v_ctl_tx))				/* ref: SGS :828-838, :865 */
 +		return SFG_ERROR;
 +	if (sfg_w32(r, c->o_int_en, c->v_int_en))						/* ref: SGS :883 (polling branch: TRANSFER_DONE only) */
 +		return SFG_ERROR;
-+	if (sfg_w32(r, c->o_auto, rd ? c->v_auto_r : c->v_auto_w))				/* ref: SGS :832/:840, :847-850, :886-888 length */
++	if (sfg_w32(r, c->o_auto, rd ? (r->dev ? c->v_auto_rc : c->v_auto_r) : c->v_auto_w))				/* ref: SGS :832/:840, :847-850, :886-888 length */
 +		return SFG_ERROR;
-+	if (!sfg_r32(r, SFG_SP_I2C, c->o_auto, &a) || a != (rd ? c->v_auto_r : c->v_auto_w))	/* ref: SGS :890 (reads it back before MASTER_RUN) */
++	if (!sfg_r32(r, SFG_SP_I2C, c->o_auto, &a) || a != (rd ? (r->dev ? c->v_auto_rc : c->v_auto_r) : c->v_auto_w))	/* ref: SGS :890 (reads it back before MASTER_RUN) */
 +		return SFG_ERROR;
-+	if (sfg_w32(r, c->o_auto, (rd ? c->v_auto_r : c->v_auto_w) | c->v_run))		/* ref: SGS :891-892 */
++	if (sfg_w32(r, c->o_auto, (rd ? (r->dev ? c->v_auto_rc : c->v_auto_r) : c->v_auto_w) | c->v_run))		/* ref: SGS :891-892 */
 +		return SFG_ERROR;
 +	return SFG_OK;
 +}
@@ -910,8 +966,11 @@ new file mode 100644
 +
 +/* One register: pointer write without STOP, repeated-start read of two bytes with STOP (GKI regmap-i2c.c:181-191). *raw = LSB first. */
 +static int
-+sfg_xfer(const struct sfg_run *r, enum sfg_reg reg, uint32_t *raw)
++sfg_xfer(const struct sfg_run *r, unsigned idx, uint32_t *raw)
 +{
++	/* C6: the index names a register of the device r->dev; the pointer byte and the length come from its table, never from the caller */
++	const uint32_t ptr = r->dev ? sfg_creg_ptr(idx) : sfg_reg_ptr(idx);
++	const unsigned nbytes = r->dev ? SFG_CHG_BYTES : SFG_VAL_BYTES;
 +	const struct sfg_cfg *c = r->c;
 +	struct sfg_st st = { 0, 0, 0 };
 +	uint32_t b = 0, v = 0;
@@ -923,7 +982,7 @@ new file mode 100644
 +	e = sfg_msg_start(r, 0);
 +	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TXROOM))
 +		e = sfg_wait(r, t0, SFG_W_TXROOM, &st);
-+	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TX) && sfg_w32(r, c->o_tx, sfg_reg_ptr(reg)))	/* ref: SGS :969-970 */
++	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TX) && sfg_w32(r, c->o_tx, ptr))	/* ref: SGS :969-970 */
 +		e = SFG_ERROR;
 +	if (e == SFG_OK && sfg_stage(r, SFG_D_PTR_TXDONE))
 +		e = sfg_wait(r, t0, SFG_W_TXDONE, &st);
@@ -935,7 +994,7 @@ new file mode 100644
 +	t0 = r->o->now(r->o->ctx);
 +	sfg_stage(r, SFG_D_RD_START);
 +	e = sfg_msg_start(r, 1);
-+	for (n = 0; e == SFG_OK && n < SFG_VAL_BYTES; n++) {
++	for (n = 0; e == SFG_OK && n < nbytes && n < SFG_VAL_BYTES; n++) {
 +		sfg_stage(r, SFG_D_RD_BYTE0 + 2u * n);
 +		e = sfg_wait(r, t0, SFG_W_RXBYTE, &st);						/* SGS :897-905 */
 +		if (e == SFG_OK && sfg_stage(r, SFG_D_RD_POP0 + 2u * n) && !sfg_rx_pop(r, &b))
@@ -1139,6 +1198,42 @@ new file mode 100644
 +	sfg_emit(r->o, &b);
 +}
 +
++/* C6: "SWEET CHARGER: raw B4=.. .. C2=.." and the decoded fields (BMS max77759_A1_regs.h: DETAILS_00 CHGIN_DTLS [6:5] :1461-1462,
++ * DETAILS_01 BAT_DTLS [6:4] :1511-1512 and CHG_DTLS [3:0] :1514-1515, DETAILS_02 CHGIN_STS [5] :1550-1551, CNFG_00 MODE [3:0] :1645-1646,
++ * CNFG_02 CHGCC [5:0] :1734-1735, CNFG_09 CHGIN_ILIM [6:0] :2030-2031); printed as register codes, not converted */
++static void
++sfg_charger_lines(const struct sfg_ops *o, const uint32_t *craw)
++{
++	struct sfg_buf b;
++	unsigned i;
++
++	b.n = 0;
++	sfg_txt(&b, "SWEET CHARGER: raw");
++	for (i = 0; i < SFG_NCREGS; i++) {
++		sfg_txt(&b, " ");
++		sfg_hex(&b, sfg_creg_ptr(i), 2);
++		sfg_txt(&b, "=");
++		sfg_hex(&b, craw[i] & 0xFFu, 2);
++	}
++	sfg_emit(o, &b);
++	b.n = 0;
++	sfg_txt(&b, "SWEET CHARGER: mode=0x");
++	sfg_hex(&b, craw[SFG_C_CNFG_00] & 0xFu, 1);
++	sfg_txt(&b, " chgin_dtls=");
++	sfg_dec(&b, (craw[SFG_C_DETAILS_00] >> 5) & 0x3u, 1);
++	sfg_txt(&b, " chg_dtls=0x");
++	sfg_hex(&b, craw[SFG_C_DETAILS_01] & 0xFu, 1);
++	sfg_txt(&b, " bat_dtls=");
++	sfg_dec(&b, (craw[SFG_C_DETAILS_01] >> 4) & 0x7u, 1);
++	sfg_txt(&b, " chgin_sts=");
++	sfg_dec(&b, (craw[SFG_C_DETAILS_02] >> 5) & 0x1u, 1);
++	sfg_txt(&b, " chgcc=0x");
++	sfg_hex(&b, craw[SFG_C_CNFG_02] & 0x3Fu, 2);
++	sfg_txt(&b, " chgin_ilim=0x");
++	sfg_hex(&b, craw[SFG_C_CNFG_09] & 0x7Fu, 2);
++	sfg_emit(o, &b);
++}
++
 +/* C5 (plan oneshot-2): the last read set as numbers, for the iOS power source (SweetBattery.cpp via sweet_batt_sample in sweet_hsi2c.c).
 + * Pure arithmetic on the raw words sfg_set already read; no hardware access. valid = 1 only when the set passes sfg_plausible
 + * (review 0148-3 H2: an implausible or changed-DevName set is logged but never published). */
@@ -1156,6 +1251,7 @@ new file mode 100644
 +	int stopped;		/* latched: no hardware access ever again this boot */
 +	unsigned sets;		/* read sets done */
 +	struct sfg_sample last;	/* C5 */
++	int chg;		/* C6: 1 = also the eight charger bytes (sweetbatt=2) */
 +};
 +
 +/* soc 0..100 %, VCell 2800..4600 mV (a 1S Li-ion cell; the same bounds as the PM6150 path in SweetBattery.cpp), Temp -20..70 C */
@@ -1220,9 +1316,9 @@ new file mode 100644
 +	struct sfg_run r;
 +	struct sfg_diag dg = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 +	struct sfg_buf b;
-+	uint32_t raw[SFG_NREGS];
++	uint32_t raw[SFG_NREGS], craw[SFG_NCREGS];
 +	const char *why;
-+	unsigned i, failed = SFG_NREGS;
++	unsigned i, failed = SFG_NREGS, cfailed = SFG_NCREGS;
 +	int e = SFG_OK, restored, first = st->sets == 0u;
 +
 +	if (st->stopped)
@@ -1230,9 +1326,12 @@ new file mode 100644
 +	r.o = o;
 +	r.c = c;
 +	r.d = &dg;
++	r.dev = 0;
 +	r.s.ctl = r.s.fifo = r.s.trail = r.s.inten = r.s.ist = r.s.err = r.s.fstat = r.s.conf = r.s.aconf = r.s.tmo = r.s.trans = r.s.addr = r.s.usicon = 0;
 +	for (i = 0; i < SFG_NREGS; i++)
 +		raw[i] = 0;
++	for (i = 0; i < SFG_NCREGS; i++)
++		craw[i] = 0;
 +	if (!o->freq_hz)
 +		return sfg_refuse(st, o, "no timer, nothing written");
 +	if (!sfg_counter_runs(&r))
@@ -1264,11 +1363,21 @@ new file mode 100644
 +	/* the seven reads, in the allowlist order; the first failure stops everything; one register transfer at a time without preemption */
 +	for (i = 0; i < SFG_NREGS && e == SFG_OK; i++) {
 +		o->crit(o->ctx, 1);
-+		e = sfg_xfer(&r, (enum sfg_reg)i, &raw[i]);
++		e = sfg_xfer(&r, i, &raw[i]);
 +		o->crit(o->ctx, 0);
 +		if (e != SFG_OK)
 +			failed = i;
 +	}
++	/* C6: then the charger bytes, the same transfer with ADDR 0x69 and a one-byte read; the first failure stops everything too */
++	r.dev = 1;
++	for (i = 0; st->chg && i < SFG_NCREGS && e == SFG_OK; i++) {
++		o->crit(o->ctx, 1);
++		e = sfg_xfer(&r, i, &craw[i]);
++		o->crit(o->ctx, 0);
++		if (e != SFG_OK)
++			cfailed = i;
++	}
++	r.dev = 0;
 +
 +	/* ALWAYS put the controller back (a write was attempted on every path that reaches here) */
 +	o->crit(o->ctx, 1);
@@ -1297,9 +1406,11 @@ new file mode 100644
 +	if (e != SFG_OK) {
 +		sfg_diag_lines(o, &dg);
 +		sfg_start(&b, "refused ");
-+		sfg_txt(&b, sfg_reg_name(failed));
++		sfg_txt(&b, failed < SFG_NREGS ? sfg_reg_name(failed) : "CHG ");
++		if (failed >= SFG_NREGS)
++			sfg_txt(&b, sfg_creg_name(cfailed));
 +		sfg_txt(&b, " reg=0x");
-+		sfg_hex(&b, sfg_reg_ptr(failed), 2);
++		sfg_hex(&b, failed < SFG_NREGS ? sfg_reg_ptr(failed) : sfg_creg_ptr(cfailed), 2);
 +		sfg_txt(&b, e == SFG_NACK ? " nack" : e == SFG_TIMEOUT ? " timeout" : " error");
 +		sfg_txt(&b, restored ? " restore=ok" : " restore=FAILED");
 +		sfg_emit(o, &b);
@@ -1307,6 +1418,8 @@ new file mode 100644
 +		return 1;
 +	}
 +	sfg_battery_line(&r, raw);
++	if (st->chg)
++		sfg_charger_lines(o, craw);
 +	if (!restored)
 +		return sfg_refuse(st, o, "restore=FAILED");
 +	sfg_sample_set(st, o, c, raw);			/* C5: only after a verified restore */
