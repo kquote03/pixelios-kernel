@@ -54,6 +54,14 @@ struct fake {
 	unsigned clob_at;                               /* run C: after this store number the RAM word at backplane address clob_bp flips a bit (a later store clobbering an earlier one; 0 = never) */
 	uint32_t clob_bp;
 	unsigned link_down_at;                          /* patch 0147 F1: after this store number the link leaves L0 (ELBI 0x2C8 low bits 0x11 -> 0x10; 0 = never) */
+	/* patch 0150 (run E): a fake firmware. It starts when the CA7 wrapper gets IOCTL 0x1 out of reset (the release), writes the shared area, the console and then the
+	 * pointer into the last RAM word fw_up us after it, and appends con_more to the console at the 2 s second look. The values are synthetic (no firmware output). */
+	int released, fw_placed;
+	unsigned long rel_t, fw_up, down_after;         /* fw_up: us after the release (0 = never comes up); down_after: the link leaves L0 that many us after the release (0 = never) */
+	uint32_t fw_last, fw_ptr, fw_shared, fw_flags, fw_con, fw_buf, fw_size, fw_idx, fw_idx2;
+	const char *con_txt, *con_more;
+	unsigned bar2_stores_after_rel;                 /* BAR2 stores that reached the bus after the release (must stay 0) */
+	unsigned cfg04_writes;
 };
 
 static uint32_t *f_wrap(struct fake *f, uint32_t win)
@@ -135,6 +143,10 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	}
 	f->lastw.space = space; f->lastw.win = win; f->lastw.off = off; f->lastw.val = v;
 	f->nw++;
+	if (f->released && space == SWW_BAR2)
+		f->bar2_stores_after_rel++;
+	if (space == SWW_CFG && off == 0x04)
+		f->cfg04_writes++;
 	if (f->link_down_at && f->link_down_at == f->nw)
 		f->ltssm = (f->ltssm & ~0x3Fu) | 0x10u;
 	if (f->src_flip_at == f->nw && space == SWW_BAR2 && win == 0 && off >= SWW_RAM_BASE)
@@ -176,6 +188,10 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 		if ((wp[1] & 1u) && f->clock_us - f->assert_t[f->win0 == SWW_WIN_CA7WRAP] < 10)      /* aiutils.c:1263 OSL_DELAY(10) after the assert */
 			f->early++;
 		wp[0] = v | f->ioctl_noise;
+		if (f->win0 == SWW_WIN_CA7WRAP && v == 0x1u && !(wp[1] & 1u) && !f->released) {      /* run E: CPUHALT dropped out of reset = the firmware runs */
+			f->released = 1;
+			f->rel_t = f->clock_us;
+		}
 	}
 	if (wp && off == SWL_AGENT_RESET_CTL) {
 		if (v == 1)
@@ -195,12 +211,59 @@ static int f_map2(void *c)
 	return f->map_fail;
 }
 
+static void fw_bytes(struct fake *f, uint32_t bp, const char *t, uint32_t n)       /* little-endian bytes into the word RAM */
+{
+	uint32_t i, a;
+
+	for (i = 0; i < n; i++) {
+		a = bp + i;
+		f->ram[a / 4] = (f->ram[a / 4] & ~(0xFFu << (8 * (a & 3)))) | ((uint32_t)(uint8_t)t[i] << (8 * (a & 3)));
+	}
+}
+
+static void fw_ring(struct fake *f, uint32_t from, const char *t)                       /* text into the console ring from index `from`, wrapping at fw_size */
+{
+	uint32_t i, n = (uint32_t)strlen(t);
+
+	for (i = 0; i < n; i++)
+		fw_bytes(f, f->fw_buf + (from + i) % f->fw_size, t + i, 1);
+}
+
+static void fw_place(struct fake *f)
+{
+	uint32_t i;
+
+	f->fw_placed = 1;
+	for (i = 0; i < 16; i++)
+		f->ram[f->fw_shared / 4 + i] = 0x5300u + i;
+	f->ram[f->fw_shared / 4] = f->fw_flags;
+	f->ram[f->fw_shared / 4 + 5] = f->fw_con;
+	f->ram[f->fw_shared / 4 + 7] = 0x0B0A0C0Du;
+	f->ram[f->fw_shared / 4 + 12] = 0x0047E000u;
+	if (f->fw_con >= SWW_RAM_BASE && f->fw_con + 0x14u <= 0x600000u && !(f->fw_con & 3u)) {
+		f->ram[f->fw_con / 4 + 2] = f->fw_buf;
+		f->ram[f->fw_con / 4 + 3] = f->fw_size;
+		f->ram[f->fw_con / 4 + 4] = f->fw_idx;
+		if (f->con_txt && f->fw_size && f->fw_buf >= SWW_RAM_BASE && f->fw_buf + f->fw_size <= 0x600000u)
+			fw_ring(f, 0, f->con_txt);
+	}
+	f->ram[f->fw_last / 4] = f->fw_ptr;
+}
+
 static void f_delay(void *c, unsigned us)
 {
 	struct fake *f = c;
 	uint32_t *wp = f_wrap(f, f->win0);
 
 	f->clock_us += us;
+	if (f->released && f->fw_up && !f->fw_placed && f->clock_us - f->rel_t >= f->fw_up)
+		fw_place(f);
+	if (f->released && f->down_after && f->clock_us - f->rel_t >= f->down_after)
+		f->ltssm = (f->ltssm & ~0x3Fu) | 0x10u;
+	if (us == 2000000u && f->fw_placed && f->con_more) {             /* the second console look: new text, the index moves (and may wrap) */
+		fw_ring(f, f->fw_idx, f->con_more);
+		f->ram[f->fw_con / 4 + 4] = f->fw_idx2;
+	}
 	if (us == 1 && wp && f->after1) {              /* the 1 us after the last IOCTL write (aiutils.c:1320): the wrapper changes behind the sequence's back */
 		if (f->after1 == 1) wp[2] = 1;
 		else if (f->after1 == 2) wp[1] |= 1;
@@ -435,7 +498,7 @@ static void deny_sweep(void)
 		for (bit = 0; bit < 32; bit++) {
 			unsigned q, other = 0;
 
-			for (q = 0; q < SWT_N_A; q++)       /* the one other value a register may take (RESET_CTL 1 and 0, IOCTL 3 and 1) */
+			for (q = 0; q < SWT_N; q++)         /* the other values a register may take (RESET_CTL 1 and 0, IOCTL 3 and 1; patch 0150: CA7 IOCTL 0x3 / 0x1 of the run E release) */
 				other |= swl_wt[q].space == p->space && swl_wt[q].win == p->win && swl_wt[q].off == p->off && swl_wt[q].val == (p->val ^ (1u << bit));
 			CHECK((swl_wr_ok(p->space, p->win, p->off, p->val ^ (1u << bit)) >= 0) == (other != 0));
 		}
@@ -452,7 +515,7 @@ static void deny_sweep(void)
 	      swl_wr_ok(SWW_ATU, 0, SWW_R2(0x0C), 0) < 0 && swl_wr_ok(SWW_ATU, 0, SWW_R2(0x18), 0) < 0 && swl_wr_ok(SWW_ATU, 0, SWW_R2(0x20), 0) < 0 && swl_wr_ok(SWW_ATU, 0, 0x600, 0x80000000) < 0);
 	CHECK(swl_wr_ok(SWW_BAR0, 0x18001000, SWW_SRPWR, 0x200) < 0 && swl_wr_ok(SWW_BAR0, 0x18001000, SWW_SRPWR, 0x00030300) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x400, 1) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18126000, 0x404, 1) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x808, 1) < 0 && swl_wr_ok(SWW_BAR0, 0x18120000, 0x80C, 1) < 0 &&
-	      swl_wr_ok(SWW_BAR0, 0x18120000, 0x408, 0x03) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x408, 0x23) < 0 && swl_wr_ok(SWW_BAR0, 0x18121000, 0x800, 1) < 0 &&
+	      swl_wr_ok(SWW_BAR0, 0x18120000, 0x408, 0x03) == SWT_CAR_IOCTL_MID && swl_wt[SWT_CAR_IOCTL_MID].run == 5 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x408, 0x23) < 0 && swl_wr_ok(SWW_BAR0, 0x18121000, 0x800, 1) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18000000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18012000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0x1FFFFC, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 4, 0) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18026000, 0x40, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18026000, 0, 0) < 0);
 	/* a store that matches no row never reaches the bus and latches STOPPED */
@@ -1223,7 +1286,7 @@ static void runb_deny_sweep(void)
 	for (v = SWT_N_B; v < SWT_N_C; v++)
 		CHECK(swl_wt[v].run == 3 && swl_wt[v].row >= 11 && swl_wt[v].row <= 13 && ((swl_wt[v].space == SWW_BAR2 && swl_wt[v].win == 0x400000u) || (swl_wt[v].space == SWW_CFG && swl_wt[v].off == 0x84)));
 	/* the run D tuple: run 4, row 14, once, a reset-vector value decided at run time, BAR2 window 0 offset 0 exactly, after W13 */
-	CHECK(SWT_N == SWT_N_C + 1 && SWT_RESET0 == SWT_N_C && swl_wt[SWT_RESET0].run == 4 && swl_wt[SWT_RESET0].row == 14 && swl_wt[SWT_RESET0].space == SWW_BAR2 && swl_wt[SWT_RESET0].win == 0 && swl_wt[SWT_RESET0].off == 0 &&
+	CHECK(SWT_N_D == SWT_N_C + 1 && SWT_RESET0 == SWT_N_C && swl_wt[SWT_RESET0].run == 4 && swl_wt[SWT_RESET0].row == 14 && swl_wt[SWT_RESET0].space == SWW_BAR2 && swl_wt[SWT_RESET0].win == 0 && swl_wt[SWT_RESET0].off == 0 &&
 	      swl_wt[SWT_RESET0].hi == 0 && swl_wt[SWT_RESET0].flags == (SWT_ONCE | SWT_RV) && swl_wt[SWT_RESET0].need == SWF_W13 && swl_wt[SWT_RESET0].pred1 == 0 && swl_wt[SWT_RESET0].rgrp == 0 &&
 	      swl_wt[SWT_RESET0].vmask == 0xFFFFFFFFu && swl_wt[SWT_RESET0].omask == 0x2u && swl_wt[SWT_RESET0].oval == 0);   /* review 0132 F1 (secured bit) and F3 (whole word) */
 	/* reads: the BAR2 words of run B only at level 4, windows 0 and 0x400000, inside the table's ranges */
@@ -1650,8 +1713,10 @@ static void runc_deny_sweep(void)
 	CHECK(swl_wr_ok_from(SWT_LAST_HI + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_VARS && swl_wr_ok_from(SWT_NV_VARS + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_TOKEN && swl_wr_ok_from(SWT_NV_TOKEN + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_RTLV);
 	CHECK(swl_wr_ok_from(SWT_NV_VARS + 1, SWW_BAR2, 0x400000, 0x1FFFFCu, 5) == SWT_NV_TOKEN && swl_wr_ok_from(SWT_NV_TOKEN + 1, SWW_BAR2, 0x400000, 0x1FFFFCu, 5) < 0);
 	CHECK(swl_wr_ok(SWW_BAR2, 0, 0x3B0000u, 5) < 0 && swl_wr_ok(SWW_BAR2, 0, 0, 5) == SWT_RESET0 && swl_wr_ok(SWW_BAR2, 0, 4, 5) < 0 && swl_wr_ok(SWW_BAR2, 0x200000u, 0, 5) < 0 && swl_wr_ok(SWW_BAR0, 0x400000, 0, 5) < 0 && swl_wr_ok(SWW_ATU, 0x400000, 0, 5) < 0);
-	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL && swl_wr_ok_from(SWT_WIN2_TAIL + 1, SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL_C && swl_wr_ok_from(SWT_WIN2_TAIL_C + 1, SWW_CFG, 0, 0x84, 0x400000) < 0);
-	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO && swl_wr_ok_from(SWT_WIN2_ZERO + 1, SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO_C && swl_wr_ok_from(SWT_WIN2_ZERO_C + 1, SWW_CFG, 0, 0x84, 0) < 0);
+	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL && swl_wr_ok_from(SWT_WIN2_TAIL + 1, SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL_C && swl_wr_ok_from(SWT_WIN2_TAIL_C + 1, SWW_CFG, 0, 0x84, 0x400000) == SWT_W84_TAIL_E &&
+	      swl_wr_ok_from(SWT_W84_TAIL_E + 1, SWW_CFG, 0, 0x84, 0x400000) < 0);
+	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO && swl_wr_ok_from(SWT_WIN2_ZERO + 1, SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO_C && swl_wr_ok_from(SWT_WIN2_ZERO_C + 1, SWW_CFG, 0, 0x84, 0) == SWT_W84_ZERO_E &&
+	      swl_wr_ok_from(SWT_W84_ZERO_E + 1, SWW_CFG, 0, 0x84, 0) < 0);
 	{
 		unsigned v;
 
@@ -1659,7 +1724,7 @@ static void runc_deny_sweep(void)
 			CHECK(((swl_wt[v].flags & SWT_TW) != 0) == (v >= SWT_NV_VARS && v <= SWT_NV_RTLV) && (!(swl_wt[v].flags & SWT_TW) || (swl_wt[v].kind >= SWK_VARS && swl_wt[v].kind <= SWK_RTLV)) &&
 			      (!!(swl_wt[v].flags & SWT_TW) || swl_wt[v].kind == 0));
 	}
-	CHECK(SWT_N == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
+	CHECK(SWT_N == 34 && SWT_N_D == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
 }
 
 /* the stores that reached the bus other than the restore of cfg 0x84 (a refused store with the window moved runs that restore) */
@@ -2230,6 +2295,207 @@ static void rev_gate(void)
 	}
 }
 
+
+/* ---- patch 0150, run E (sweetwlan=7): W15 release, W16 firmware-ready poll, W17 read-only shared/console dump ---- */
+#define ELEVEL6 (CLEVEL5 | SWF_W14)
+#define ELEVEL7 (ELEVEL6 | SWF_W15 | SWF_W16 | SWF_W17)
+
+static const char con_banner[] = "\r\nRTE (PCIE-MSG) 99.9 (synthetic) on BCM4389 r1\r\nwl0: Broadcom BCM4389 802.11 Wireless Controller 99.9.9 (synthetic)\r\n\x01\x7f" "FWID 01-synthetic\r\n";
+
+static void fw_default(struct fake *f)
+{
+	f->fw_up = 300000;                  /* up 300 ms after the release */
+	f->fw_last = 0x49FFFCu;             /* ram_end 0x4a0000 (336 x 8 KiB) - 4 */
+	f->fw_shared = f->fw_ptr = 0x480000u;       /* beyond window 0: the dump needs cfg 0x84 = 0x400000 */
+	f->fw_flags = 0x00030007u;          /* version 7 */
+	f->fw_con = 0x3FFFF0u;              /* the console header straddles the window boundary (+0x10 = 0x400000) */
+	f->fw_buf = 0x420000u;              /* the buffer in the tail window (a straddling buffer is its own case) */
+	f->fw_size = 0x400u;
+	f->fw_idx = (uint32_t)strlen(con_banner);
+	f->con_txt = con_banner;
+}
+
+static int rune_run(struct fake *f, struct swl_wx *x, uint32_t len, uint32_t pin)
+{
+	return runc(f, x, 7, len, pin);
+}
+
+static int left_ok(const struct fake *f, unsigned w15_from)     /* nothing after the release is a BAR2 store, EP Command is never written, cfg 0x84 is 0 at the end */
+{
+	(void)w15_from;
+	return f->bar2_stores_after_rel == 0 && f->cfg04_writes == 0 && f->win2 == 0 && all_allowed(f);
+}
+
+static void rune(void)
+{
+	static struct fake f;
+	struct swl_wx x;
+	const uint32_t len = 1764018u, pin = 0x1153ccffu;
+	unsigned n6;
+
+	cx_init_rng();
+	mkimg(len);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, len, pin);
+	cx_hand(336);
+	/* level 6 is unchanged by patch 0150: the CA7 stays halted and nothing of run E runs */
+	obsb(&f, 336);
+	fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.flags == ELEVEL6 && f.released == 0 && f.ca.ioctl == 0x21u && strstr(logbuf, "W15") == 0 && strstr(logbuf, "level 6 done w14") != 0);
+	n6 = f.nw;
+
+	/* level 7, the whole run: release, the pointer after 300 ms, the dump; the firmware runs at the end; no BAR2 store after the release; cfg 0x84 back at 0 */
+	obsb(&f, 336);
+	fw_default(&f);
+	CHECK(rune_run(&f, &x, len, pin) == 0);
+	CHECK(x.stopped == 0 && x.flags == ELEVEL7 && x.armed == 0 && f.released == 1 && f.ca.ioctl == 0x1u && f.ca.ctl == 0 && left_ok(&f, n6) && x.w84 == 0);
+	CHECK(x.shared == 0x480000u && x.fwup_polls == 6 && x.sh[0] == 0x00030007u && x.con == 0x3FFFF0u && x.con_buf == 0x420000u && x.con_size == 0x400u);
+	CHECK(f.nw > n6 + 4 && f.nw < n6 + 40);
+	CHECK(strstr(logbuf, "W15 CA7 wrapper before release: ioctl 0x21 reset_ctl 0 reset_st 0") != 0 && strstr(logbuf, "W15 CA7 released") != 0);
+	CHECK(strstr(logbuf, "W16 last RAM word 0x49fffc = 0x00480000 after 6 polls of 50 ms (token 0xfffc0003)") != 0);
+	CHECK(strstr(logbuf, "SWEET WLAN: fw ready shared=0x480000 ver=7 flags=0x30007 console=0x3ffff0 fwid=0xb0a0c0d ring_info=0x47e000") != 0);
+	CHECK(strstr(logbuf, "SWEET WLAN: fwcon: RTE (PCIE-MSG) 99.9 (synthetic) on BCM4389 r1\n") != 0);
+	CHECK(strstr(logbuf, "SWEET WLAN: fwcon: wl0: Broadcom BCM4389 802.11 Wireless Controller 99.9.9 (synthetic)\n") != 0);
+	CHECK(strstr(logbuf, "SWEET WLAN: fwcon: FWID 01-synthetic\n") != 0 && strchr(logbuf, '\r') == 0 && strchr(logbuf, 0x7f) == 0 && strchr(logbuf, 0x01) == 0);
+	CHECK(x.con_bytes == (uint32_t)strlen(con_banner) && strstr(logbuf, "level 7 done fw ready shared=0x480000 ver=7 polls=6 console=") != 0);
+	CHECK(strstr(logbuf, "W17 done") != 0 && strstr(logbuf, "STOP") == 0);
+
+	/* the second look: new text, the index wraps the ring; only the new bytes, at most 2 KiB in all */
+	obsb(&f, 336);
+	fw_default(&f);
+	f.fw_idx = 0x3F0u;
+	f.con_txt = 0;
+	f.con_more = "0123456789abcdef wrapped line\r\n";
+	f.fw_idx2 = (0x3F0u + 31u) % 0x400u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && left_ok(&f, n6));
+	CHECK(strstr(logbuf, "console idx 15 after 2000 ms, 31 new bytes shown") != 0 && strstr(logbuf, "fwcon: 0123456789abcdef wrapped line\n") != 0 && x.con_bytes == 0x3F0u + 31u);
+	/* a huge first look is cut at 2 KiB, the second look gets nothing beyond the budget */
+	obsb(&f, 336);
+	fw_default(&f);
+	f.fw_size = 0x4000u; f.fw_buf = 0x440000u; f.fw_idx = 0x3000u; f.con_txt = 0; f.con_more = "more\r\n"; f.fw_idx2 = 0x3006u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 2048u && strstr(logbuf, "0 new bytes shown") != 0 && left_ok(&f, n6));
+
+	/* the firmware never writes the pointer: 100 polls (5 s), a clean stop; cfg 0x84 restored; the CA7 wrapper is logged as DHD does; the firmware is left running */
+	obsb(&f, 336);
+	fw_default(&f);
+	f.fw_up = 0;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_FWUP && x.stop_code == SWW_E_FWUP && x.row == 16 && f.win2 == 0 && f.bar2_stores_after_rel == 0 && f.cfg04_writes == 0 && all_allowed(&f));
+	CHECK(x.fwup_polls == 100 && strstr(logbuf, "after 100 polls") != 0 && strstr(logbuf, "W16 firmware not up: ca7 ioctl 0x1 reset_ctl 0") != 0 && strstr(logbuf, "ca7=RELEASED (firmware running)") != 0);
+	CHECK(f.clock_us - f.rel_t >= 4950000ul && f.clock_us - f.rel_t < 5100000ul);
+	/* it writes 0 back, or all ones, or a pointer outside RAM / unaligned / too close to the end: a stop before anything is read through it */
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_FWUP && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0xFFFFFFFFu;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_DEAD && left_ok(&f, n6) && strstr(logbuf, "fw ready") == 0);
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x100u;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6) && strstr(logbuf, "shared pointer 0x100 outside RAM") != 0 && strstr(logbuf, "fw ready") == 0);
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x480002u;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x49FFC4u;            /* 0x40 bytes would reach the last word */
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = f.fw_shared = 0x49FFBCu;   /* the last place that fits */
+	CHECK(rune_run(&f, &x, len, pin) == 0 && left_ok(&f, n6) && x.shared == 0x49FFBCu);
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x4A0000u;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_ptr = 0x1FFFFCu;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_SHARED && left_ok(&f, n6));
+	/* console pointer / header outside RAM: recorded, the console is not read, the run still ends done on window 0 */
+	obsb(&f, 336); fw_default(&f); f.fw_con = 0x4A0000u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && strstr(logbuf, "console pointer 0x4a0000 outside RAM") != 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_con = 0x49FFF0u;            /* +0x10 = the last word itself: outside */
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && strstr(logbuf, "console pointer") != 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_size = 0x200000u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && strstr(logbuf, "console buffer outside RAM") != 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_size = 0;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && strstr(logbuf, "console buffer outside RAM") != 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_idx = 0x400u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && strstr(logbuf, "index outside it") != 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_buf = 0x1FFF00u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.fw_buf = 0xFFFFFF00u; f.fw_size = 0x200u; f.con_txt = 0;    /* buf + size wraps 32 bits */
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && left_ok(&f, n6));
+	obsb(&f, 336); fw_default(&f); f.con_more = "x\r\n"; f.fw_idx2 = 0x400u;        /* the second index is outside the buffer */
+	CHECK(rune_run(&f, &x, len, pin) == 0 && strstr(logbuf, "second look skipped") != 0 && left_ok(&f, n6));
+	/* the link leaves L0 while polling (the firmware could take it down): stop, no TLP to the dead link; the cfg 0x84 restore is skipped then (F1) */
+	obsb(&f, 336); fw_default(&f); f.fw_up = 0; f.down_after = 120000;
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_PRE && x.row == 16 && f.bar2_stores_after_rel == 0 && f.cfg04_writes == 0 && strstr(logbuf, "W16 link precondition lost") != 0);
+	CHECK(strstr(logbuf, "skipped, link precondition") != 0 && x.restore == SWW_RS_SKIPPED);
+	obsb(&f, 336); fw_default(&f); f.down_after = 1000000;            /* down before the second console look */
+	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_PRE && x.row == 17 && strstr(logbuf, "before the second console look") != 0);
+	/* the CA7 is not in the halted state W6 leaves: no release store at all */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	f.ca.ioctl = 0x1u;
+	x.level = 7;
+	n6 = f.nw;
+	CHECK(swl_w15(&x) == -SWW_E_STATE && f.nw <= n6 + 1 && f.released == 0);
+	/* the release tuples, each gate alone (from the level-6 state, window on the CA7 wrapper) */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && f.win0 == SWW_WIN_CA7WRAP);
+	n6 = f.nw;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u) == -SWW_E_REPEAT && f.nw == n6);           /* level 6: the halt tuple is consumed, run 5 not allowed */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7; x.flags &= ~SWF_W14;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u) == -SWW_E_PHASE && f.nw == n6);            /* needs W14 */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_IOCTL, 0x3u) == -SWW_E_ORDER && f.nw == n6);              /* the assert first */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7; f.ca.ioctl = 0x1u;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u) == -SWW_E_COMP && f.nw == n6);             /* only from the halted IOCTL 0x21 */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7; f.ca.ctl = 1u;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u) == -SWW_E_OLD && f.nw == n6);              /* only from out of reset */
+	/* the run E window tuples need W15 and only move between 0 and the tail window */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7;
+	CHECK(swl_wr(&x, SWW_CFG, 0, SWW_CFG_WIN2, SWW_WIN_TAIL) == -SWW_E_PHASE && f.nw == n6);
+	obsb(&f, 336); fw_default(&f);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7; x.flags |= SWF_W15; f.win2 = SWW_WIN_TAIL;
+	CHECK(swl_wr(&x, SWW_CFG, 0, SWW_CFG_WIN2, SWW_WIN_TAIL) == -SWW_E_OLD && f.nw == n6);
+	CHECK(swl_wr_ok(SWW_CFG, 0, SWW_CFG_WIN2, 0x200000u) < 0 && swl_wr_ok(SWW_CFG, 0, 0x04, 0x6) < 0);
+	/* a read through swl_bp_rd outside the RAM is refused before the bus (address, alignment, the last word + 4) */
+	obsb(&f, 336); fw_default(&f);
+	CHECK(rune_run(&f, &x, len, pin) == 0);
+	{
+		uint32_t v = 0;
+		unsigned r0;
+
+		x.stopped = 0; r0 = f.nrd;
+		CHECK(swl_bp_rd(&x, 0x1FFFFCu, &v) == -SWW_E_SHARED && f.nrd == r0);
+		x.stopped = 0; r0 = f.nrd;
+		CHECK(swl_bp_rd(&x, 0x4A0000u, &v) == -SWW_E_SHARED && f.nrd == r0);
+		x.stopped = 0; r0 = f.nrd;
+		CHECK(swl_bp_rd(&x, 0x300002u, &v) == -SWW_E_SHARED && f.nrd == r0);
+		x.stopped = 0;
+		CHECK(swl_bp_rd(&x, 0x49FFFCu, &v) == 0 && v == 0x480000u && f.win2 == SWW_WIN_TAIL && x.w84 == SWW_WIN_TAIL);
+		CHECK(swl_bp_rd(&x, 0x200000u, &v) == 0 && f.win2 == 0 && x.w84 == 0);
+	}
+	/* a store fault at every store of W15: a stop, the CA7 put back in reset (the restore), never a running firmware */
+	{
+		unsigned k, base;
+
+		obsb(&f, 336); fw_default(&f);
+		CHECK(runc(&f, &x, 6, len, pin) == 0);
+		base = f.nw;
+		for (k = 1; k <= 5; k++) {
+			obsb(&f, 336); fw_default(&f);
+			f.fail_wr_at = base + k;
+			CHECK(rune_run(&f, &x, len, pin) < 0 && x.row == 15 && f.released == 0 && f.bar2_stores_after_rel == 0);
+			CHECK(x.restore == SWW_RS_NONE || (f.ca.ctl & 1u));
+		}
+	}
+	/* a console buffer that straddles the window boundary is read across it */
+	obsb(&f, 336); fw_default(&f); f.fw_con = 0x470000u; f.fw_buf = 0x3FFF90u;
+	CHECK(rune_run(&f, &x, len, pin) == 0 && strstr(logbuf, "fwcon: wl0: Broadcom BCM4389 802.11 Wireless Controller 99.9.9 (synthetic)\n") != 0 && left_ok(&f, n6));
+}
+
 int main(void)
 {
 	rev_gate();
@@ -2251,6 +2517,7 @@ int main(void)
 	rund();
 	fwid();
 	f1_cfg_restore();
+	rune();
 	if (fails) {
 		fprintf(stderr, "RESULT: FAIL wlan_wr_host_test (%u checks)\n", fails);
 		return 1;
