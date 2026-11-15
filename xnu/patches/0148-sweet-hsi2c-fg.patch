@@ -741,7 +741,7 @@ new file mode 100644
 +	int ok = sfg_r32(r, SFG_SP_I2C, c->o_int_st, &st->ist) && sfg_r32(r, SFG_SP_I2C, c->o_fifo_st, &st->fs) &&
 +	    sfg_r32(r, SFG_SP_I2C, c->o_trans, &st->ts) && sfg_r32(r, SFG_SP_I2C, c->o_err, &err);
 +	unsigned why = !ok ? SFG_DW_UNREADABLE : (st->ist & c->int_nack) ? SFG_DW_NACK_INT : (st->ts & c->f_st_mask) == c->st_no_ack ? SFG_DW_NACK_STATE :
-+	    (st->ist & c->int_errs) ? SFG_DW_INT_ERRS : (st->ts & c->f_st_mask) == c->st_lose ? SFG_DW_LOSE : err ? SFG_DW_ERR_STATUS : SFG_DW_NONE;
++	    (st->ist & c->int_errs) ? SFG_DW_INT_ERRS : err ? SFG_DW_ERR_STATUS : SFG_DW_NONE;	/* no LOSE (0xC) check here: c4-batt3 saw it mid-read with data and no TRANS_ABORT; LX :521-541 decides on INT_STATUS only, LOSE only before a transfer :670-693 */
 +
 +	if (r->d) {			/* F5: the words of this poll, kept in memory for the failure line */
 +		r->d->ist = st->ist;

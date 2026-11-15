@@ -67,7 +67,7 @@ static uint32_t rfault_off;
 static unsigned wfault_n, ignore_from;
 static uint32_t ignore_off;
 static int ignore_any;
-static unsigned nack_at, timeout_at, rxtimeout_at, abort_at, err_at;
+static unsigned nack_at, timeout_at, rxtimeout_at, abort_at, err_at, lose_mid_at, lose_left;
 static int ist_sticky, busy_after_read;
 static uint64_t ticks, tick_step;
 static char lines[512][SFG_LINE + 8];
@@ -119,6 +119,10 @@ static int f_rd32(void *ctx, int sp, uint32_t off, uint32_t *v)
 	case R_TMO: *v = h.tmo; return 1;
 	case R_TRANS:
 		*v = h.trans;
+		if (lose_left > 0) {	/* observed c4-batt3: TRANS_STATUS master state 0xC (LOSE) while the read completes, no TRANS_ABORT interrupt */
+			*v = (h.trans & ~0xfu) | 0xCu;
+			lose_left--;
+		}
 		if (busy_after_read > 0 && (h.trans & MBUSY) && h.nrx == 0 && !h.held && --busy_after_read == 0)
 			h.trans &= ~MBUSY;
 		return 1;
@@ -179,6 +183,8 @@ static void start(uint32_t a)
 		return;
 	if (!h.have_ptr || !fgv_known[h.ptr])
 		violate("read of a register the fake gauge does not have");
+	if (lose_mid_at == nruns)
+		lose_left = 4;
 	h.rx[h.nrx++] = (uint8_t)(fgv[h.ptr] & 0xff);
 	h.rx[h.nrx++] = (uint8_t)(fgv[h.ptr] >> 8);
 	h.ist |= DONE;
@@ -327,7 +333,7 @@ static void world(void)
 	wfault_n = ignore_from = 0;
 	ignore_off = 0;
 	ignore_any = 0;
-	nack_at = timeout_at = rxtimeout_at = abort_at = err_at = 0;
+	nack_at = timeout_at = rxtimeout_at = abort_at = err_at = lose_mid_at = lose_left = 0;
 	ist_sticky = busy_after_read = 0;
 	ticks = 1000;
 	tick_step = 100;
@@ -572,6 +578,11 @@ int main(void)
 	world(); timeout_at = 1; tick_step = 1;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && has("timeout") && restore_tail());
 	/* arbitration lost / ERR_STATUS */
+	/* c4-batt3 (observed): master state LOSE (0xC) in TRANS_STATUS while the 2-byte read completes, INT_STATUS has TRANS_DONE and no
+	 * TRANS_ABORT. Linux v6.18 i2c-exynos5.c:521-541 (EXYNOS7 path) decides on INT_STATUS only and checks LOSE only before a transfer
+	 * (:670-693), so this read must succeed */
+	world(); lose_mid_at = 2;
+	EXPECT(sfg_set(&st, &ops, &cfg) == 0 && violations == 0 && has("src=fg") && !has("refused") && restore_tail() && as_before());
 	world(); abort_at = 2;
 	EXPECT(sfg_set(&st, &ops, &cfg) == 1 && violations == 0 && has("refused REPSOC reg=0x06 error") && restore_tail() && as_before());
 	EXPECT(has("fail at rd-byte0 why=int-errs") && count("SWEET BATTERY: fail ") == 3);
