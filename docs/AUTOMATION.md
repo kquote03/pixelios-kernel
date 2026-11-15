@@ -623,3 +623,19 @@ block is not readable from EL1 (power cycle reverts). Run: `tools/xrun ... --wla
 ### patch 0147 (sweetwlan=4..6 on oriole)
 The level-6 firmware pin is a table (bluejay 1764018 B crc 0x1153ccff, oriole 1764091 B crc 0x92567396), the image bound is 1764091 B; levels >= 4 only accept a table identity.
 A stop prints `SWEET WLAN: left after stop: atu_r2=.. sys_mem=.. ca7=.. cfg84=..`; a cfg 0x84 restore with the link down is `skipped` (review F1).
+
+## XNU sweetwlan=7: BCM4389 CA7 release + read-only firmware-ready dump (patch 0150, plan oneshot-2 step W5; BUILT, UNRUN, reviewed SAFE)
+
+```bash
+tools/xrun --kernel ~/pixelios-artifacts/xnu-local-ef93d09/kernel.development.sweet --board oriole --no-camera --gui --rails --cpus 8 \
+  --wlan-hold --wlan-level 7 --wlanfw ~/pixelios-artifacts/wlan-fw/wlanfw-oriole.bin --intent wlan \
+  --expect 'SWEET WLAN: (stage 3 level 7 (done|stopped)|fw ready)' --fail-on 'restore=failed' --label o3-w5-l7 --restart 600,bootloader
+```
+
+Level 7 = level 6 (image, NVRAM tail, reset vector) plus W15 (release the CA7: RESET_CTL 1, IOCTL 0x3, RESET_CTL 0, IOCTL 0x1, from the halted IOCTL 0x21 only),
+W16 (poll the last RAM word for the shared-area pointer, 100 x 50 ms, link precondition before each poll), W17 (read 0x40 bytes of pciedev_shared_t, the console
+header and at most 2 KiB of console text, printable bytes only, now and 2 s later). Output: `SWEET WLAN: W15 ...`, `SWEET WLAN: W16 last RAM word ...`,
+`SWEET WLAN: fw ready shared=0x... ver=N ...`, `SWEET WLAN: fwcon: <text>`, `SWEET WLAN: stage 3 level 7 done fw ready shared=...`.
+Never written: EP Command (bus master), any BAR2 word after W14, rings, doorbells, host_cap. Left after the run: the firmware running (also after a W16/W17 stop),
+SYS_MEM out of reset, ATU region 2 enabled, cfg 0x84 = 0; a power cycle resets the chip. Reviews: docs/reviews/0150-wlan-fw-ready-review-fable-1.md (SAFE-AFTER-FIXES),
+-2.md (SAFE; G1-G6 L open: glue gate/latch for the release before any later store level, two cite texts, uncovered mutants X2/X3/X8/X9/X11/X15).
