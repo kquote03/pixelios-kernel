@@ -182,3 +182,9 @@ nix-shell $A/gpu/nix/shell.nix --run 'bash <repo>/gpu/ios/configure-ios.sh'
 flock $A/scratch/heavy.lock nix-shell $A/gpu/nix/shell.nix --run 'export PATH=$A/gpu/ios/bin:$PATH; ninja -C $A/gpu/build/mesa-ios -k 0'
 ```
 [guess] 0005 changes the kmod meson for Linux too (panfrost_kmod.c moved into the non-Darwin branch); the host build was not rebuilt with 0005 yet.
+
+First cross build result [obs 2026-11-16]: `ninja -C $A/gpu/build/mesa-ios -k 0` = 278/278, 0 FAILED. The default targets are 30 static libraries
+(`libglapi.a`, `libpan-arch-v*.a`, `libpan-format-v*.a`, `libpanfrost*.a`, `libpanfrost_perf.a`, `libpanfrostwinsys.a`); objects are
+`Mach-O 64-bit arm64 object`, LC_BUILD_VERSION platform ios, minos 16.0, sdk 16.4. Libraries that are not built by default (libmesa,
+libgallium, libpankmod_lib, ...) are only built when a target links them; `ninja ... src/panfrost/lib/kmod/libpankmod_lib.a` built cleanly
+(no warnings) and exports `sweet_kmod_*` and `sweet_iokit_transport_create`. No dylib or executable exists yet (the sweetgl target is the G3 agent's).
