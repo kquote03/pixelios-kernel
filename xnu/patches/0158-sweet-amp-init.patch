@@ -2,10 +2,13 @@ SWEET AMP (patch 0158, plan 2026-11-14 oneshot-2 step A7), boot-arg sweetamp=1: 
 sweetamp=1 AND the ADT root model-number is "oriole". One synchronous run from sweet_ufs_init, before the touch / battery threads: the A1 identify
 (the port of the shim --amp-id, pk-amp shim/ampid.c 4c7be85, review SAFE round 2; A1 PASS on hardware o5-a1-ampid) and, on each amp that identified as CS35L41 B2 with OTP_BOOT_DONE, the
 stock probe-time writes: IRQ1_MASK1 = INT1_MASK_DEFAULT, the B2 errata patch, DSP1_CCM_CORE_CTRL = 0 (cs35l41.c:4306-4308, :3675-3686, :4351-4362,
-:4401). cs35l41_otp_unpack is NOT done (its bit maps are GPL data tables, cs35l41-tables.c: not copied; blocked). The write allowlist is exactly those
-12 (register, value) pairs; PWR_CTRL1 / GLOBAL_EN is never written (refused by name). IRQ1_STATUS1 error bits (seven) must be 0 before the first write and after the writes, then both resets go
-low and every pad / controller / sysreg / mux word is restored and read back. Lines "SWEET AMP: ..."; pass "SWEET AMP: init ok (no otp unpack) l,r devid 35a40
-rev b2, errors=0" (A7 PARTIAL), then "SWEET AMP: verdict PASS". Host test shim/amp_xnu_host_test.c (header extracted from this patch). BUILT, UNRUN; needs A1 PASS and an independent review first.
+:4401; A7 partial PASS on hardware o5-a7-ampinit), then the OTP trim unpack (stock cs35l41_otp_unpack cs35l41.c:1856-1988): OTPID, OTP_MEM0..31 read twice,
+the map by id, TEST_KEY unlock 0x55 / 0xAA, a read-modify-write per map row, lock 0xCC / 0x33 on every path once unlocked, every row read back.
+The maps and the bit walk are bsd/dev/sweet_amp_otp.h, GPL-2.0-only, transcribed from Linux v6.18 cs35l41-lib.c (Copyright 2017-2021 Cirrus Logic, Inc.;
+user decision 2026-11-16, THIRD_PARTY row 22). The write allowlist: the 12 init pairs, the 4 test-key words, the 38 OTP row registers;
+PWR_CTRL1 / GLOBAL_EN is never written (refused by name). IRQ1_STATUS1 error bits (seven) must be 0 before the first write and after the writes, then both resets go
+low and every pad / controller / sysreg / mux word is restored and read back. Lines "SWEET AMP: ..."; pass "SWEET AMP: init ok (otp unpack) l,r devid 35a40
+rev b2, errors=0", then "SWEET AMP: verdict PASS". Host test shim/amp_xnu_host_test.c (headers extracted from this patch). BUILT, UNRUN (otp unpack).
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -166,14 +169,14 @@ new file mode 100644
 +	}
 +	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sa_freq);
 +	printf("SWEET AMP: init run (sweetamp=1), timebase %llu Hz\n", sa_freq);
-+	printf("SWEET AMP: verdict %s\n", amp_init_run() == 0 ? "PASS (A7 partial: no otp unpack)" : "FAIL (see the AMP lines)");	/* review F1: the return value */
++	printf("SWEET AMP: verdict %s\n", amp_init_run() == 0 ? "PASS" : "FAIL (see the AMP lines)");	/* review F1: the return value */
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_amp.h
-@@ -0,0 +1,1007 @@
+@@ -0,0 +1,1123 @@
 +/*
 + * bsd/dev/sweet_amp.h - xnu patch 0158 (plan oneshot-2 step A7, boot-arg sweetamp=1): the two CS35L41 speaker amps of oriole on USI13 / SPI13.
 + * Pure logic, included by bsd/dev/sweet_amp.c (MMIO glue) and by the host test shim/amp_xnu_host_test.c. Every hardware access goes through the
@@ -187,16 +190,18 @@ new file mode 100644
 + *     0x4310 := 0; VPVBST_FS_SEL 0x4400 := 0; BSTCVRT_DCM_CTRL 0x381C := 0x51; DSP1_YM_ACCEL_PL0_PRI 0x2BC20E0 := 0; DSP1_XM_ACCEL_PL0_PRI 0x2BC2020 := 0;
 + *     TEST_KEY_CTL := 0xCCCC, 0x3333 (cs35l41.h:30, :76, :80, :84, :324, :330);
 + *   DSP1_CCM_CORE_CTRL 0x2BC1000 := 0 (AMP cs35l41.c:4401, cs35l41.h:318).
-+ *   NOT done: cs35l41_otp_unpack (:4385, :1856-1975): it needs the OTP bit maps of cs35l41-tables.c:726-966 (GPL-2.0 data tables; copying them into an APSL
-+ *   patch is not decided): recorded as blocked. Its trims matter for the output stage, which this patch never enables.
-+ * The write allowlist is exactly those 12 (register, value) pairs; PWR_CTRL1 0x2014 (GLOBAL_EN, cs35l41.h:42, :667) is not in it and is refused by name.
++ *   Then (A7 full) the OTP trim unpack, amp_otp() below (stock cs35l41_otp_unpack AMP cs35l41.c:1856-1988, called at :4385, i.e. stock runs it
++ *   between the errata and the CCM write; here it runs after the CCM read-back so the 12 hardware-proven writes keep their order). Maps and bit walk:
++ *   sweet_amp_otp.h (GPL-2.0-only, transcribed from Linux v6.18 cs35l41-lib.c, user decision 2026-11-16).
++ * The write allowlist is those 12 (register, value) pairs, TEST_KEY_CTL := 0x55 / 0xAA / 0xCC / 0x33, and the 38 registers an OTP map row names
++ *   (any value: amp_otp() changes only the row mask of a value it read); PWR_CTRL1 0x2014 (GLOBAL_EN, cs35l41.h:42, :667) is not in it and is refused by name.
 + * A write frame (AMP cs35l41-spi.c:32-45, GKI regmap-spi.c write = one transfer): the 32-bit address with bit 31 CLEAR, 2 pad bytes 0, the 32-bit value,
 + * big endian, 10 bytes. Its bytes are accepted by the TX allowlist only while an allowed pair is armed (amp_write), at their exact frame position.
 + * IRQ1_STATUS1 0x10010 is read before the first write (st0: any error bit = no write) and after the writes (st1); error bits AMP_SHORT_ERR 0x80000000,
 + * TEMP_ERR 0x20000, bit 16 (unmasked by INT1_MASK_DEFAULT, unnamed), TEMP_WARN 0x8000, BST_SHORT_ERR 0x100, BST_DCM_UVP_ERR 0x80, BST_OVP_ERR 0x40
 + * (cs35l41.h:124, :684-689) must all be 0. Then the usual restore: both resets low (the amps lose the writes), every
-+ * pad / controller / sysreg / mux word back. Pass line (A7 PARTIAL: no OTP unpack, review F3): "SWEET AMP: init ok (no otp unpack) l,r devid 35a40 rev b2,
-+ * errors=0". Any later step that sets GLOBAL_EN must first add the OTP unpack. Worst-case run time about 9.3 s (review F8).
++ * pad / controller / sysreg / mux word back. Pass line: "SWEET AMP: init ok (otp unpack) l,r devid 35a40 rev b2,
++ * errors=0". Worst-case run time about 9.3 s (review F8).
 + * The read check is per byte position, so about 90 addresses are readable, all with the read flag (0x80 / 0x82 first byte); no write (review F8).
 + * Known and accepted (review F5, F7, F9): the TX check does not track which bytes are queued, so a caller that changed the arm state inside one frame
 + * could mix frames; the only caller arms for exactly one transfer (pinned by the host test). What 0x4100 / 0x4310 / 0x4400 / BSTCVRT_DCM_CTRL do bit by
@@ -208,6 +213,7 @@ new file mode 100644
 +#ifndef SWEET_AMP_H
 +#define SWEET_AMP_H
 +#include <stdint.h>
++#include "sweet_amp_otp.h"
 +
 +/* the includer provides these (bsd/dev/sweet_amp.c: ml_io_map'ed windows, mach_absolute_time; the host test: a fake SoC) */
 +static int try_read32(uintptr_t pa, uint32_t *v);
@@ -369,7 +375,7 @@ new file mode 100644
 +	X(AMP_REG_TEST_KEY, 0x5555u) X(AMP_REG_TEST_KEY, 0xAAAAu) X(0x4100u, 0u) X(0x4310u, 0u) X(0x4400u, 0u) X(0x381Cu, 0x51u) X(0x2BC20E0u, 0u) \
 +	X(0x2BC2020u, 0u) X(AMP_REG_TEST_KEY, 0xCCCCu) X(AMP_REG_TEST_KEY, 0x3333u) X(AMP_REG_CCM_CORE, 0u)
 +
-+/* a (register, value) pair the init may write: exactly the 12 of AMP_INIT_SEQ; never PWR_CTRL1 */
++/* a (register, value) pair the init may write: the 12 of AMP_INIT_SEQ, the four OTP test-key words, a register an OTP map row names; never PWR_CTRL1 */
 +static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint32_t val)
 +{
 +	int ok = 0;
@@ -379,7 +385,16 @@ new file mode 100644
 +#define AMP_W_OK(r, v) ok |= (reg == (r) && val == (v));
 +	AMP_INIT_SEQ(AMP_W_OK)
 +#undef AMP_W_OK
-+	return ok;
++	ok |= reg == AMP_REG_TEST_KEY && (val == AMP_OTP_KEY_UNLOCK1 || val == AMP_OTP_KEY_UNLOCK2 || val == AMP_OTP_KEY_LOCK1 || val == AMP_OTP_KEY_LOCK2);
++	return ok || amp_otp_reg_ok(reg);
++}
++
++/* a register an armed read may name: the seven of the A1 / A7 reads, OTPID, OTP_MEM0..31, a register an OTP map row names */
++static inline __attribute__((always_inline)) int amp_read_ok(uint32_t reg)
++{
++	return reg == AMP_REG_IRQ1_STATUS4 || reg == AMP_REG_IRQ1_STATUS3 || reg == AMP_REG_DEVID || reg == AMP_REG_REVID || reg == AMP_REG_IRQ1_STATUS1 ||
++	       reg == AMP_REG_IRQ1_MASK1 || reg == AMP_REG_CCM_CORE || reg == AMP_OTP_REG_OTPID ||
++	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg);
 +}
 +
 +/* byte `pos` of the 10-byte write frame of (reg, val): the address with bit 31 clear, 2 pad bytes 0, the value, all big endian */
@@ -389,7 +404,8 @@ new file mode 100644
 +	       pos < AMP_ADDR_BYTES + AMP_PAD_BYTES ? 0u : (val >> (8u * (AMP_WTX_BYTES - 1u - pos))) & 0xffu;
 +}
 +
-+/* the armed write: set only by amp_write() after amp_write_ok, cleared right after its frame; read by w32 only */
++/* the armed transfer: on = 1 a write (set only by amp_write() after amp_write_ok), on = 2 a read (amp_read(), its address frame only); cleared right
++ * after its frame; read by w32 only */
 +struct amp_arm { int on; uint32_t reg, val; };
 +static struct amp_arm amp_arm;
 +
@@ -612,7 +628,7 @@ new file mode 100644
 +			return 0;	/* mode 0 (no CPOL / CPHA, the DT sets neither), master, no HS_EN (SGS :793-806, :613-616 only >= 30 MHz) */
 +		if (!(v & CH_TX))
 +			return 1;
-+		if (arm)	/* A7: one armed, allowed write frame queued in full */
++		if (arm == 1)	/* A7: one armed, allowed write frame queued in full */
 +			return amp_write_ok(areg, aval) && (v & CH_RX) && !(v & CH_SWRST) && !(old & CH_TX) && TX_LVL(aux) == AMP_WTX_BYTES;
 +		return (v & CH_RX) && !(v & CH_SWRST) && !(old & CH_TX) && TX_LVL(aux) == AMP_TX_BYTES;
 +	}
@@ -628,10 +644,12 @@ new file mode 100644
 +		return v == SPI_PND_CLR_ALL || v == 0u;
 +	if (pa == A_PKT)	/* enable_datapath: count & ~EN, count, count | EN (SGS :572-581); flush 0 (:268) */
 +		return v == 0u || v == AMP_TX_BYTES || v == AMP_VAL_BYTES || v == (AMP_TX_BYTES | PKT_EN) || v == (AMP_VAL_BYTES | PKT_EN) ||
-+		       (v == rv && !(v & PKT_EN)) || (arm && amp_write_ok(areg, aval) && (v == AMP_WTX_BYTES || v == (AMP_WTX_BYTES | PKT_EN)));
++		       (v == rv && !(v & PKT_EN)) || (arm == 1 && amp_write_ok(areg, aval) && (v == AMP_WTX_BYTES || v == (AMP_WTX_BYTES | PKT_EN)));
 +	if (pa == A_TX) {	/* one byte per 32-bit write (writesb_32, SGS :519-529) */
-+		if (arm)	/* A7: exactly the armed write frame, byte by byte */
++		if (arm == 1)	/* A7: exactly the armed write frame, byte by byte */
 +			return !(aux & CH_TX) && amp_write_ok(areg, aval) && TX_LVL(old) < AMP_WTX_BYTES && v == wframe_byte(areg, aval, TX_LVL(old));
++		if (arm == 2)	/* A7: exactly the armed read address frame, byte by byte */
++			return !(aux & CH_TX) && amp_read_ok(areg) && TX_LVL(old) < AMP_TX_BYTES && v == frame_byte(areg, TX_LVL(old));
 +		return !(aux & CH_TX) && tx_byte_ok(TX_LVL(old), v);
 +	}
 +#define PAD_W(P, fn, datw, drvw) \
@@ -810,8 +828,14 @@ new file mode 100644
 +		return AMP_ERROR;		/* the other chip select must read high: never both amps on the bus (a failed CS release stops here) */
 +	if (pad_put(s, dat, nr, 1u, 0u) || w32(s, A_SLAVE, V_SLAVE_AUTO))	/* ref: SGS enable_cs :662-669 (gpiod_set_value 1 = active low) */
 +		e = AMP_ERROR;
-+	if (e == AMP_OK)
++	if (e == AMP_OK) {
++		amp_arm.reg = reg;
++		amp_arm.val = 0;
++		amp_arm.on = 2;
 +		e = xfer(s, reg, 1, &dummy);
++	}
++	amp_arm.on = 0;
++	amp_arm.reg = 0;
 +	if (e == AMP_OK)
 +		e = xfer(s, 0u, 0, val);
 +	if (pad_put(s, dat, nr, 1u, 1u))					/* ref: SGS disable_cs :762-763 (AUTO: SLAVE_SEL not written) */
@@ -830,6 +854,8 @@ new file mode 100644
 +		return AMP_ERROR;
 +	if (!r32(odat, &o) || !peri_pin_bit(o, onr))
 +		return AMP_ERROR;		/* never both amps on the bus */
++	if (!r32(dat, &o) || !peri_pin_bit(o, nr))
++		return AMP_ERROR;		/* A7: its own chip select must read high too (a failed release before an OTP relock: no merged frame) */
 +	if (pad_put(s, dat, nr, 1u, 0u) || w32(s, A_SLAVE, V_SLAVE_AUTO))
 +		e = AMP_ERROR;
 +	if (e == AMP_OK) {
@@ -850,7 +876,7 @@ new file mode 100644
 +#define AMP_ID_OK(ee, rr)	((ee) == AMP_OK && (rr).otp && !((rr).st3 & AMP_OTP_BOOT_ERR) && (rr).devid == AMP_DEVID && (rr).revid == AMP_REVID)
 +
 +/* A7: the B2 probe writes in stock order, then IRQ1_STATUS1 / IRQ1_MASK1 / DSP1_CCM_CORE_CTRL read back. 0 = all written, read back, no error bit */
-+static int amp_init(const struct amp_snap *s, int cs, const char *name)
++static int amp_init_regs(const struct amp_snap *s, int cs, const char *name)
 +{
 +	uint32_t st1 = 0, mask = 0, ccm = 0, st0 = 0;
 +	unsigned n = 0;
@@ -888,6 +914,99 @@ new file mode 100644
 +	if (e == AMP_OK && (st1 & AMP_ERR_BITS))
 +		say(name, " !!! amp error bit in IRQ1_STATUS1 (H8: no output steps for the rest of the run)");
 +	return e == AMP_OK && !(st1 & AMP_ERR_BITS) && mask == AMP_INT1_MASK_DEFAULT && ccm == 0u ? AMP_OK : AMP_ERROR;
++}
++
++/* ---- A7: the OTP trim unpack (maps and bit walk: sweet_amp_otp.h, GPL-2.0-only, Linux v6.18 cs35l41-lib.c:813-880 = stock AMP cs35l41.c:1856-1988) ----
++ * Stock order: OTPID, the map by id (none = stop), OTP_MEM0..31, unlock TEST_KEY_CTL 0x55, 0xAA, per row regmap_update_bits(reg, GENMASK(shift + size - 1,
++ * shift), val << shift) (rows with reg 0 skipped), lock 0xCC, 0x33. Here the 32 words are read twice and must agree (stock lowers SPI to 4 MHz for this
++ * read, CS35L41_SPI_MAX_FREQ_OTP AMP cs35l41.h:740; this bus runs at 6.144 MHz and its clock is not changed); a row is written only if its field
++ * changes (as regmap_update_bits); once the unlock was attempted EVERY path writes both lock words; after the lock every row is read back. */
++static int amp_otp(const struct amp_snap *s, int cs, const char *name)
++{
++	const struct amp_otp_map *m = 0;
++	uint32_t id = 0, mem[AMP_OTP_WORDS], mem2[AMP_OTP_WORDS], vals[AMP_OTP_MAX_ELEMS], v = 0, bad_reg = 0;
++	unsigned nwr = 0, nbad = 0, lk = 0;
++	int e, unlocked = 0;
++	const char *why = 0;
++	char line[RAMLOG_LINE_MAX];
++	unsigned p;
++
++	e = amp_read(s, cs, AMP_OTP_REG_OTPID, &id);
++	for (uint32_t i = 0; e == AMP_OK && i < AMP_OTP_WORDS; i++)
++		e = amp_read(s, cs, AMP_OTP_REG_MEM0 + 4u * i, &mem[i]);
++	for (uint32_t i = 0; e == AMP_OK && i < AMP_OTP_WORDS; i++) {
++		e = amp_read(s, cs, AMP_OTP_REG_MEM0 + 4u * i, &mem2[i]);
++		if (e == AMP_OK && mem2[i] != mem[i]) {
++			why = " otp words differ between two reads: no write";
++			e = AMP_ERROR;
++		}
++	}
++	if (e == AMP_OK && !(m = amp_otp_find(id))) {
++		why = " no otp map for this otp id: no write";
++		e = AMP_ERROR;
++	}
++	if (e == AMP_OK && amp_otp_extract(m, mem, vals)) {
++		why = " otp map walks past the otp words: no write";
++		e = AMP_ERROR;
++	}
++	if (e == AMP_OK) {
++		unlocked = 1;		/* from here on the lock is written on every path */
++		e = amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_UNLOCK1);
++		if (e == AMP_OK)
++			e = amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_UNLOCK2);
++	}
++	for (uint32_t i = 0; e == AMP_OK && i < m->n; i++) {
++		const struct amp_otp_field *f = &m->map[i];
++		uint32_t mask = amp_otp_mask(f), nv;
++
++		if (f->reg == 0u)
++			continue;
++		e = amp_read(s, cs, f->reg, &v);
++		nv = (v & ~mask) | ((vals[i] << f->shift) & mask);
++		if (e == AMP_OK && nv != v) {
++			e = amp_write(s, cs, f->reg, nv);
++			nwr++;
++		}
++	}
++	if (unlocked) {
++		lk = amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_LOCK1) == AMP_OK;
++		lk = (amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_LOCK2) == AMP_OK) && lk;
++		if (!lk)
++			why = " !!! otp test-key LOCK write failed";
++	}
++	for (uint32_t i = 0; e == AMP_OK && lk && i < m->n; i++) {
++		const struct amp_otp_field *f = &m->map[i];
++
++		if (f->reg == 0u)
++			continue;
++		e = amp_read(s, cs, f->reg, &v);
++		if (e == AMP_OK && ((v & amp_otp_mask(f)) >> f->shift) != vals[i] && !nbad++)
++			bad_reg = f->reg;
++	}
++	p = put_txt(line, sizeof(line), 0, name);
++	p = put_txt(line, sizeof(line), p, " otp id=");
++	p = put_hexmin(line, sizeof(line), p, id);
++	p = put_txt(line, sizeof(line), p, m ? (m->map == amp_otp_map_1 ? " map=1" : " map=2") : " map=none");
++	p = put_txt(line, sizeof(line), p, " writes=");
++	p = put_dec(line, sizeof(line), p, nwr);
++	p = put_txt(line, sizeof(line), p, " readback-bad=");
++	p = put_dec(line, sizeof(line), p, nbad);
++	p = put_txt(line, sizeof(line), p, " first=");
++	p = put_hexmin(line, sizeof(line), p, bad_reg);
++	p = put_txt(line, sizeof(line), p, !unlocked ? " lock=untouched" : lk ? " lock=ok" : " lock=FAILED");
++	p = put_txt(line, sizeof(line), p, e == AMP_OK && lk && !nbad ? "" : " FAILED");
++	emit("AMP", line, p);
++	if (why)
++		say(name, why);
++	return e == AMP_OK && unlocked && lk && nbad == 0u ? AMP_OK : AMP_ERROR;
++}
++
++/* A7: the probe writes, then the OTP unpack on the same amp */
++static int amp_init(const struct amp_snap *s, int cs, const char *name)
++{
++	int e = amp_init_regs(s, cs, name);
++
++	return e == AMP_OK ? amp_otp(s, cs, name) : e;
 +}
 +
 +/* AMP cs35l41.c:4210-4230: reset requested GPIOD_OUT_LOW (DAT 0, then output), 2 ms, release (1), 2 ms */
@@ -1175,12 +1294,328 @@ new file mode 100644
 +	}
 +	result(&l, &r, restored ? "ok" : "FAILED");
 +	pass = e == AMP_OK && il == AMP_OK && ir == AMP_OK && AMP_ID_OK(el, l) && AMP_ID_OK(er, r) && restored;	/* review F1: ONE condition */
-+	con_str("SWEET", pass ? "AMP: init ok (no otp unpack) l,r devid 35a40 rev b2, errors=0" : "AMP: init FAILED (see the AMP lines)");
++	con_str("SWEET", pass ? "AMP: init ok (otp unpack) l,r devid 35a40 rev b2, errors=0" : "AMP: init FAILED (see the AMP lines)");
 +	return pass ? 0 : 1;
 +}
 +
 +
 +#endif /* SWEET_AMP_H */
+diff --git a/bsd/dev/sweet_amp_otp.h b/bsd/dev/sweet_amp_otp.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_amp_otp.h
+@@ -0,0 +1,311 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * bsd/dev/sweet_amp_otp.h - xnu patch 0158 (A7): the CS35L41 OTP trim maps and the unpack arithmetic. A GPL-2.0-only island inside the APSL patch
++ * directory (user decision 2026-11-16: the OTP map tables may be transcribed from the GPL-2.0 Linux driver, with attribution; THIRD_PARTY.md row 22).
++ *
++ * Transcribed from Linux v6.18 (research-src/linux-v6.18, commit 7d0a66e4bb9081d75c82ec4957c50034cb0ea449):
++ *   sound/soc/codecs/cs35l41-lib.c -- "CS35L41 Common functions for HDA and ASoC Audio drivers"
++ *   Copyright 2017-2021 Cirrus Logic, Inc.   (cs35l41-lib.c:5; authors David Rhodes, Lucas Tanure)
++ *   otp_map_1 :429-530, otp_map_2 :532-634, cs35l41_otp_map_map :699-735, cs35l41_find_otp_map :770-780, test key :782-811,
++ *   cs35l41_otp_unpack :813-880; include/sound/cs35l41.h:22 OTPID 0x10, :24 TEST_KEY_CTL 0x40, :26 OTP_MEM0 0x400, :539 OTP_SIZE_WORDS 32, :821-833.
++ * The same rows, ids and bit / word offsets are in the stock oriole driver (kernel/google-modules/amplifiers 33976d7: cs35l41-tables.c:726-968,
++ * cs35l41.c:1844-1988, unlock 0x55 / 0xAA and lock 0xCC / 0x33 at :1915-1980) [observed: row-by-row diff, 2026-11-16].
++ * Pure: no hardware access. The caller (bsd/dev/sweet_amp.h amp_otp) does the bus I/O.
++ */
++#ifndef SWEET_AMP_OTP_H
++#define SWEET_AMP_OTP_H
++#include <stdint.h>
++
++#define AMP_OTP_REG_OTPID	0x10u		/* CS35L41_OTPID */
++#define AMP_OTP_REG_MEM0	0x400u		/* CS35L41_OTP_MEM0 .. MEM31 0x47C */
++#define AMP_OTP_WORDS		32u		/* CS35L41_OTP_SIZE_WORDS */
++#define AMP_OTP_KEY_UNLOCK1	0x55u		/* cs35l41_test_key_unlock */
++#define AMP_OTP_KEY_UNLOCK2	0xAAu
++#define AMP_OTP_KEY_LOCK1	0xCCu		/* cs35l41_test_key_lock */
++#define AMP_OTP_KEY_LOCK2	0x33u
++#define AMP_OTP_MAX_ELEMS	99u
++
++struct amp_otp_field { uint32_t reg; uint8_t shift, size; };	/* cs35l41_otp_packed_element_t */
++struct amp_otp_map { uint32_t id, n; const struct amp_otp_field *map; uint32_t bit_offset, word_offset; };	/* cs35l41_otp_map_element_t */
++
++static const struct amp_otp_field amp_otp_map_1[] = {
++	/* addr       shift size */
++	{ 0x00002030, 0, 4 },	/* TRIM_OSC_FREQ_TRIM */
++	{ 0x00002030, 7, 1 },	/* TRIM_OSC_TRIM_DONE */
++	{ 0x0000208c, 24, 6 },	/* TST_DIGREG_VREF_TRIM */
++	{ 0x00002090, 14, 4 },	/* TST_REF_TRIM */
++	{ 0x00002090, 10, 4 },	/* TST_REF_TEMPCO_TRIM */
++	{ 0x0000300C, 11, 4 },	/* PLL_LDOA_TST_VREF_TRIM */
++	{ 0x0000394C, 23, 2 },	/* BST_ATEST_CM_VOFF */
++	{ 0x00003950, 0, 7 },	/* BST_ATRIM_IADC_OFFSET */
++	{ 0x00003950, 8, 7 },	/* BST_ATRIM_IADC_GAIN1 */
++	{ 0x00003950, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET1 */
++	{ 0x00003950, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN1 */
++	{ 0x00003954, 0, 7 },	/* BST_ATRIM_IADC_OFFSET2 */
++	{ 0x00003954, 8, 7 },	/* BST_ATRIM_IADC_GAIN2 */
++	{ 0x00003954, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET2 */
++	{ 0x00003954, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN2 */
++	{ 0x00003958, 0, 7 },	/* BST_ATRIM_IADC_OFFSET3 */
++	{ 0x00003958, 8, 7 },	/* BST_ATRIM_IADC_GAIN3 */
++	{ 0x00003958, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET3 */
++	{ 0x00003958, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN3 */
++	{ 0x0000395C, 0, 7 },	/* BST_ATRIM_IADC_OFFSET4 */
++	{ 0x0000395C, 8, 7 },	/* BST_ATRIM_IADC_GAIN4 */
++	{ 0x0000395C, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET4 */
++	{ 0x0000395C, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN4 */
++	{ 0x0000416C, 0, 8 },	/* VMON_GAIN_OTP_VAL */
++	{ 0x00004160, 0, 7 },	/* VMON_OFFSET_OTP_VAL */
++	{ 0x0000416C, 8, 8 },	/* IMON_GAIN_OTP_VAL */
++	{ 0x00004160, 16, 10 },	/* IMON_OFFSET_OTP_VAL */
++	{ 0x0000416C, 16, 12 },	/* VMON_CM_GAIN_OTP_VAL */
++	{ 0x0000416C, 28, 1 },	/* VMON_CM_GAIN_SIGN_OTP_VAL */
++	{ 0x00004170, 0, 6 },	/* IMON_CAL_TEMPCO_OTP_VAL */
++	{ 0x00004170, 6, 1 },	/* IMON_CAL_TEMPCO_SIGN_OTP */
++	{ 0x00004170, 8, 6 },	/* IMON_CAL_TEMPCO2_OTP_VAL */
++	{ 0x00004170, 14, 1 },	/* IMON_CAL_TEMPCO2_DN_UPB_OTP_VAL */
++	{ 0x00004170, 16, 9 },	/* IMON_CAL_TEMPCO_TBASE_OTP_VAL */
++	{ 0x00004360, 0, 5 },	/* TEMP_GAIN_OTP_VAL */
++	{ 0x00004360, 6, 9 },	/* TEMP_OFFSET_OTP_VAL */
++	{ 0x00004448, 0, 8 },	/* VP_SARADC_OFFSET */
++	{ 0x00004448, 8, 8 },	/* VP_GAIN_INDEX */
++	{ 0x00004448, 16, 8 },	/* VBST_SARADC_OFFSET */
++	{ 0x00004448, 24, 8 },	/* VBST_GAIN_INDEX */
++	{ 0x0000444C, 0, 3 },	/* ANA_SELINVREF */
++	{ 0x00006E30, 0, 5 },	/* GAIN_ERR_COEFF_0 */
++	{ 0x00006E30, 8, 5 },	/* GAIN_ERR_COEFF_1 */
++	{ 0x00006E30, 16, 5 },	/* GAIN_ERR_COEFF_2 */
++	{ 0x00006E30, 24, 5 },	/* GAIN_ERR_COEFF_3 */
++	{ 0x00006E34, 0, 5 },	/* GAIN_ERR_COEFF_4 */
++	{ 0x00006E34, 8, 5 },	/* GAIN_ERR_COEFF_5 */
++	{ 0x00006E34, 16, 5 },	/* GAIN_ERR_COEFF_6 */
++	{ 0x00006E34, 24, 5 },	/* GAIN_ERR_COEFF_7 */
++	{ 0x00006E38, 0, 5 },	/* GAIN_ERR_COEFF_8 */
++	{ 0x00006E38, 8, 5 },	/* GAIN_ERR_COEFF_9 */
++	{ 0x00006E38, 16, 5 },	/* GAIN_ERR_COEFF_10 */
++	{ 0x00006E38, 24, 5 },	/* GAIN_ERR_COEFF_11 */
++	{ 0x00006E3C, 0, 5 },	/* GAIN_ERR_COEFF_12 */
++	{ 0x00006E3C, 8, 5 },	/* GAIN_ERR_COEFF_13 */
++	{ 0x00006E3C, 16, 5 },	/* GAIN_ERR_COEFF_14 */
++	{ 0x00006E3C, 24, 5 },	/* GAIN_ERR_COEFF_15 */
++	{ 0x00006E40, 0, 5 },	/* GAIN_ERR_COEFF_16 */
++	{ 0x00006E40, 8, 5 },	/* GAIN_ERR_COEFF_17 */
++	{ 0x00006E40, 16, 5 },	/* GAIN_ERR_COEFF_18 */
++	{ 0x00006E40, 24, 5 },	/* GAIN_ERR_COEFF_19 */
++	{ 0x00006E44, 0, 5 },	/* GAIN_ERR_COEFF_20 */
++	{ 0x00006E48, 0, 10 },	/* VOFF_GAIN_0 */
++	{ 0x00006E48, 10, 10 },	/* VOFF_GAIN_1 */
++	{ 0x00006E48, 20, 10 },	/* VOFF_GAIN_2 */
++	{ 0x00006E4C, 0, 10 },	/* VOFF_GAIN_3 */
++	{ 0x00006E4C, 10, 10 },	/* VOFF_GAIN_4 */
++	{ 0x00006E4C, 20, 10 },	/* VOFF_GAIN_5 */
++	{ 0x00006E50, 0, 10 },	/* VOFF_GAIN_6 */
++	{ 0x00006E50, 10, 10 },	/* VOFF_GAIN_7 */
++	{ 0x00006E50, 20, 10 },	/* VOFF_GAIN_8 */
++	{ 0x00006E54, 0, 10 },	/* VOFF_GAIN_9 */
++	{ 0x00006E54, 10, 10 },	/* VOFF_GAIN_10 */
++	{ 0x00006E54, 20, 10 },	/* VOFF_GAIN_11 */
++	{ 0x00006E58, 0, 10 },	/* VOFF_GAIN_12 */
++	{ 0x00006E58, 10, 10 },	/* VOFF_GAIN_13 */
++	{ 0x00006E58, 20, 10 },	/* VOFF_GAIN_14 */
++	{ 0x00006E5C, 0, 10 },	/* VOFF_GAIN_15 */
++	{ 0x00006E5C, 10, 10 },	/* VOFF_GAIN_16 */
++	{ 0x00006E5C, 20, 10 },	/* VOFF_GAIN_17 */
++	{ 0x00006E60, 0, 10 },	/* VOFF_GAIN_18 */
++	{ 0x00006E60, 10, 10 },	/* VOFF_GAIN_19 */
++	{ 0x00006E60, 20, 10 },	/* VOFF_GAIN_20 */
++	{ 0x00006E64, 0, 10 },	/* VOFF_INT1 */
++	{ 0x00007418, 7, 5 },	/* DS_SPK_INT1_CAP_TRIM */
++	{ 0x0000741C, 0, 5 },	/* DS_SPK_INT2_CAP_TRIM */
++	{ 0x0000741C, 11, 4 },	/* DS_SPK_LPF_CAP_TRIM */
++	{ 0x0000741C, 19, 4 },	/* DS_SPK_QUAN_CAP_TRIM */
++	{ 0x00007434, 17, 1 },	/* FORCE_CAL */
++	{ 0x00007434, 18, 7 },	/* CAL_OVERRIDE */
++	{ 0x00007068, 0, 9 },	/* MODIX */
++	{ 0x0000410C, 7, 1 },	/* VIMON_DLY_NOT_COMB */
++	{ 0x0000400C, 0, 7 },	/* VIMON_DLY */
++	{ 0x00000000, 0, 1 },	/* extra bit */
++	{ 0x00017040, 0, 8 },	/* X_COORDINATE */
++	{ 0x00017040, 8, 8 },	/* Y_COORDINATE */
++	{ 0x00017040, 16, 8 },	/* WAFER_ID */
++	{ 0x00017040, 24, 8 },	/* DVS */
++	{ 0x00017044, 0, 24 },	/* LOT_NUMBER */
++};
++
++static const struct amp_otp_field amp_otp_map_2[] = {
++	/* addr       shift size */
++	{ 0x00002030, 0, 4 },	/* TRIM_OSC_FREQ_TRIM */
++	{ 0x00002030, 7, 1 },	/* TRIM_OSC_TRIM_DONE */
++	{ 0x0000208c, 24, 6 },	/* TST_DIGREG_VREF_TRIM */
++	{ 0x00002090, 14, 4 },	/* TST_REF_TRIM */
++	{ 0x00002090, 10, 4 },	/* TST_REF_TEMPCO_TRIM */
++	{ 0x0000300C, 11, 4 },	/* PLL_LDOA_TST_VREF_TRIM */
++	{ 0x0000394C, 23, 2 },	/* BST_ATEST_CM_VOFF */
++	{ 0x00003950, 0, 7 },	/* BST_ATRIM_IADC_OFFSET */
++	{ 0x00003950, 8, 7 },	/* BST_ATRIM_IADC_GAIN1 */
++	{ 0x00003950, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET1 */
++	{ 0x00003950, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN1 */
++	{ 0x00003954, 0, 7 },	/* BST_ATRIM_IADC_OFFSET2 */
++	{ 0x00003954, 8, 7 },	/* BST_ATRIM_IADC_GAIN2 */
++	{ 0x00003954, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET2 */
++	{ 0x00003954, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN2 */
++	{ 0x00003958, 0, 7 },	/* BST_ATRIM_IADC_OFFSET3 */
++	{ 0x00003958, 8, 7 },	/* BST_ATRIM_IADC_GAIN3 */
++	{ 0x00003958, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET3 */
++	{ 0x00003958, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN3 */
++	{ 0x0000395C, 0, 7 },	/* BST_ATRIM_IADC_OFFSET4 */
++	{ 0x0000395C, 8, 7 },	/* BST_ATRIM_IADC_GAIN4 */
++	{ 0x0000395C, 16, 8 },	/* BST_ATRIM_IPKCOMP_OFFSET4 */
++	{ 0x0000395C, 24, 8 },	/* BST_ATRIM_IPKCOMP_GAIN4 */
++	{ 0x0000416C, 0, 8 },	/* VMON_GAIN_OTP_VAL */
++	{ 0x00004160, 0, 7 },	/* VMON_OFFSET_OTP_VAL */
++	{ 0x0000416C, 8, 8 },	/* IMON_GAIN_OTP_VAL */
++	{ 0x00004160, 16, 10 },	/* IMON_OFFSET_OTP_VAL */
++	{ 0x0000416C, 16, 12 },	/* VMON_CM_GAIN_OTP_VAL */
++	{ 0x0000416C, 28, 1 },	/* VMON_CM_GAIN_SIGN_OTP_VAL */
++	{ 0x00004170, 0, 6 },	/* IMON_CAL_TEMPCO_OTP_VAL */
++	{ 0x00004170, 6, 1 },	/* IMON_CAL_TEMPCO_SIGN_OTP */
++	{ 0x00004170, 8, 6 },	/* IMON_CAL_TEMPCO2_OTP_VAL */
++	{ 0x00004170, 14, 1 },	/* IMON_CAL_TEMPCO2_DN_UPB_OTP_VAL */
++	{ 0x00004170, 16, 9 },	/* IMON_CAL_TEMPCO_TBASE_OTP_VAL */
++	{ 0x00004360, 0, 5 },	/* TEMP_GAIN_OTP_VAL */
++	{ 0x00004360, 6, 9 },	/* TEMP_OFFSET_OTP_VAL */
++	{ 0x00004448, 0, 8 },	/* VP_SARADC_OFFSET */
++	{ 0x00004448, 8, 8 },	/* VP_GAIN_INDEX */
++	{ 0x00004448, 16, 8 },	/* VBST_SARADC_OFFSET */
++	{ 0x00004448, 24, 8 },	/* VBST_GAIN_INDEX */
++	{ 0x0000444C, 0, 3 },	/* ANA_SELINVREF */
++	{ 0x00006E30, 0, 5 },	/* GAIN_ERR_COEFF_0 */
++	{ 0x00006E30, 8, 5 },	/* GAIN_ERR_COEFF_1 */
++	{ 0x00006E30, 16, 5 },	/* GAIN_ERR_COEFF_2 */
++	{ 0x00006E30, 24, 5 },	/* GAIN_ERR_COEFF_3 */
++	{ 0x00006E34, 0, 5 },	/* GAIN_ERR_COEFF_4 */
++	{ 0x00006E34, 8, 5 },	/* GAIN_ERR_COEFF_5 */
++	{ 0x00006E34, 16, 5 },	/* GAIN_ERR_COEFF_6 */
++	{ 0x00006E34, 24, 5 },	/* GAIN_ERR_COEFF_7 */
++	{ 0x00006E38, 0, 5 },	/* GAIN_ERR_COEFF_8 */
++	{ 0x00006E38, 8, 5 },	/* GAIN_ERR_COEFF_9 */
++	{ 0x00006E38, 16, 5 },	/* GAIN_ERR_COEFF_10 */
++	{ 0x00006E38, 24, 5 },	/* GAIN_ERR_COEFF_11 */
++	{ 0x00006E3C, 0, 5 },	/* GAIN_ERR_COEFF_12 */
++	{ 0x00006E3C, 8, 5 },	/* GAIN_ERR_COEFF_13 */
++	{ 0x00006E3C, 16, 5 },	/* GAIN_ERR_COEFF_14 */
++	{ 0x00006E3C, 24, 5 },	/* GAIN_ERR_COEFF_15 */
++	{ 0x00006E40, 0, 5 },	/* GAIN_ERR_COEFF_16 */
++	{ 0x00006E40, 8, 5 },	/* GAIN_ERR_COEFF_17 */
++	{ 0x00006E40, 16, 5 },	/* GAIN_ERR_COEFF_18 */
++	{ 0x00006E40, 24, 5 },	/* GAIN_ERR_COEFF_19 */
++	{ 0x00006E44, 0, 5 },	/* GAIN_ERR_COEFF_20 */
++	{ 0x00006E48, 0, 10 },	/* VOFF_GAIN_0 */
++	{ 0x00006E48, 10, 10 },	/* VOFF_GAIN_1 */
++	{ 0x00006E48, 20, 10 },	/* VOFF_GAIN_2 */
++	{ 0x00006E4C, 0, 10 },	/* VOFF_GAIN_3 */
++	{ 0x00006E4C, 10, 10 },	/* VOFF_GAIN_4 */
++	{ 0x00006E4C, 20, 10 },	/* VOFF_GAIN_5 */
++	{ 0x00006E50, 0, 10 },	/* VOFF_GAIN_6 */
++	{ 0x00006E50, 10, 10 },	/* VOFF_GAIN_7 */
++	{ 0x00006E50, 20, 10 },	/* VOFF_GAIN_8 */
++	{ 0x00006E54, 0, 10 },	/* VOFF_GAIN_9 */
++	{ 0x00006E54, 10, 10 },	/* VOFF_GAIN_10 */
++	{ 0x00006E54, 20, 10 },	/* VOFF_GAIN_11 */
++	{ 0x00006E58, 0, 10 },	/* VOFF_GAIN_12 */
++	{ 0x00006E58, 10, 10 },	/* VOFF_GAIN_13 */
++	{ 0x00006E58, 20, 10 },	/* VOFF_GAIN_14 */
++	{ 0x00006E5C, 0, 10 },	/* VOFF_GAIN_15 */
++	{ 0x00006E5C, 10, 10 },	/* VOFF_GAIN_16 */
++	{ 0x00006E5C, 20, 10 },	/* VOFF_GAIN_17 */
++	{ 0x00006E60, 0, 10 },	/* VOFF_GAIN_18 */
++	{ 0x00006E60, 10, 10 },	/* VOFF_GAIN_19 */
++	{ 0x00006E60, 20, 10 },	/* VOFF_GAIN_20 */
++	{ 0x00006E64, 0, 10 },	/* VOFF_INT1 */
++	{ 0x00007418, 7, 5 },	/* DS_SPK_INT1_CAP_TRIM */
++	{ 0x0000741C, 0, 5 },	/* DS_SPK_INT2_CAP_TRIM */
++	{ 0x0000741C, 11, 4 },	/* DS_SPK_LPF_CAP_TRIM */
++	{ 0x0000741C, 19, 4 },	/* DS_SPK_QUAN_CAP_TRIM */
++	{ 0x00007434, 17, 1 },	/* FORCE_CAL */
++	{ 0x00007434, 18, 7 },	/* CAL_OVERRIDE */
++	{ 0x00007068, 0, 9 },	/* MODIX */
++	{ 0x0000410C, 7, 1 },	/* VIMON_DLY_NOT_COMB */
++	{ 0x0000400C, 0, 7 },	/* VIMON_DLY */
++	{ 0x00004000, 11, 1 },	/* VMON_POL */
++	{ 0x00017040, 0, 8 },	/* X_COORDINATE */
++	{ 0x00017040, 8, 8 },	/* Y_COORDINATE */
++	{ 0x00017040, 16, 8 },	/* WAFER_ID */
++	{ 0x00017040, 24, 8 },	/* DVS */
++	{ 0x00017044, 0, 24 },	/* LOT_NUMBER */
++};
++
++#define AMP_OTP_N(a)	((uint32_t)(sizeof(a) / sizeof((a)[0])))
++static const struct amp_otp_map amp_otp_maps[] = {
++	{ 0x01u, AMP_OTP_N(amp_otp_map_1), amp_otp_map_1, 16u, 2u },
++	{ 0x02u, AMP_OTP_N(amp_otp_map_2), amp_otp_map_2, 16u, 2u },
++	{ 0x03u, AMP_OTP_N(amp_otp_map_2), amp_otp_map_2, 16u, 2u },
++	{ 0x06u, AMP_OTP_N(amp_otp_map_2), amp_otp_map_2, 16u, 2u },
++	{ 0x08u, AMP_OTP_N(amp_otp_map_1), amp_otp_map_1, 16u, 2u },
++};
++_Static_assert(AMP_OTP_N(amp_otp_map_1) == AMP_OTP_MAX_ELEMS && AMP_OTP_N(amp_otp_map_2) == AMP_OTP_MAX_ELEMS, "99 rows each (cs35l41-lib.c)");
++
++/* cs35l41_find_otp_map: the raw OTPID word compared with each id */
++static const struct amp_otp_map *amp_otp_find(uint32_t id)
++{
++	for (uint32_t i = 0; i < AMP_OTP_N(amp_otp_maps); i++)
++		if (amp_otp_maps[i].id == id)
++			return &amp_otp_maps[i];
++	return 0;
++}
++
++/* GENMASK(h, l), 0 <= l <= h <= 31 */
++static inline uint32_t amp_otp_genmask(uint32_t h, uint32_t l)
++{
++	return (h >= 31u ? 0xffffffffu : ((1u << (h + 1u)) - 1u)) & ~((1u << l) - 1u);
++}
++
++/* the register mask of one row: GENMASK(shift + size - 1, shift) */
++static inline uint32_t amp_otp_mask(const struct amp_otp_field *f)
++{
++	return amp_otp_genmask((uint32_t)f->shift + f->size - 1u, f->shift);
++}
++
++/* a register some row of some map writes (reg 0 rows are skipped by the unpack) */
++static inline int amp_otp_reg_ok(uint32_t reg)
++{
++	for (uint32_t i = 0; reg != 0u && i < AMP_OTP_MAX_ELEMS; i++)
++		if (amp_otp_map_1[i].reg == reg || amp_otp_map_2[i].reg == reg)
++			return 1;
++	return 0;
++}
++
++/*
++ * The bit walk of cs35l41_otp_unpack: vals[i] = row i's value from mem (32 words). Bounded: -1 if a row would read past word 31 (cannot happen for the
++ * carried maps, 688 bits from word 2 bit 16 end in word 24; checked anyway), else 0.
++ */
++static int amp_otp_extract(const struct amp_otp_map *m, const uint32_t mem[AMP_OTP_WORDS], uint32_t vals[AMP_OTP_MAX_ELEMS])
++{
++	uint32_t bit_offset = m->bit_offset, word_offset = m->word_offset;
++
++	if (m->n > AMP_OTP_MAX_ELEMS)
++		return -1;
++	for (uint32_t i = 0; i < m->n; i++) {
++		uint32_t size = m->map[i].size, v;
++
++		if (size == 0u || size > 32u || word_offset >= AMP_OTP_WORDS || bit_offset >= 32u)
++			return -1;
++		if (bit_offset + size - 1u >= 32u) {
++			if (word_offset + 1u >= AMP_OTP_WORDS)
++				return -1;
++			v = (mem[word_offset] & amp_otp_genmask(31u, bit_offset)) >> bit_offset;
++			word_offset++;
++			v |= (mem[word_offset] & amp_otp_genmask(bit_offset + size - 33u, 0u)) << (32u - bit_offset);
++			bit_offset += size - 32u;
++		} else {
++			v = (mem[word_offset] & amp_otp_genmask(bit_offset + size - 1u, bit_offset)) >> bit_offset;
++			bit_offset += size;
++		}
++		if (bit_offset == 32u) {
++			bit_offset = 0u;
++			word_offset++;
++		}
++		vals[i] = v;
++	}
++	return 0;
++}
++#endif
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c

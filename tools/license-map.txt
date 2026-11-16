@@ -18,6 +18,7 @@ xnu/patches/.keep	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
 xnu/patches/00[6-7][0-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3 (0060-0079 = sweet 0061-0081 renumbered; 0061 own, 0070 and 0077 modified), THIRD_PARTY rows 2,5
 xnu/patches/NOTICE.md	MIT	pixos: notice text
 xnu/patches/0101-*	APSL-2.0 AND MIT	apple-xnu + idea/code from ios-flame 0121 (MIT dipa-studio, 0101 header line 10), THIRD_PARTY rows 2,5
+xnu/patches/0158-*	APSL-2.0 AND GPL-2.0-only	apple-xnu + bsd/dev/sweet_amp_otp.h: CS35L41 OTP maps from Linux v6.18 cs35l41-lib.c (Cirrus Logic), THIRD_PARTY row 22
 xnu/patches/*	APSL-2.0	apple-xnu modifications written by this project, xnu/patches/NOTICE.md, THIRD_PARTY row 5
 xnu/patches-archive/006[023]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3 (retired, byte-identical to sweet 0060/0062/0063), THIRD_PARTY rows 2,5
 xnu/patches-archive/*.patch	APSL-2.0	apple-xnu modifications written by this project (retired), THIRD_PARTY row 5

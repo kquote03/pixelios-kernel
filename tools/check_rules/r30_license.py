@@ -8,7 +8,7 @@ from .lib import Finding
 
 RULE = "R30"
 MAP = "tools/license-map.txt"
-ALLOWED = {"MIT", "ISC", "APSL-2.0", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0"}
+ALLOWED = {"MIT", "ISC", "APSL-2.0", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "GPL-2.0-only"}	# GPL-2.0-only: the CS35L41 OTP maps only (user 2026-11-16, THIRD_PARTY row 22)
 # forbidden tracked material (AGENTS.md rule 4): firmware / Apple payloads / secrets, by basename; ALLOW_TRACKED_BINARY is the exception list (empty)
 FORBIDDEN_NAMES = ["*.img", "*.bin", "*.ipsw", "*.dmg", "*.im4p", "*.im4m", "*.img4", "*.ota", "*.mbn", "*.pem", "*.key", "*.p12",
                    "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", ".env", ".env.*", "*.env", "dyld_shared_cache*", "kernelcache*"]
@@ -31,6 +31,7 @@ HOLDERS = [
     (r"android open source|\baosp\b", None, "AOSP", "MIT-AOSP-avbtool.txt"),
     (r"pornin", "MIT", None, "MIT-BearSSL.txt"),
     (r"collabora", "MIT", "Mesa", "MIT-Mesa.txt"),
+    (r"cirrus logic", "GPL-2.0-only", "cs35l41", "GPL-2.0-only.txt"),
 ]
 # device/** must not carry identifiers of the phone (AGENTS.md rule 4): serial, IMEI, a globally administered MAC
 DEVICE_LEAKS = [
