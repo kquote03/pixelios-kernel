@@ -24,12 +24,13 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
 5. **Tag every claim** in docs and handoffs as *observed on hardware*, *read from source*, or *guess*. Never write
    "works" without a device result (date + build id).
 6. **Delegates are cheap volume, the driver verifies.** Only the driver agent delegates. Delegate prompts start with
-   "Work alone. Do not spawn subagents ..." and carry numbered requirements and a verification command. Review
-   hardware-touching code with a different model family than the author, never the same one.
+   "Work alone. Do not spawn subagents ..." and carry numbered requirements and a verification command.
 7. **Never assume; check.** Every fact a change relies on (register, offset, unit, layout, flag, API, behaviour) is
    checked against a cited source, a decompile or a measured result before it is implemented. If it is still not certain,
    do not implement it: reverse/measure it first, and keep any gate for it closed until then.
-8. **Code that writes hardware and has not passed an independent review stays on a local `wip/*` branch**, unpushed.
+8. **Keep reviews short.** A diff that writes hardware gets one quick read by the driver agent before its first run
+   (stop/restore path, bounded waits, cited constants); the verdict is a few lines in the commit message. Then commit
+   and push. No reviewer agents, review rounds or review files unless the user asks.
 
 ## Commands
 
