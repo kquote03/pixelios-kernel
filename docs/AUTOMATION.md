@@ -672,3 +672,32 @@ Lines: `SWEET MALI: irq attach INTID 452 -> 0 ISENABLER14=... IGROUPR14=... IROU
 `selftest RESULT js0=PASS js1=PASS`, then `irq counts mode=irq job=N mmu=0 spurious=0 unhandled_spi=0 last_unhandled=0`.
 Pass = selftest PASS, job >= 2, spurious 0, unhandled_spi 0. Any attach refusal (`-> 1` precheck, `-> 5` did not stick) leaves `mode=poll` and the
 old polling; nothing is written for a refused precheck. Then with the replay: `--gpujob ... --args 'sweetmali=0x300'`, same `replay tri=PASS`.
+
+## G5: dev overlay first runs, then sweetgl_selftest (plan oneshot-2 step G5; PREPARED, UNRUN; writes the iOS root)
+
+Kernel for every G5 run: `$A/xnu-local-lane-g-63384af/kernel.development.sweet` (stack up to 0155; has 0048 /dev/null tee, 0104/0105 SweetMali,
+0117 dev overlay; NOT 0157). Common flags (lane rules): `SWEET_USBLOG_PORT=64738 tools/xrun --kernel <K> --board oriole --no-camera --gui --rails --cpus 8
+--lock-wait 3600 --restart 600,bootloader --hard-timeout 600 --fail-on "panic\(" --fail-on "Kernel trap" --expect SBCoverSheet`. Overlays (not in git):
+`$A/gpu/g5/ov*/`, archives `$A/gpu/g5/*.bin` (`tools/mkdevoverlay.py DIR OUT.bin`, default owner 0:0; xrun `--overlay DIR` packs again itself).
+One new thing per boot; stop G5 at the first FAIL and follow the checklist's recovery above.
+
+| Run | Overlay (`--overlay`) | Extra | Pass |
+|---|---|---|---|
+| g5-dev1 | `ov1-hello`: `/private/var/dev/hello` = `hello\n` (new file) | - | `SWEET DEV: wrote /private/var/dev/hello 6 bytes`, `done: 1 written, 0 skipped, 0 refused/failed`, SBCoverSheet |
+| g5-dev2 | same | - | `skipped /private/var/dev/hello 6 bytes (identical)`, `done: 0 written, 1 skipped` |
+| g5-dev3a | `ov3a-marker`: `/usr/local/pixos/marker` = `pixos marker v1\n` (new file + new dir under /usr/local) | - | `wrote /usr/local/pixos/marker 16 bytes`, `done: 1 written` |
+| g5-dev3b | `ov3b-marker`: same path, `v2` (first replacement: tmp + rename, `.sweetorig` = v1, review F4) | - | `wrote /usr/local/pixos/marker 16 bytes`, `done: 1 written` |
+| g5-dev3c | `ov3b-marker` | `--args "sweetdev=restore"` | `SWEET DEV: restored /usr/local/pixos/marker` |
+| g5-st1 | G5 content (below; NOT prepared yet) | `--gpu-handover --intent gpu --args "sweetmali=1 sweetnull=backboardd,SpringBoard,<launcher name>"` | `sweetgl selftest: clear=PASS tri=PASS` |
+
+The fail-on list of the checklist applies to every row (`SWEET DEV: (refused|failed|sync error|bad archive|...)`, `mounting dirty non-journaled root`).
+
+G5 content still open (lane G stopped; see the G5-READY report): (1) a launcher that waits for the SweetMali service and runs
+`sweetgl_selftest` at most once per boot with its output on /dev/null (spec: `$A/gpu/g5/spec/test_sweetgl_once.py`); (2) a host tool that writes
+the replacement `/System/Library/xpc/launchd.plist` = the flashed root's cache (extracted read-only from `$A/ios-root-oriole-v2.img`,
+sha256 `7aab4ecbdaec394205a955f0dce2abf9dd571614b3aee53eaa7439d455763ede`, 523 LaunchDaemons, no `org.pixelios` job) plus exactly one job
+`org.pixelios.sweetgl-selftest` (RunAtLoad, UserName root, no KeepAlive), with a test that the only difference is that job. Files of that run would be
+new files only: `/usr/local/bin/sweetgl_selftest`, `/usr/local/lib/libsweetgl.dylib` (20.9 MB: the U1 size ramp applies, research 41), the launcher,
+plus the one replacement `launchd.plist` (kept as `.sweetorig`; `sweetdev=restore` puts it back).
+One-client rule (0105): with `sweetmali=1` and no `sweetenv`, backboardd does not load libsweetgl and never opens SweetMali, so the self-test is the only
+client; the user client accepts root (the job runs as root).
