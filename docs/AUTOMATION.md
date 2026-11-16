@@ -664,13 +664,13 @@ First run: one CPU, selftest only (doc 35 s.8 item 8):
 
 ```bash
 SWEET_USBLOG_PORT=64738 tools/xrun --kernel <kernel> --board oriole --no-camera --gui --rails --cpus 1 --gpu-handover --intent gpu \
-  --args 'sweetmali=0x202' --expect 'SWEET MALI: irq counts' --fail-on 'panic\(' \
+  --args 'sweetmali=0x202' --expect 'SWEET MALI: irq counts mode=irq job=([2-9]|[1-9][0-9])' --fail-on 'irq attach failed' --fail-on 'panic\(' \
   --label gpu-o3-g4-irq1 --lock-wait 3600 --restart 600,bootloader --hard-timeout 600
 ```
 
 Lines: `SWEET MALI: irq attach INTID 452 -> 0 ISENABLER14=... IGROUPR14=... IROUTER=...` (and 453), `irq mode on`, the usual
-`selftest RESULT js0=PASS js1=PASS`, then `irq counts mode=irq job=N mmu=0 spurious=0 unhandled_spi=0 last_unhandled=0`.
-Pass = selftest PASS, job >= 2, spurious 0, unhandled_spi 0. Any attach refusal (`-> 1` precheck, `-> 5` did not stick) leaves `mode=poll` and the
+`selftest RESULT js0=PASS js1=PASS`, then `irq counts mode=irq job=N mmu=0 spurious=0 unhandled_spi=0 storms=0 last_unhandled=0`.
+Pass = selftest PASS, mode=irq, job >= 2, unhandled_spi 0, storms 0; a small non-zero spurious is a note, not a failure (review 0157 F8; bounded since F2). `mode=poll` is its own outcome (FAIL of this step, but safe). Any attach refusal (`-> 1` precheck, `-> 5` did not stick) leaves `mode=poll` and the
 old polling; nothing is written for a refused precheck. Then with the replay: `--gpujob ... --args 'sweetmali=0x300'`, same `replay tri=PASS`.
 
 ## G5: dev overlay first runs, then sweetgl_selftest (plan oneshot-2 step G5; PREPARED, UNRUN; writes the iOS root)

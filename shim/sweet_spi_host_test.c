@@ -1,4 +1,4 @@
-/* Host unit test for the pure SPI table of xnu patch 0157 (osfmk/arm64/sweet_spi.h, docs/research/35 s.6/s.8): allowlist (INTID 452/453 only,
+/* Host unit test for the pure SPI table of xnu patch 0157 (pexpert/arm/sweet_spi.h, docs/research/35 s.6/s.8): allowlist (INTID 452/453 only,
  * never 451), GICD offsets/bits, the attach preconditions on the read-back state and the IRQ dispatch decision (handler or mask-and-count).
  * shim/build.sh extracts the header from the patch. Built with -Werror and with ASan/UBSan. */
 #include <assert.h>
@@ -7,8 +7,9 @@
 #include "sweet_spi.h"
 
 static int hits[2];
-static void h0(void *a) { (void)a; hits[0]++; }
-static void h1(void *a) { (void)a; hits[1]++; }
+static int mine0 = 1;
+static int h0(void *a) { (void)a; hits[0]++; return mine0; }
+static int h1(void *a) { (void)a; hits[1]++; return 1; }
 
 int
 main(void)
@@ -78,6 +79,36 @@ main(void)
 	assert(sweet_spi_mask_reg(600, &off, &bit) == 0 && off == SSPI_ICENABLER + 4 * (600 / 32) && bit == (1u << (600 % 32)));
 	assert(sweet_spi_mask_reg(31, &off, &bit) != 0 && sweet_spi_mask_reg(1020, &off, &bit) != 0);
 	assert(sweet_spi_mask_reg(1019, &off, &bit) == 0 && off < 0x200);
+
+	/* review 0157 F1: ownership = the ISENABLER bit sticks; IGROUPR is RAZ/WI for Non-secure on this GIC (DS = 0), so it is printed, not required */
+	assert(sweet_spi_attach_ok(1u << 4, 0, 1u << 4) == 1);
+	assert(sweet_spi_attach_ok(1u << 4, 1u << 4, 1u << 4) == 1);
+	assert(sweet_spi_attach_ok(1u << 5, 0xFFFFFFFFu, 1u << 4) == 0);
+	assert(sweet_spi_attach_ok(0, 0xFFFFFFFFu, 1u << 4) == 0);
+
+	/* review 0157 F2: an attached handler that keeps answering "not mine" (STATUS 0 while the line stays high) is masked after SSPI_STORM_MAX
+	 * consecutive entries; one "mine" resets the run */
+	{
+		static struct sweet_spi_table s2;
+		assert(sweet_spi_set(&s2, 452, h0, NULL) == 0);
+		mine0 = 0;
+		for (unsigned i = 0; i + 1 < SSPI_STORM_MAX; i++) {
+			assert(sweet_spi_dispatch(&s2, 452) == SSPI_HANDLED);
+		}
+		mine0 = 1;
+		assert(sweet_spi_dispatch(&s2, 452) == SSPI_HANDLED);   /* resets */
+		mine0 = 0;
+		for (unsigned i = 0; i + 1 < SSPI_STORM_MAX; i++) {
+			assert(sweet_spi_dispatch(&s2, 452) == SSPI_HANDLED);
+		}
+		assert(s2.storms == 0);
+		assert(sweet_spi_dispatch(&s2, 452) == SSPI_MASK);      /* the SSPI_STORM_MAX-th in a row */
+		assert(s2.storms == 1 && s2.last_unhandled == 452);
+		assert(sweet_spi_dispatch(&s2, 452) == SSPI_MASK);      /* stays masked: the slot was cleared */
+		mine0 = 1;
+		int before = hits[0];
+		assert(sweet_spi_dispatch(&s2, 452) == SSPI_MASK && hits[0] == before);   /* the detached handler never runs again */
+	}
 
 	printf("sweet_spi_host_test: PASS\n");
 	return 0;

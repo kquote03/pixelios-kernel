@@ -30,6 +30,12 @@ MUTANTS = [
     ("no unhandled count", "\tt->unhandled++;\n", ""),
     ("no last unhandled", "\tt->last_unhandled = intid;\n", ""),
     ("affinity keeps MT", "return mpidr & 0xFF00FFFFFFull;", "return mpidr & 0xFFFFFFFFFFull;"),
+    ("F1 require IGROUPR", "\t(void)igroupr;\n\treturn (isen & bit) != 0;", "\treturn (isen & bit) != 0 && (igroupr & bit) != 0;"),
+    ("F1 ignore ISENABLER", "\t(void)igroupr;\n\treturn (isen & bit) != 0;", "\t(void)igroupr;\n\t(void)isen;\n\treturn bit != 0;"),
+    ("F2 no storm limit", "if (++t->slot[i].notmine < SSPI_STORM_MAX) {", "if (++t->slot[i].notmine || 1) {"),
+    ("F2 no reset on mine", "\t\t\t\tt->slot[i].notmine = 0;\n\t\t\t\treturn SSPI_HANDLED;", "\t\t\t\treturn SSPI_HANDLED;"),
+    ("F2 slot kept after storm", "\t\t\tt->slot[i].fn = NULL;    /* review 0157 F2", "\t\t\t(void)0;    /* review 0157 F2"),
+    ("F2 storms not counted", "\t\t\tt->storms++;\n", ""),
 ]
 
 

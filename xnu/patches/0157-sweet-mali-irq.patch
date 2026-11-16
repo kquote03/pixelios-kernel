@@ -2,15 +2,24 @@ SWEET MALI interrupts (patch 0157, plan oneshot-2 step G4, docs/research/35 s.8)
 and MMU interrupts (INTID 452/453 = SPI 420/421, stock oriole DT; GPU INTID 451 is never attached) instead of the 200 us poll.
 - pexpert/arm/sweet_spi.h (pure, shim/sweet_spi_host_test.c): allowlist 452/453, GICD offsets, attach preconditions, IRQ dispatch decision.
 - pe_fiq.c: sweet_spi_attach/detach + sweet_spi_irq. Attach READS ICFGR/IGRPMODR/IROUTER (must be level / 0 / this CPU, as the 0109 probe read
-  them) and writes only ICENABLER, ICPENDR, ICACTIVER, IGROUPR |= bit, ISENABLER (bounded RWP waits), then reads back; not sticking = detach.
+  them) and writes only ICENABLER, ICPENDR, ICACTIVER, IGROUPR |= bit, ISENABLER (bounded RWP waits), then reads back. Ownership = the ISENABLER
+  bit sticks; IGROUPR is printed, not required (review 0157 F1: RAZ/WI for Non-secure with two security states). Not sticking = detach, polling.
 - sleh.c: SPIs go to sweet_spi_irq first. Once any SPI is attached the net is armed: an SPI without a handler is masked (ICENABLER) and counted
   instead of being EOId and re-taken forever (review M2). Before the first attach nothing changes.
-- sweet_mali.c: ISR reads *_IRQ_STATUS, writes that *_IRQ_MASK to 0, counts, wakes sm_thread; masks armed at submit (slot done/fail bits,
-  MMU AS0 page fault + bus error), zeroed in finish(); sm_thread keeps check_job and its timeouts, fallback deadline 5 ms; dead = GIC detach
-  then masks 0; review 0155 F1: a replay submit failure other than EINVAL leaks the BOs (a job may run); counts printed: "SWEET MALI: irq counts mode=... job=N mmu=N spurious=N unhandled_spi=N". Without bit 0x200 nothing changes.
+- sweet_mali.c: ISR reads *_IRQ_STATUS, writes that *_IRQ_MASK to 0, counts, wakes sm_thread, returns 1. STATUS 0 = "not mine": both masks to 0
+  and return 0; SSPI_STORM_MAX (64) consecutive "not mine" entries detach the slot and mask the SPI (review 0157 F2; counted as storms).
+  Masks armed at submit (slot done/fail bits, MMU AS0 page fault + bus error), zeroed in finish(); sm_thread keeps check_job and its timeouts,
+  fallback deadline 5 ms; dead = GIC detach then masks 0; review 0155 F1: a replay submit failure other than EINVAL leaks the BOs.
+  Counts: "SWEET MALI: irq counts mode=... job=N mmu=N spurious=N unhandled_spi=N storms=N last_unhandled=N". Without bit 0x200 nothing changes.
+Known limits (review 0157): F5 no barriers between the table stores, the net flag and the enable, and dispatch reads fn/intid/arg separately:
+only safe because both SPIs route to the attaching CPU and the first runs use --cpus 1 (two-CPU use needs ordering). F6 sm.dead set by map/unmap
+does not wake sm_thread, so the GIC detach can lag up to 1 s idle (masks are 0 then, lines low). F7 the net stays armed for the rest of the boot
+after the first attach that passed the precheck (also after EIO/detach): any later Non-secure SPI without a handler is masked; a future driver
+must use sweet_spi_attach. F9 IPRIORITYR is neither written nor printed (probe read 0, passes PMR 0xFF): on "mode=irq job=0" read it and
+ISPENDR14 first. A small non-zero spurious count is a note, not a failure (F8).
 
 diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
-index c882063..f7aa5e2 100644
+index c882063..be14405 100644
 --- a/bsd/dev/sweet_mali.c
 +++ b/bsd/dev/sweet_mali.c
 @@ -64,6 +64,7 @@ extern int sweet_gpu_power_on(volatile uint32_t *g);
@@ -53,7 +62,7 @@ index c882063..f7aa5e2 100644
  	if (failed) {
  		sm.fail_seq[sm.busy_seq % 32] = sm.busy_seq;
  	}
-@@ -281,6 +293,93 @@ check_job(void)
+@@ -281,6 +293,103 @@ check_job(void)
  	}
  }
  
@@ -61,38 +70,48 @@ index c882063..f7aa5e2 100644
 + * The Mali line is RAWSTAT & MASK (doc 35 s.2); the masks stay 0 except while a job runs. The ISR (IRQ context: no lock, no printf) reads
 + * STATUS, writes that source's MASK to 0 (drops the level line, keeps RAWSTAT for check_job), counts and wakes sm_thread; clearing and all
 + * fault/stop logic stay in check_job. SPI 419 (GPU) is never attached. */
-+extern int sweet_spi_attach(uint32_t intid, void (*fn)(void *), void *arg, uint32_t *isen, uint32_t *igroupr, uint64_t *irouter);
++extern int sweet_spi_attach(uint32_t intid, int (*fn)(void *), void *arg, uint32_t *isen, uint32_t *igroupr, uint64_t *irouter);
 +extern void sweet_spi_detach(uint32_t intid);
-+extern void sweet_spi_counts(uint32_t *unhandled, uint32_t *last);
++extern void sweet_spi_counts(uint32_t *unhandled, uint32_t *last, uint32_t *storms);
 +
-+static void
++/* returns 1 = ours (STATUS != 0); 0 = not mine: both masks go to 0 so a line this handler cannot see drops too, and sweet_spi_dispatch
++ * masks the SPI after SSPI_STORM_MAX such entries in a row (review 0157 F2) */
++static int
 +sm_isr_job(void *arg __unused)
 +{
 +	if (!sm.up || sm.g == NULL) {
-+		return;
++		return 0;
 +	}
 +	if (rr(R_JOB_STATUS) == 0) {
-+		sm.irq_spurious++;
-+	} else {
 +		wr(R_JOB_MASK, 0);
-+		sm.irq_job++;
++		wr(R_MMU_MASK, 0);
++		sm.irq_spurious++;
++		thread_wakeup((event_t)&sm.thread);
++		return 0;
 +	}
++	wr(R_JOB_MASK, 0);
++	sm.irq_job++;
 +	thread_wakeup((event_t)&sm.thread);
++	return 1;
 +}
 +
-+static void
++static int
 +sm_isr_mmu(void *arg __unused)
 +{
 +	if (!sm.up || sm.g == NULL) {
-+		return;
++		return 0;
 +	}
 +	if (rr(R_MMU_STATUS) == 0) {
-+		sm.irq_spurious++;
-+	} else {
++		wr(R_JOB_MASK, 0);
 +		wr(R_MMU_MASK, 0);
-+		sm.irq_mmu++;
++		sm.irq_spurious++;
++		thread_wakeup((event_t)&sm.thread);
++		return 0;
 +	}
++	wr(R_MMU_MASK, 0);
++	sm.irq_mmu++;
 +	thread_wakeup((event_t)&sm.thread);
++	return 1;
 +}
 +
 +/* GIC first (no GPU access needed), then the masks */
@@ -138,16 +157,16 @@ index c882063..f7aa5e2 100644
 +static void
 +sm_irq_report(void)
 +{
-+	uint32_t un = 0, last = 0;
++	uint32_t un = 0, last = 0, storms = 0;
 +
-+	sweet_spi_counts(&un, &last);
-+	printf("SWEET MALI: irq counts mode=%s job=%u mmu=%u spurious=%u unhandled_spi=%u last_unhandled=%u\n", sm.irq_on ? "irq" : "poll",
-+	    sm.irq_job, sm.irq_mmu, sm.irq_spurious, un, last);
++	sweet_spi_counts(&un, &last, &storms);
++	printf("SWEET MALI: irq counts mode=%s job=%u mmu=%u spurious=%u unhandled_spi=%u storms=%u last_unhandled=%u\n", sm.irq_on ? "irq" : "poll",
++	    sm.irq_job, sm.irq_mmu, sm.irq_spurious, un, storms, last);
 +}
  static void
  sm_thread(void *arg __unused, wait_result_t w __unused)
  {
-@@ -290,8 +389,11 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+@@ -290,8 +399,11 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
  		if (sm.busy) {
  			check_job();
  		}
@@ -160,7 +179,7 @@ index c882063..f7aa5e2 100644
  		} else {
  			clock_interval_to_deadline(1000000, NSEC_PER_USEC, &dl);   /* idle: woken by submit */
  		}
-@@ -468,6 +570,10 @@ sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq)
+@@ -468,6 +580,10 @@ sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq)
  	wr(R_JS_BASE(slot) + JS_AFFINITY_NEXT, SHADERS);
  	wr(R_JS_BASE(slot) + JS_AFFINITY_NEXT + 4, 0);
  	wr(R_JS_BASE(slot) + JS_CONFIG_NEXT, JS_CONFIG_VAL);
@@ -171,7 +190,7 @@ index c882063..f7aa5e2 100644
  	sm.busy = 1;
  	wr(R_JS_BASE(slot) + JS_COMMAND_NEXT, JS_CMD_START);
  	*seq = sm.busy_seq;
-@@ -865,6 +971,9 @@ sm_replay_job(const uint8_t *buf, size_t len, unsigned idx, int *stop)
+@@ -865,6 +981,9 @@ sm_replay_job(const uint8_t *buf, size_t len, unsigned idx, int *stop)
  		rc = sweet_mali_submit(j.jc[c], (j.req[c] & SMR_REQ_FS) ? SWEET_MALI_REQ_FS : 0, &seq);
  		if (rc != 0) {
  			printf("SWEET MALI: replay %s=FAIL chain %u submit %d\n", j.name, c, rc);
@@ -181,7 +200,7 @@ index c882063..f7aa5e2 100644
  			goto out;
  		}
  		rc = sweet_mali_wait(seq, SMR_WAIT_US);
-@@ -997,6 +1106,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -997,6 +1116,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  	if (sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0)) {
  		return;
  	}
@@ -191,7 +210,7 @@ index c882063..f7aa5e2 100644
  	if ((mode & 3u) == 2) {
  		sm_selftest();
  	}
-@@ -1007,6 +1119,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+@@ -1007,6 +1129,9 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
  			sm_replay();
  		}
  	}
@@ -229,10 +248,10 @@ index 24f1abc..90a052c 100644
  			    cdp->interrupt_refCon,
  			    cdp->interrupt_nub,
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..59007a0 100644
+index 6089db9..d1995da 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -222,6 +222,122 @@ pe_init_fiq()
+@@ -222,6 +222,123 @@ pe_init_fiq()
  	__builtin_arm_isb(ISB_SY);
  #endif /* SWEET */
  }
@@ -280,12 +299,13 @@ index 6089db9..59007a0 100644
 +	return 1;
 +}
 +
-+void sweet_spi_counts(uint32_t *unhandled, uint32_t *last);
++void sweet_spi_counts(uint32_t *unhandled, uint32_t *last, uint32_t *storms);
 +void
-+sweet_spi_counts(uint32_t *unhandled, uint32_t *last)
++sweet_spi_counts(uint32_t *unhandled, uint32_t *last, uint32_t *storms)
 +{
 +	*unhandled = sweet_spi_tab.unhandled;
 +	*last = sweet_spi_tab.last_unhandled;
++	*storms = sweet_spi_tab.storms;
 +}
 +
 +void sweet_spi_detach(uint32_t intid);
@@ -305,9 +325,9 @@ index 6089db9..59007a0 100644
 +/* 0 = attached and enabled (ISENABLER read back set). Writes, in order: ICENABLER, ICPENDR, ICACTIVER, IGROUPR |= bit, (RWP), ISENABLER, (RWP).
 + * ICFGR, IGRPMODR and IROUTER are only READ: they must already say level / group-modifier 0 / this CPU (the 0109 probe read 0, 0, 0 on oriole),
 + * else nothing is written (EPERM). *isen, *igroupr, *irouter: read back for the caller's log line. */
-+int sweet_spi_attach(uint32_t intid, void (*fn)(void *), void *arg, uint32_t *isen, uint32_t *igroupr, uint64_t *irouter);
++int sweet_spi_attach(uint32_t intid, int (*fn)(void *), void *arg, uint32_t *isen, uint32_t *igroupr, uint64_t *irouter);
 +int
-+sweet_spi_attach(uint32_t intid, void (*fn)(void *), void *arg, uint32_t *isen, uint32_t *igroupr, uint64_t *irouter)
++sweet_spi_attach(uint32_t intid, int (*fn)(void *), void *arg, uint32_t *isen, uint32_t *igroupr, uint64_t *irouter)
 +{
 +	struct sweet_spi_regs r;
 +	struct sweet_spi_state s;
@@ -344,8 +364,8 @@ index 6089db9..59007a0 100644
 +	(void)sweet_spi_rwp_wait();
 +	*isen = gicd_read32(SSPI_ISENABLER + r.word_off);
 +	*igroupr = gicd_read32(SSPI_IGROUPR + r.word_off);
-+	if (!(*isen & r.bit) || !(*igroupr & r.bit)) {
-+		sweet_spi_detach(intid);   /* did not stick: Non-secure cannot own this SPI */
++	if (!sweet_spi_attach_ok(*isen, *igroupr, r.bit)) {
++		sweet_spi_detach(intid);   /* the enable did not stick: Non-secure cannot own this SPI (IGROUPR is RAZ/WI here, review 0157 F1) */
 +		return 5;               /* EIO */
 +	}
 +	return 0;
@@ -357,10 +377,10 @@ index 6089db9..59007a0 100644
  pe_init_fiq()
 diff --git a/pexpert/arm/sweet_spi.h b/pexpert/arm/sweet_spi.h
 new file mode 100644
-index 0000000..2e614c2
+index 0000000..acce3ee
 --- /dev/null
 +++ b/pexpert/arm/sweet_spi.h
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,189 @@
 +/*
 + * GIC SPI table for the sweet port (patch 0157, docs/research/35 s.6/s.8): which SPIs a driver may attach (allowlist: INTID 452 = Mali JOB,
 + * 453 = Mali MMU; never 451 = Mali GPU, doc 35 s.8 item 6), where their GICD bits live, the attach preconditions on the read-back state, and
@@ -387,6 +407,7 @@ index 0000000..2e614c2
 +#define SSPI_CTLR_RWP   (1u << 31)
 +#define SSPI_IROUTER_IRM (1ull << 31)
 +#define SSPI_SLOTS      2u
++#define SSPI_STORM_MAX  64u    /* review 0157 F2: consecutive "not mine" handler returns before the SPI is masked */
 +
 +enum { SSPI_HANDLED = 0, SSPI_MASK = 1, SSPI_NOT_SPI = 2 };
 +
@@ -408,10 +429,11 @@ index 0000000..2e614c2
 +struct sweet_spi_table {
 +	struct {
 +		uint32_t intid;
-+		void (*fn)(void *);
++		int (*fn)(void *);      /* returns 1 = the source was ours (STATUS != 0), 0 = not mine */
 +		void *arg;
++		uint32_t notmine;       /* consecutive 0 returns */
 +	} slot[SSPI_SLOTS];
-+	uint32_t unhandled, last_unhandled;
++	uint32_t unhandled, last_unhandled, storms;
 +};
 +
 +static int
@@ -476,7 +498,7 @@ index 0000000..2e614c2
 +}
 +
 +static int
-+sweet_spi_set(struct sweet_spi_table *t, uint32_t intid, void (*fn)(void *), void *arg)
++sweet_spi_set(struct sweet_spi_table *t, uint32_t intid, int (*fn)(void *), void *arg)
 +{
 +	unsigned i, free_i = SSPI_SLOTS;
 +
@@ -496,6 +518,7 @@ index 0000000..2e614c2
 +	}
 +	t->slot[free_i].intid = intid;
 +	t->slot[free_i].arg = arg;
++	t->slot[free_i].notmine = 0;
 +	t->slot[free_i].fn = fn;                /* last: the IRQ path keys on fn */
 +	return 0;
 +}
@@ -510,6 +533,15 @@ index 0000000..2e614c2
 +	}
 +}
 +
++/* review 0157 F1: ownership = the ISENABLER bit stuck. IGROUPR is printed but not required: with two security states (DS = 0) it is
++ * RAZ/WI for Non-secure accesses [guess, GICv3 rule], like GICR_IGROUPR0 on this port (pe_fiq.c note). */
++static int
++sweet_spi_attach_ok(uint32_t isen, uint32_t igroupr, uint32_t bit)
++{
++	(void)igroupr;
++	return (isen & bit) != 0;
++}
++
 +/* IRQ context: SSPI_HANDLED (the handler ran), SSPI_MASK (no handler: the caller masks the SPI; counted here), SSPI_NOT_SPI */
 +static int
 +sweet_spi_dispatch(struct sweet_spi_table *t, uint32_t intid)
@@ -518,10 +550,19 @@ index 0000000..2e614c2
 +		return SSPI_NOT_SPI;
 +	}
 +	for (unsigned i = 0; i < SSPI_SLOTS; i++) {
-+		void (*fn)(void *) = t->slot[i].fn;
++		int (*fn)(void *) = t->slot[i].fn;
 +		if (fn != NULL && t->slot[i].intid == intid) {
-+			fn(t->slot[i].arg);
-+			return SSPI_HANDLED;
++			if (fn(t->slot[i].arg)) {
++				t->slot[i].notmine = 0;
++				return SSPI_HANDLED;
++			}
++			if (++t->slot[i].notmine < SSPI_STORM_MAX) {
++				return SSPI_HANDLED;
++			}
++			t->slot[i].fn = NULL;    /* review 0157 F2: a level line nobody claims: detach and let the caller mask it */
++			t->storms++;
++			t->last_unhandled = intid;
++			return SSPI_MASK;
 +		}
 +	}
 +	t->unhandled++;
