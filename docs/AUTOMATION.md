@@ -675,22 +675,58 @@ old polling; nothing is written for a refused precheck. Then with the replay: `-
 
 ## G5: dev overlay first runs, then sweetgl_selftest (plan oneshot-2 step G5; PREPARED, UNRUN; writes the iOS root)
 
-Kernel for every G5 run: `$A/xnu-local-lane-g-63384af/kernel.development.sweet` (stack up to 0155; has 0048 /dev/null tee, 0104/0105 SweetMali,
-0117 dev overlay; NOT 0157). Common flags (lane rules): `SWEET_USBLOG_PORT=64738 tools/xrun --kernel <K> --board oriole --no-camera --gui --rails --cpus 8
---lock-wait 3600 --restart 600,bootloader --hard-timeout 600 --fail-on "panic\(" --fail-on "Kernel trap" --expect SBCoverSheet`. Overlays (not in git):
-`$A/gpu/g5/ov*/`, archives `$A/gpu/g5/*.bin` (`tools/mkdevoverlay.py DIR OUT.bin`, default owner 0:0; xrun `--overlay DIR` packs again itself).
-One new thing per boot; stop G5 at the first FAIL and follow the checklist's recovery above.
+Review: `docs/reviews/g5-dev-overlay-first-runs-review-fable-1.md` (SAFE-AFTER-FIXES, fixes F1-F8 applied here). Scheduled by the orchestrator after
+all other phone work; stop G5 at the first FAIL (stricter than plan stop H5: `hfs_mountroot failed` in 2 GUI runs in a row ends every root run).
+Kernel for every run: `$A/xnu-local-lane-g-63384af/kernel.development.sweet` (stack up to 0155: 0048 /dev/null tee, 0104/0105 SweetMali, 0117 dev
+overlay incl. efc1233; NOT 0157). One new thing per boot.
 
-| Run | Overlay (`--overlay`) | Extra | Pass |
-|---|---|---|---|
-| g5-dev1 | `ov1-hello`: `/private/var/dev/hello` = `hello\n` (new file) | - | `SWEET DEV: wrote /private/var/dev/hello 6 bytes`, `done: 1 written, 0 skipped, 0 refused/failed`, SBCoverSheet |
-| g5-dev2 | same | - | `skipped /private/var/dev/hello 6 bytes (identical)`, `done: 0 written, 1 skipped` |
-| g5-dev3a | `ov3a-marker`: `/usr/local/pixos/marker` = `pixos marker v1\n` (new file + new dir under /usr/local) | - | `wrote /usr/local/pixos/marker 16 bytes`, `done: 1 written` |
-| g5-dev3b | `ov3b-marker`: same path, `v2` (first replacement: tmp + rename, `.sweetorig` = v1, review F4) | - | `wrote /usr/local/pixos/marker 16 bytes`, `done: 1 written` |
-| g5-dev3c | `ov3b-marker` | `--args "sweetdev=restore"` | `SWEET DEV: restored /usr/local/pixos/marker` |
-| g5-st1 | G5 content (below; NOT prepared yet) | `--gpu-handover --intent gpu --args "sweetmali=1 sweetnull=backboardd,SpringBoard,<launcher name>"` | `sweetgl selftest: clear=PASS tri=PASS` |
+Overlays (not in git) and their archives (`tools/mkdevoverlay.py DIR OUT.bin`, owner 0:0):
 
-The fail-on list of the checklist applies to every row (`SWEET DEV: (refused|failed|sync error|bad archive|...)`, `mounting dirty non-journaled root`).
+| Dir | Content | Archive sha256 |
+|---|---|---|
+| `$A/gpu/g5/ov1-hello` | `/private/var/dev/hello` = `hello\n` (6 B) | `1f2fb6e9e3444a1b1edde6f77dbfa7129cf19f6447cac8bb79497d2f1a997b86` |
+| `$A/gpu/g5/ov3a-marker` | `/usr/local/pixos/marker` = `pixos marker v1\n` (16 B) | `2cb7bef05245fa9c03f976b57722ad1807ed0cbe420fd828cac36e3998515f34` |
+| `$A/gpu/g5/ov3b-marker` | `/usr/local/pixos/marker` = `pixos marker v2\n` (16 B) | `a3d1d4e26c87a553fd8583403e1f25338f7c87f8af4ffa46d400937808c9504c` |
+
+**Before each run** (xrun packs `--overlay DIR` itself): re-pack and compare, stop on a mismatch:
+`python3 -I tools/mkdevoverlay.py $A/gpu/g5/<dir> /tmp/<dir>.bin && sha256sum /tmp/<dir>.bin` = the value above.
+
+```bash
+A=~/pixelios-artifacts; K=$A/xnu-local-lane-g-63384af/kernel.development.sweet
+C=(--kernel "$K" --board oriole --no-camera --gui --rails --cpus 8 --lock-wait 3600 --restart 600,bootloader --hard-timeout 600 --expect SBCoverSheet
+   --fail-on 'SWEET DEV: (refused|failed|sync error|bad archive|sweetdev=.* but no SWEETDEV|root is not mounted|out of memory|restore .*: no \.sweetorig)'
+   --fail-on 'mounting dirty non-journaled root' --fail-on 'SWEET UFS: (refusing write|command 0x2a)' --fail-on 'panic\(' --fail-on 'Kernel trap')
+D='SWEET DEV: done:'
+# g5-dev0 (F4): RAM disk present, hook inert (first boot with a RAMDisk node next to rd=ufsroot0; no write)
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov1-hello --args 'sweetdev=0' --fail-on 'SWEET DEV:' --label g5-dev0
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov1-hello   --label g5-dev1  --expect 'SWEET DEV: wrote /private/var/dev/hello 6 bytes' --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov1-hello   --label g5-dev2  --expect 'SWEET DEV: skipped /private/var/dev/hello 6 bytes \(identical\)' --expect "$D 0 written, 1 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov3a-marker --label g5-dev3a --expect 'SWEET DEV: wrote /usr/local/pixos/marker 16 bytes [0-9]+ ms' --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov3b-marker --label g5-dev3b --expect 'SWEET DEV: wrote /usr/local/pixos/marker 16 bytes \(original kept\)' --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov3b-marker --label g5-dev3c --args 'sweetdev=restore' --expect 'SWEET DEV: restored /usr/local/pixos/marker' --expect "$D 1 written, 0 skipped, 0 refused/failed"
+# g5-dev3d (F5): reads the restore back (v1 again), writes nothing
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov3a-marker --label g5-dev3d --expect 'SWEET DEV: skipped /usr/local/pixos/marker 16 bytes \(identical\)' --expect "$D 0 written, 1 skipped, 0 refused/failed"
+```
+
+| Run | Proves | Pass (all: `--expect SBCoverSheet`, no fail-on) |
+|---|---|---|
+| g5-dev0 | payload RAM disk next to `rd=ufsroot0`, hook inert | no `SWEET DEV:` line at all |
+| g5-dev1 | first write: new file, new dir `/private/var/dev` | `wrote /private/var/dev/hello 6 bytes`, `done: 1 written, 0 skipped, 0 refused/failed` |
+| g5-dev2 | read-back of dev1 from disk | `skipped ... (identical)`, `done: 0 written, 1 skipped, 0 refused/failed` |
+| g5-dev3a | new file + two new dirs (`/usr/local` is absent on the image, so `/usr/local` and `/usr/local/pixos`) | `wrote /usr/local/pixos/marker 16 bytes N ms` (no `(original kept)`), `done: 1 written, 0 skipped, 0 refused/failed` |
+| g5-dev3b | first replacement (tmp + rename), `.sweetorig` = v1 | `wrote ... 16 bytes (original kept)`, `done: 1 written, 0 skipped, 0 refused/failed` |
+| g5-dev3c | `sweetdev=restore` | `restored /usr/local/pixos/marker`, `done: 1 written, 0 skipped, 0 refused/failed` |
+| g5-dev3d | the restore reached the disk (file is v1 again) | `skipped ... (identical)`, `done: 0 written, 1 skipped, 0 refused/failed` |
+
+Check in every report that the shim/loader lines do not say `ramdisk overlaps kernel memory`. Optional (review F10): copy the re-packed `/tmp/<dir>.bin`
+next to the run's report. Final state after dev0-dev3d (created things are permanent, `restore` removes none, review F7): directories
+`/private/var/dev`, `/usr/local`, `/usr/local/pixos`; files `/private/var/dev/hello` (6 B), `/usr/local/pixos/marker` (v1, 16 B); no `.sweetorig`
+left after the restore [guess from the restore rename; dev3d only shows the content].
+Recovery (F2): as the checklist above; a damaged root is re-flashed by the user only, after confirming the image:
+`tools/fflash-userdata.sh $A/ios-root-oriole-v2.img --yes-erase-userdata --force` (`--force`: that image's hash is already in `$A/flashed-userdata.txt`).
+
+g5-st1 (sweetgl_selftest; NOT prepared): `--gpu-handover --intent gpu --args "sweetmali=1 sweetnull=backboardd,SpringBoard,<launcher name>"`, expect
+`sweetgl selftest: clear=PASS tri=PASS`, plus the C list.
 
 G5 content still open (lane G stopped; see the G5-READY report): (1) a launcher that waits for the SweetMali service and runs
 `sweetgl_selftest` at most once per boot with its output on /dev/null (spec: `$A/gpu/g5/spec/test_sweetgl_once.py`); (2) a host tool that writes
