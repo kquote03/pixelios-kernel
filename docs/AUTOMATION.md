@@ -639,3 +639,19 @@ header and at most 2 KiB of console text, printable bytes only, now and 2 s late
 Never written: EP Command (bus master), any BAR2 word after W14, rings, doorbells, host_cap. Left after the run: the firmware running (also after a W16/W17 stop),
 SYS_MEM out of reset, ATU region 2 enabled, cfg 0x84 = 0; a power cycle resets the chip. Reviews: docs/reviews/0150-wlan-fw-ready-review-fable-1.md (SAFE-AFTER-FIXES),
 -2.md (SAFE; G1-G6 L open: glue gate/latch for the release before any later store level, two cite texts, uncovered mutants X2/X3/X8/X9/X11/X15).
+
+## XNU sweetwlan=8: BCM4389 msgbuf setup + first ioctl round trip (patch 0159, plan oneshot-2 step W7; docs/research/51)
+
+Level 7 (above) plus run F: host_cap, the five common rings in a 256 KiB host pool, EP bus master ON, host-ready doorbell, `cur_etheraddr`
+and `ver` through the control rings (polled), guard check, bus master OFF. First step that lets the chip write host RAM.
+```
+SWEET_USBLOG_PORT=64738 tools/xrun --kernel ~/pixelios-artifacts/xnu-local-w8-<tag>/kernel.development.sweet --board oriole --no-camera --gui --rails --cpus 8 \
+  --wlan-hold --wlan-level 8 --wlanfw ~/pixelios-artifacts/wlan-fw/wlanfw-oriole.bin --intent wlan \
+  --expect 'SWEET WLAN: (stage 3 level 8 (done|stopped)|fw version)' --fail-on 'restore=failed|DMA suspect|bus_master=ON' --label o5-w7-l8 --restart 600,bootloader --lock-wait 3600
+```
+Pass: `SWEET WLAN: W24 device-to-host DMA works`, `SWEET WLAN: fw version <text> mac xx:xx:xx:xx:<b4>:<b5>`, `stage 3 level 8 done msgbuf round trip ok, bus master off`.
+A stop prints `W<row> STOP: <reason>`, the restore lines (EP Command := 0x2 first) and `left after stop: bus_master=...`.
+`no completion ... is untouched` = the firmware took the request but nothing reached the host pool (DMA blocked or no answer): the Wi-Fi
+ladder ends there, no secure-world call is tried. Left after the run: firmware running, bus master off, pool kept, ATU r2 enabled, cfg 0x84 = 0.
+Plan stop H10 applies (a panic outside Wi-Fi code or memory corruption signs in 2 runs ends the bus-master steps).
+Status: *not run yet* (built and host-tested 2026-11-16; needs a SAFE review first).

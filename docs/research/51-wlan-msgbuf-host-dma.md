@@ -91,7 +91,7 @@ Shared area (`pciedev_shared_t`, offsets from `shared`; `bwfm.h:111-148`):
   delivering completions with the mask closed is **[guess]** (U4).
 - **Messages** (little endian; `bwfm.h:193-214, 216-291`):
   - Common header (8 B): msgtype u8, ifidx u8, flags u8, rsvd u8, request_id u32.
-  - `IOCTLRESP_BUF_POST` 0x0B, 32 B: header, host_buf_len u16, 3 × u16 reserved, host_buf_addr low/high, 4 × u32 reserved.
+  - `IOCTLRESP_BUF_POST` 0x0B, 40 B (one control-submit item): header, host_buf_len u16 at +8, 3 × u16 reserved, host_buf_addr low/high at +16/+20, 4 × u32 reserved.
     Posted before a request so the firmware has a buffer for the answer (`bwfm.c:1307-1344`).
   - `IOCTLPTR_REQ` 0x09, 40 B: header, cmd u32, trans_id u16, input_buf_len u16, output_buf_len u16, 3 × u16 reserved,
     req_buf_addr low/high, 2 × u32 reserved (`bwfm.c:2470-2535`).
@@ -126,9 +126,10 @@ A power cycle resets the chip.
 - **R1 Pool only.** A tuple whose value is a host address takes it from writer state (`pool_pa` + a fixed offset from a
   compile-time layout table), never from the caller; the writer refuses if `offset + len > pool_len` or the pool is unset.
   Message fields that carry addresses are filled by one helper with the same check.
-- **R2 Bus master.** Set by exactly one tuple, only after W21, only from old Command 0x0002. Cleared on every exit path:
-  normal end, every stop, and first in the restore order, before the CA7 reset restore. The glue also clears it if the
-  writer returns with the BM group still armed.
+- **R2 Bus master.** Set by exactly one tuple, only after W21, only from old Command 0x0002. Cleared on every exit path while the link is in L0:
+  normal end, every stop, and first in the restore order, before the CA7 reset restore. If the link has left L0 no config
+  TLP is sent (as for every restore since patch 0147); the run then reports `bus_master=ON (restore not done)`. The firmware
+  knows only pool addresses and the pool is never freed, so a chip that comes back can still write only into the pool.
 - **R3 Bounded.** Every poll loop has a fixed count; no wait depends on the firmware.
 - **R4 TCM stores.** Only at addresses derived from the ring_info read in W18 and bounds-checked against RAM; index
   stores only with a value < the ring's depth and an old upper half of 0.
@@ -175,3 +176,16 @@ A power cycle resets the chip.
   at each stop point, index ≥ depth from the fake firmware, oversized resp_len, wrong trans_id, timeout, guard damage,
   level 7 writes nothing new).
 - `tools/test_wlan_wr_mutants.py`: add 0151 to both apply chains; one mutant per new guard.
+
+## 9. As implemented (patch 0159, 2026-11-16)
+
+- The patch is **0159-sweet-wlan-msgbuf** (0151 was released: the stack applies in number order and this patch builds on 0154).
+- Tuples: `SWT_F_LO` / `SWT_F_HI` (chip-RAM words, judged by `swl_f_kind()`), `SWT_BM_ON` / `SWT_BM_OFF`, `SWT_DB_RDY` / `SWT_DB_H2D`.
+  They are visible to `swl_wr_pick()` only at level 8, so the allowlist of levels ≤ 7 is the one it was (`swl_wr_ok()` unchanged).
+- Glue (`sw3_wr`), all only at level 8 after the release: EP Command only as 0x2 / 0x6 (0x6 only with a pool); doorbells 0x140 / 0x144 only
+  as 1 on the PCIe core window while the last Command store had the master bit; at most 96 chip-RAM stores (run F makes 39). This is
+  the explicit exception to the 0154 latch.
+- The test was written after the first draft of the code, not before it (the order TDD asks for was not kept for this patch). Every
+  rule R1–R9 has a negative case in `shim/wlan_wr_host_test.c` (`runf_tests`) and a mutant in `tools/test_wlan_wr_mutants.py`; a
+  fault sweep fails or drops each single run F store in turn and requires bus master off at the end.
+- **[guess]** still open on hardware: U1–U5, U7 of §7; the 256-byte request size of `ver`.

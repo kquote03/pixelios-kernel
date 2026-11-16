@@ -585,6 +585,10 @@ else
 	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0154-sweet-wlan-ca7-latch.patch > $O/sweet_wlan_wr.0154.diff
 	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0154.diff || { echo "FAIL patch 0154 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
 	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
+	# patch 0159 (run F: msgbuf setup, bus master, one ioctl round trip) changes it once more: the same way, on top of the text after 0154
+	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0159-sweet-wlan-msgbuf.patch > $O/sweet_wlan_wr.0159.diff
+	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0159.diff || { echo "FAIL patch 0159 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
+	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
 	chk "wlan_wr_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_wr_host_test wlan_wr_host_test.c
 	chk "wlan_wr_host_test" $O/wlan_wr_host_test
 	# the pure NVRAM part of the same header (process_nvram_vars port): known answers, no bus
