@@ -68,6 +68,10 @@ static struct {
 struct amp {
 	uint32_t mask1, ccm, st1;	/* IRQ1_MASK1, DSP1_CCM_CORE_CTRL, IRQ1_STATUS1 */
 	unsigned nwr, seq_bad;	/* write frames seen, out-of-sequence writes */
+	uint32_t revid;		/* 0 = B2 (0xB2) */
+	int ignore_mask;	/* the IRQ1_MASK1 write does not stick */
+	int drop_cs1_after_st1;	/* right after the pre-write IRQ1_STATUS1 read (L), CS1 is driven low (stuck) */
+	int st1_seen;
 	uint32_t st3;	/* IRQ1_STATUS3 (OTP_BOOT_ERR bit 31) */
 	int booted;		/* OTP done after boot_polls status reads since the reset release */
 	unsigned boot_polls, reads_since;
@@ -225,7 +229,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 				violate("a write outside the stock B2 sequence or out of order");
 			}
 			m->nwr++;
-			if (wa == 0x10110u) m->mask1 = wv;
+			if (wa == 0x10110u && !m->ignore_mask) m->mask1 = wv;
 			if (wa == 0x2BC1000u) m->ccm = wv;
 		}
 		if (p > 9)
@@ -236,6 +240,8 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 		violate("an address / pad byte clocked with the transmitter off");
 	if (p >= 4 && p < 6 && mosi != 0)
 		violate("a pad byte is not 0");
+	if (p == 5 && m->frame[0] == 0x80u && m->frame[1] == 0x01u && m->frame[2] == 0x00u && m->frame[3] == 0x10u)
+		m->st1_seen = 1;
 	if (p == 5) {
 		addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 		if (addr != REGS4[0] && addr != REGS4[1] && addr != REGS4[2] && addr != REGS4[3] && addr != 0x10010u && addr != 0x10110u && addr != 0x2BC1000u)
@@ -248,7 +254,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 	if (addr == 0x1001Cu && p == 6 && !m->booted && ++m->reads_since >= m->boot_polls)
 		m->booted = 1;
-	val = addr == 0x0u ? 0x35A40u : addr == 0x4u ? 0xB2u : addr == 0x1001Cu ? (m->booted ? 0x2u : 0u) : addr == 0x10110u ? m->mask1 :
+	val = addr == 0x0u ? 0x35A40u : addr == 0x4u ? (m->revid ? m->revid : 0xB2u) : addr == 0x1001Cu ? (m->booted ? 0x2u : 0u) : addr == 0x10110u ? m->mask1 :
 	      addr == 0x2BC1000u ? m->ccm : addr == 0x10010u ? m->st1 : addr == 0x10018u ? m->st3 : 0u;
 	return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
 }
@@ -298,6 +304,10 @@ static void pad_write(int b, unsigned r, uint32_t v)
 	for (int a = 0; a < 2; a++) {
 		if (before[a] && !cs_low(a))
 			amp[a].nf = 0;	/* chip select released: the next frame starts fresh */
+		if (a == 0 && before[0] && !cs_low(0) && amp[0].drop_cs1_after_st1 && amp[0].st1_seen) {
+			h.dat[1] &= ~1u;	/* CS1 stuck low from now on */
+			amp[0].drop_cs1_after_st1 = 0;
+		}
 		if (!before[a] && cs_low(a))
 			amp[a].nf = 0;
 		if (rel[a] && !released(a)) { amp[a].booted = 0; amp[a].was_released = 0; }
@@ -425,7 +435,7 @@ static void full_ok(const char *label, uint32_t mux0)
 	CHECK(rc == 0, label);
 	CHECK(violations == 0, why_v);
 	CHECK(has("SWEET AMP RESULT: l=0x35a40/0xb2 r=0x35a40/0xb2 restore=ok"), label);
-	CHECK(has("SWEET AMP: init ok l,r devid 35a40 rev b2, errors=0"), label);
+	CHECK(has("SWEET AMP: init ok (no otp unpack) l,r devid 35a40 rev b2, errors=0"), label);
 	CHECK(amp[0].nwr == 12 && amp[1].nwr == 12 && !amp[0].seq_bad && !amp[1].seq_bad, "each amp got exactly the 12 stock writes in order");
 	CHECK(restored_exact(), label);
 	CHECK(amp[0].frames >= 4 && amp[1].frames >= 4, "both amps answered at least four frames");
@@ -660,6 +670,23 @@ int main(void)
 	CHECK(has("!!! amp error bit") && has("SWEET AMP: init FAILED"), "error bit reported, no pass");
 	reset_hw(); amp[0].absent = 1; stopped("L absent: no write frame to it", 1);
 	CHECK(amp[0].nwr == 0, "no write to an unidentified amp");
+	/* review F1: OTP_BOOT_ERR set: no write to that amp, no pass line */
+	reset_hw(); amp[0].st3 = 0x80000000u; stopped("L OTP_BOOT_ERR (A7 gate, review F1)", 1);
+	CHECK(amp[0].nwr == 0 && !has("init ok"), "OTP_BOOT_ERR: no write, no pass line");
+	/* review F2: the surviving mutants */
+	reset_hw(); amp[0].boot_polls = 1000; stopped("L never OTP_BOOT_DONE (gate needs l.otp)", 1);
+	CHECK(amp[0].nwr == 0 && !has("init ok"), "no OTP_BOOT_DONE: no write to L");
+	reset_hw(); amp[1].revid = 0xB0u; stopped("R is revision B0 (gate needs r.revid)", 1);
+	CHECK(amp[1].nwr == 0 && !has("init ok"), "not B2: no write to R");
+	reset_hw(); amp[0].st1 = 0x80u; stopped("L BST_DCM_UVP_ERR (error bits include 0x80)", 1);
+	CHECK(!has("init ok") && has("init FAILED") && amp[0].nwr == 0, "BST_DCM_UVP_ERR before the init: no write, no pass");
+	CHECK(amp[1].nwr == 0, "review F4: no R write after a failed L init");
+	reset_hw(); amp[0].st1 = 0x10000u; stopped("L bit 16 (review F6)", 1);
+	CHECK(!has("init ok") && amp[0].nwr == 0, "bit 16 before the init: no write");
+	reset_hw(); amp[0].ignore_mask = 1; stopped("L IRQ1_MASK1 write does not stick (read-backs compared)", 1);
+	CHECK(!has("init ok") && has("init FAILED"), "read-back mismatch: no pass");
+	reset_hw(); amp[0].drop_cs1_after_st1 = 1; stopped("CS1 stuck low before the L writes (amp_write checks the other CS)", 1);
+	CHECK(amp[0].nwr == 0 && !has("init ok"), "the other chip select low: no write frame");
 	reset_hw(); no_clock = 1; stopped("the bus never clocks (RX timeout)", 1);
 	CHECK(has("timeout"), "timeout reported");
 	reset_hw(); (void)amp_init_run(); unsigned nfull = nw;
