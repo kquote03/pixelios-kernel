@@ -647,7 +647,7 @@ and `ver` through the control rings (polled), guard check, bus master OFF. First
 ```
 SWEET_USBLOG_PORT=64738 tools/xrun --kernel ~/pixelios-artifacts/xnu-local-w8-<tag>/kernel.development.sweet --board oriole --no-camera --gui --rails --cpus 8 \
   --wlan-hold --wlan-level 8 --wlanfw ~/pixelios-artifacts/wlan-fw/wlanfw-oriole.bin --intent wlan \
-  --expect 'SWEET WLAN: (stage 3 level 8 (done|stopped)|fw version)' --fail-on 'restore=failed|DMA suspect|bus_master=ON' --label o5-w7-l8 --restart 600,bootloader --lock-wait 3600
+  --expect 'SWEET WLAN: (stage 3 level 8 (done|stopped)|fw version)' --fail-on 'restore=failed|DMA suspect|bus_master=ON|bus_master=unknown|restore of group 16 skipped' --fail-on 'panic\(cpu' --fail-on 'Kernel trap at' --label o5-w7-l8 --restart 600,bootloader --lock-wait 3600
 ```
 Pass: `SWEET WLAN: W24 device-to-host DMA works`, `SWEET WLAN: fw version <text> mac xx:xx:xx:xx:<b4>:<b5>`, `stage 3 level 8 done msgbuf round trip ok, bus master off`.
 A stop prints `W<row> STOP: <reason>`, the restore lines (EP Command := 0x2 first) and `left after stop: bus_master=...`.

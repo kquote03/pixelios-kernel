@@ -65,6 +65,9 @@ struct fake {
 	/* patch 0159 (run F): a fake msgbuf firmware. With mb set, fw_place() also writes ring_info, the ring memory table and zeroed index arrays; a store of 1 to the H2D doorbell (bus master on)
 	 * makes it consume the control-submit items from the host pool and write ACK + completion + answer back into the pool. Host addresses outside the pool are counted in oob and not followed. */
 	int mb, fw_mute, fw_extra, fw_guard, bm_stuck, idx_dirty;
+	int fw_late, ri_host;                           /* review 0159-1: the completion items arrive one delay after the index; a non-zero host index-buffer word in ring_info */
+	uint32_t fw_cmd_xor;
+	struct { uint8_t *at; uint8_t b[24]; } late[8]; unsigned nlate;
 	uint8_t *pool;
 	uint64_t pool_pa;
 	uint32_t ri, ringmem, hw, hr, dw, dr, maxsub, maxcpl;
@@ -174,6 +177,10 @@ static void fw_cpl(struct fake *f, uint32_t typ, uint32_t id, uint32_t status, u
 
 	if (depth == 0 || item != 24 || w >= depth || (c = fw_hp(f, base + (uint64_t)w * item, item)) == 0)
 		return;
+	if (f->fw_late && f->nlate < 8) {              /* the index moves now, the item bytes reach host memory at the next delay */
+		f->late[f->nlate].at = c;
+		c = f->late[f->nlate++].b;
+	}
 	memset(c, 0, 24);
 	c[0] = (uint8_t)typ;
 	p32(c + 4, id); p16(c + 8, status); p16(c + 12, rlen); p16(c + 14, trans); p32(c + 16, cmd);
@@ -183,7 +190,7 @@ static void fw_cpl(struct fake *f, uint32_t typ, uint32_t id, uint32_t status, u
 static void fw_msgbuf(struct fake *f)
 {
 	static const uint8_t mac[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
-	static const char ver[] = "wl0: Jan  1 2026 00:00:00 version 99.9.9 (synthetic) FWID 01-abcdef\n second line";
+	static const char ver[] = "wl0:\x01 Jan  1 2026 00:00:00 version 99.9.9\x7f (synthetic) FWID 01-abcdef\n second line";      /* two bytes that must not reach the log */
 	uint32_t depth, item, r, w, rl;
 	uint64_t base, qpa;
 	uint8_t *it, *q, *a;
@@ -215,7 +222,7 @@ static void fw_msgbuf(struct fake *f)
 			if (f->fw_extra)
 				fw_cpl(f, 0x01, 0, 0, 0, 0, 0);                                         /* a general status item first */
 			fw_cpl(f, 0x0A, g32(it + 4), 0, 0, g16(it + 12), g32(it + 8));
-			fw_cpl(f, 0x0C, f->resp_id ^ f->fw_id_xor, q && a && rl ? f->fw_status : 1, f->fw_len ? f->fw_len : rl, g16(it + 12) ^ f->fw_trans_xor, g32(it + 8));
+			fw_cpl(f, 0x0C, f->resp_id ^ f->fw_id_xor, q && a && rl ? f->fw_status : 1, f->fw_len ? f->fw_len : rl, g16(it + 12) ^ f->fw_trans_xor, g32(it + 8) ^ f->fw_cmd_xor);
 			f->have_resp = 0;
 			if (f->fw_guard)
 				f->pool[0x0A00] = 0x11;                                                /* a stray write into the gap after the control-submit ring */
@@ -355,6 +362,7 @@ static void fw_place(struct fake *f)
 		for (k = 0; k < 20; k++) f->ram[f->ringmem / 4 + k] = 0;
 		for (k = 0; k < f->maxsub && k < 64; k++) { f->ram[f->hw / 4 + k] = 0; f->ram[f->hr / 4 + k] = 0; }
 		for (k = 0; k < f->maxcpl && k < 64; k++) { f->ram[f->dw / 4 + k] = 0; f->ram[f->dr / 4 + k] = 0; }
+		if (f->ri_host) f->ram[f->ri / 4 + f->ri_host] = 0x8u;       /* a host index-buffer address word the firmware left set */
 		if (f->idx_dirty) f->ram[f->hw / 4] = 0x00010000u;      /* an index slot whose upper half is not 0 */
 		f->ram[(f->fw_shared + 0x54) / 4] = 0; f->ram[(f->fw_shared + 0x70) / 4] = 0;
 	}
@@ -367,6 +375,7 @@ static void f_delay(void *c, unsigned us)
 	uint32_t *wp = f_wrap(f, f->win0);
 
 	f->clock_us += us;
+	while (f->nlate) { f->nlate--; memcpy(f->late[f->nlate].at, f->late[f->nlate].b, 24); }
 	if (f->released && f->fw_up && !f->fw_placed && f->clock_us - f->rel_t >= f->fw_up)
 		fw_place(f);
 	if (f->released && f->down_after && f->clock_us - f->rel_t >= f->down_after)
@@ -2750,14 +2759,15 @@ static void fwf(struct fake *f)
 	f->maxsub = 42; f->maxcpl = 5;
 }
 
-/* what = 0 normal; 1 no pool; 2 misaligned pool; 3 no sync callback; 4 short pool */
+/* what = 0 normal; 1 no pool; 2 misaligned pool; 3 no sync callback; 4 short pool; 5 pool ends above 2^36; 6 pool ends exactly at 2^36 */
 static int runf_x(struct fake *f, struct swl_wx *x, int level, int what)
 {
 	mkc(x, f, level, flen, fpin);
 	cbus.sync = what == 3 ? 0 : f_sync;
 	memset(fpool, 0xEE, sizeof fpool);
 	x->pool = what == 1 ? 0 : fpool;
-	x->pool_pa = what == 2 ? FPA + 0x1000u : FPA;
+	x->pool_pa = what == 2 ? FPA + 0x1000u : what == 5 ? (1ull << 36) - SWM_POOL_LEN + SWM_POOL_ALIGN : what == 6 ? (1ull << 36) - SWM_POOL_LEN : FPA;
+	f->pool_pa = x->pool_pa;
 	x->pool_len = what == 4 ? SWM_POOL_LEN - 4u : SWM_POOL_LEN;
 	return swl_stage3(x);
 }
@@ -2848,6 +2858,30 @@ static void runf_tests(void)
 	fwf(&f); f.maxcpl = 2; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));
 	fwf(&f); f.maxsub = 1; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));
 
+	/* review 0159-1 F1: a non-zero host index-buffer word in ring_info (each of words 5..12): no store, no bus master */
+	for (i = 5; i <= 12; i++) {
+		fwf(&f); f.ri_host = (int)i;
+		CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && x.row == 18 && nothing_f(&f) && strstr(logbuf, "host index buffers") != 0);
+	}
+	/* review 0159-1 F2: the bus address is 36 bits wide: a pool that ends above 2^36 is refused, one that ends exactly there is used */
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 5) < 0 && x.stop_code == SWW_E_POOL && x.row == 18 && nothing_f(&f));
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 6) == 0 && bm_off(&f) && f.ram[(0x47E100 + 12) / 4] == 0xFu);
+	/* review 0159-1 F3: the index moves one poll before the item bytes arrive: the item is not consumed as type 0, the run passes */
+	fwf(&f); f.fw_late = 1;
+	CHECK(runf(&f, &x) == 0 && bm_off(&f) && x.f_other == 0 && strstr(logbuf, "completion item type") == 0 && strstr(logbuf, "mac xx:xx:xx:xx:44:55") != 0);
+	/* review 0159-1 F4: a stop with bus master on reports the guard bytes (here one changed, then none) */
+	fwf(&f); f.fw_guard = 1; f.fw_status = 5;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && bm_off(&f) && strstr(logbuf, "host pool guard bytes changed 1 (DMA suspect)") != 0);
+	fwf(&f); f.fw_mute = 1;
+	CHECK(runf(&f, &x) < 0 && strstr(logbuf, "host pool guard bytes changed 0\n") != 0);
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 1) < 0 && strstr(logbuf, "guard bytes") == 0);      /* a stop before bus master prints no such line */
+	/* review 0159-1 F8: a short MAC answer, a completion for another command, control bytes in the version text */
+	fwf(&f); f.fw_len = 3; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && x.row == 24 && bm_off(&f) && strstr(logbuf, "cur_etheraddr answer is 3 bytes") != 0);
+	fwf(&f); f.fw_cmd_xor = 1; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f));
+	fwf(&f); CHECK(runf(&f, &x) == 0 && strchr(logbuf, 0x01) == 0 && strchr(logbuf, 0x7f) == 0);
+	/* review 0159-1 F8: the bus-master tuple itself needs W21 (a direct call on a state that lacks it stores nothing) */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_BM_ON); x.flags &= ~SWF_W21;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x04u, 0x0006u) == -SWW_E_PHASE && f.nw == n && (f.cmd & 0xFFFFu) == 2);
 	/* rule R4: an index slot whose upper half is not 0 is not stored; bus master never comes on */
 	fwf(&f); f.idx_dirty = 1;
 	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_OLD && x.row == 20 && f.cfg04_writes == 0 && f.nrdy == 0 && f.ram[0x3F0000 / 4] == 0x00010000u && bm_off(&f));

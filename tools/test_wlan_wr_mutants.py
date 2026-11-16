@@ -304,6 +304,22 @@ def audit_board_glue(glue):
 
 # (name, [(old, new)], equivalent-because or None). Strings are literal; every occurrence is replaced.
 MUTANTS = [
+    # --- review 0159-1 (F1..F4, F8)
+    ("W18: host index-buffer words not required to be 0 (review F1)", [("\t\tif (x->f_ri[i] != 0u) {\n\t\t\treturn swl_stop(x, SWW_E_MSG);\n\t\t}\n", "")], None),
+    ("W18: only the first host index-buffer word checked (review F1)", [("for (i = SWM_RI_HOSTIDX0; i <= SWM_RI_HOSTIDX1; i++) {", "for (i = SWM_RI_HOSTIDX0; i <= SWM_RI_HOSTIDX0; i++) {")], None),
+    ("W18: 36-bit bus address limit dropped (review F2)", [(" ||\n\t    x->pool_pa + SWM_POOL_LEN > SWM_DMA_LIMIT) {", ") {")], None),
+    ("W18: bus address limit one page too high (review F2)", [("x->pool_pa + SWM_POOL_LEN > SWM_DMA_LIMIT) {", "x->pool_pa + SWM_POOL_LEN > SWM_DMA_LIMIT + SWM_POOL_ALIGN) {")], None),
+    ("run F: an unwritten completion item is consumed (review F3)", [("\t\t\tif (typ == 0u) {       /* review 0159-1 F3", "\t\t\tif (0) {       /* review 0159-1 F3")], None),
+    ("run F: no guard report after a stop (review F4)", [("\t\tswl_left(x);\n\t\tswl_left_f(x);\n", "\t\tswl_left(x);\n")], None),
+    ("run F: guard report without the cache callback (review F4)", [("\tx->b->sync(x->b->ctx, 0, SWM_POOL_LEN);\n\tbad = swm_guard(x, 0);\n\tprintf(\"SWEET WLAN: left after stop:", "\tbad = swm_guard(x, 0);\n\tprintf(\"SWEET WLAN: left after stop:")], "EQUIVALENT on the host: the fake pool is ordinary memory, the callback only counts; on the phone it is the cache invalidate before the read"),
+    ("run F: response buffer address in the item is outside the pool (review F8)", [("\tswm_w32(it + 16, (uint32_t)pa);\n\tswm_w32(it + 20, (uint32_t)(pa >> 32));", "\tswm_w32(it + 16, (uint32_t)pa + SWM_POOL_LEN);\n\tswm_w32(it + 20, (uint32_t)(pa >> 32));")], None),
+    ("run F: request buffer high word in the item dropped (review F8)", [("\tswm_w32(it + 24, (uint32_t)pa);\n\tswm_w32(it + 28, (uint32_t)(pa >> 32));", "\tswm_w32(it + 24, (uint32_t)pa);\n\tswm_w32(it + 28, 0u);")], None),
+    ("run F: request buffer not synced before the doorbell (review F8)", [("\tswm_sync(x, SWM_O_REQ, SWM_L_REQ);\n", "")], None),
+    ("run F: ring item not synced before the doorbell (review F8)", [("\tswm_sync(x, swm_ring[0].off + x->f_w0 * SWM_ITEM_H2D, SWM_ITEM_H2D);\n", "")], None),
+    ("run F: completion item not synced before it is read (review F8)", [("\t\t\tswm_sync(x, swm_ring[SWM_NH2D].off + x->f_r0 * SWM_ITEM_D2H, SWM_ITEM_D2H);\n", "")], None),
+    ("run F: answer not synced before it is read (review F8)", [("\tswm_sync(x, SWM_O_RESP, SWM_L_RESP);\n\tfor (i = 0; i < rl && i < omax; i++) {", "\tfor (i = 0; i < rl && i < omax; i++) {")], None),
+    ("run F: completion command not compared (review F8)", [(" || swm_r32(c + 16) != SWM_C_GET_VAR || got) {", " || got) {")], None),
+    ("run F: version text not filtered (review F8)", [("\t\tif (ver[i] >= 0x20 && ver[i] < 0x7F) {", "\t\tif (1) {")], None),
     # --- patch 0159 (run F, docs/research/51 rules R1..R9). The nine patterns re-pinned below changed only because 0159 changed their text (the run filter of the allowlist search, the SWT_DYN flag,
     # the bus-master term of the precondition, one more indent level of the old-value read).
     ("run F: tuples visible below level 8", [("int mr = x->level - SWW_LEVEL0 >= SWW_RUN_F ? x->level - SWW_LEVEL0 : SWW_RUN_F - 1;", "int mr = SWW_RUN_F;")], None),
@@ -331,14 +347,14 @@ MUTANTS = [
     ("W18: host-ready flag not required", [("!(fl & SWM_SH_FLAGS_HOSTRDY) || ", "")], None),
     ("W18: DAR firmware accepted", [("(fl & (SWM_SH_FLAGS_DAR | SWM_SH_FLAGS_2B_IDX))", "(fl & SWM_SH_FLAGS_2B_IDX)")], None),
     ("W18: 2-byte indices accepted", [("(fl & (SWM_SH_FLAGS_DAR | SWM_SH_FLAGS_2B_IDX))", "(fl & SWM_SH_FLAGS_DAR)")], None),
-    ("W18: sync callback not required", [("if (x->b->sync == NULL || swm_pa(x, 0, SWM_POOL_LEN) == 0", "if (swm_pa(x, 0, SWM_POOL_LEN) == 0")], "EQUIVALENT for safety: the host test with no sync callback crashes on the NULL call (the mutant is killed by a signal, reported as fail); listed here only if a platform returns instead"),
+    ("W18: sync callback not required", [("if (x->b->sync == NULL || swm_pa(x, 0, SWM_POOL_LEN) == 0", "if (swm_pa(x, 0, SWM_POOL_LEN) == 0")], None),      # review 0159-1 F8: killed (the NULL callback is called and the test dies), not equivalent
     ("W18: pool alignment not required", [(" || (x->pool_pa & (SWM_POOL_ALIGN - 1u)) != 0", "")], None),
     ("W18: regions outside RAM accepted", [("\t\tif (!swl_f_inram(x, rg[i].a, rg[i].n)) {", "\t\tif (0) {")], None),
     ("W18: overlapping regions accepted", [("if (rg[i].a < rg[j].a + rg[j].n && rg[j].a < rg[i].a + rg[i].n) {", "if (0) {")], None),
     ("W18: ring counts not required", [("if (maxsub < SWM_NH2D || maxcpl < SWM_ND2H || maxsub > 1024u || maxcpl > 1024u) {", "if (0) {")], None),
     ("W18: in-RAM check ignores alignment", [("return !(a & 3u) && n != 0u && a >= SWW_RAM_BASE", "return n != 0u && a >= SWW_RAM_BASE")], None),
     ("W18: in-RAM check ignores the RAM base", [("n != 0u && a >= SWW_RAM_BASE && n <= x->ram_bytes", "n != 0u && n <= x->ram_bytes")], "EQUIVALENT: for a < SWW_RAM_BASE the unsigned a - SWW_RAM_BASE wraps to at least 0xFFE00000, which is above ram_bytes - n (ram_bytes <= 0x400000), so the last clause refuses it"),
-    ("run F: bus master tuple needs no W21", [(".omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = SWF_W21 },", ".omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = 0 },")], "EQUIVALENT: swl_w22() is the only caller and runs after swl_w21() in swl_stage3(); the direct-call case after a finished run hits SWT_ONCE first"),
+    ("run F: bus master tuple needs no W21", [(".omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = SWF_W21 },", ".omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = 0 },")], None),      # review 0159-1 F8: a direct call case kills it
     ("run F: bus master on from any old Command", [(".vmask = 0xFFFFu,\n\t                     .omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = SWF_W21 },", ".vmask = 0xFFFFu,\n\t                     .need = SWF_W21 },")], "EQUIVALENT: swl_wpre() already requires the memory-only Command before the store (the old-value clause is the second check of the same word)"),
     ("run F: bus master may be switched on twice", [("[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = SWT_ONCE,", "[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = 0,")], None),
     ("run F: bus master restore not armed (R2)", [("[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM,", "[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG,")], None),
@@ -360,7 +376,7 @@ MUTANTS = [
     ("run F: link not checked while waiting", [("\t\tif (swl_lpre(x)) {\n\t\t\tprintf(\"SWEET WLAN: W%u link precondition lost while waiting", "\t\tif (0) {\n\t\t\tprintf(\"SWEET WLAN: W%u link precondition lost while waiting")], None),
     ("run F: guard gaps not checked (R9)", [("\tbad = swm_guard(x, 0);\n\tif (bad) {", "\tbad = swm_guard(x, 0);\n\tif (0) {")], None),
     ("run F: guard gaps not filled", [("\t\t\tif (fill) {\n\t\t\t\tx->pool[j] = SWM_GUARD;", "\t\t\tif (0) {\n\t\t\t\tx->pool[j] = SWM_GUARD;")], None),
-    ("run F: short MAC answer accepted", [("\tif (n < sizeof mac) {", "\tif (0) {")], "EQUIVALENT for the fake firmware: it answers cur_etheraddr with 6 bytes or with a non-zero status; no case produces a short answer with status 0 (the rule is defensive)"),
+    ("run F: short MAC answer accepted", [("\tif (n < sizeof mac) {", "\tif (0) {")], None),      # review 0159-1 F8: killed by the fw_len = 3 case
     ("run F: the whole MAC is printed", [("mac xx:xx:xx:xx:%02x:%02x\\n\", vt, mac[4], mac[5]);", "mac xx:xx:%02x:%02x:%02x:%02x\\n\", vt, mac[2], mac[3], mac[4], mac[5]);")], None),
     ("run F: version text not cut at the first line", [(" && ver[i] != 0 && ver[i] != '\\n'; i++) {", " && ver[i] != 0; i++) {")], None),
     ("run F: stage 3 runs F at level 7", [("\tif (x->level >= SWW_LEVEL0 + SWW_RUN_F) {       /* run F (patch 0159)", "\tif (x->level >= SWW_LEVEL0 + SWW_RUN_F - 1) {       /* run F (patch 0159)")], None),
@@ -414,7 +430,7 @@ MUTANTS = [
     ("read table: alignment not compared", [("&& (off & 3u) == 0) {\n\t\t\treturn (int)i;", ") {\n\t\t\treturn (int)i;")], None),
     ("read of an unlisted register allowed", [("if (i < 0 || (int)swl_rt[i].run", "if ((int)swl_rt[i < 0 ? 0 : i].run")], None),
     # --- stop and restore
-    ("STOP does not run the restore", [("\t\tswl_restore(x);\n\t\tswl_left(x);\n\t}\n\treturn -code;", "\t\tswl_left(x);\n\t}\n\treturn -code;")], None),  # patch 0147: swl_left() follows the restore
+    ("STOP does not run the restore", [("\t\tswl_restore(x);\n\t\tswl_left(x);\n\t\tswl_left_f(x);\n\t}\n\treturn -code;", "\t\tswl_left(x);\n\t\tswl_left_f(x);\n\t}\n\treturn -code;")], None),  # patch 0147: swl_left() follows the restore
     ("restore group never armed", [("\tx->armed |= p->rgrp;\n", "")], None),
     ("restore of a finished step still armed", [("\tx->armed = 0;\n\tx->flags |= flag;", "\tx->flags |= flag;")], None),
     ("restore skipped check dropped", [("\t\t\tif (pre) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group", "\t\t\tif (0) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group")], None),

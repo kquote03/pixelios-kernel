@@ -189,3 +189,22 @@ A power cycle resets the chip.
   rule R1–R9 has a negative case in `shim/wlan_wr_host_test.c` (`runf_tests`) and a mutant in `tools/test_wlan_wr_mutants.py`; a
   fault sweep fails or drops each single run F store in turn and requires bus master off at the end.
 - **[guess]** still open on hardware: U1–U5, U7 of §7; the 256-byte request size of `ver`.
+
+## 10. After review 0159-1 (2026-11-16)
+
+- **Corrections to §2 and §4.** Bus addresses on this RC are **36 bits** wide, not 64: DHD sets a 36-bit DMA mask for this SoC
+  (`dhd_pcie_linux.c:2188-2197`, `dhd_pcie.h:825-828`) **[src]**. All oriole RAM lies below 2^36, so the pool fits; W18 now refuses a pool
+  that ends above 2^36. W18 checks a 16 KiB-aligned pool and that limit; it does not check "64 KiB aligned, inside XNU RAM" as §4 said.
+- **F1.** W18 prints ring_info words 5–12 (the four host index-buffer addresses) and stops unless all are 0: the host selects chip-RAM
+  indices only by leaving them unset, and a non-zero word would be a host address outside the pool.
+- **F3.** The firmware offers D2H_SYNC_XORCSUM and run F uses no sync, so a completion item can be seen before its bytes arrive. An item
+  of type 0 is now left in place and looked at again on the next poll.
+- **F4.** Every stop after bus master on prints `host pool guard bytes changed N`.
+- **F5 (claims withdrawn).** No FAULT_STATUS re-read and no firmware console re-read happen after run F. U2 and U7 are therefore settled
+  only indirectly (by the round trip working); after a failed run, a separate boot with `sweetwlan=2 sweetpcie1mmu=1` shows the S2MPU words
+  only for that boot.
+- **U8 (new).** The root port's own Command register (DBI 0x04) is never written by the shim. If its Bus Master Enable is clear, requests
+  from the chip are dropped at the RC: the result would be "no completion ... is untouched", nothing worse. **[guess]** until the first run.
+- **Residual risk, stated plainly (review item 12).** If device→host requests were translated to another address, a chip write could land
+  in kernel memory outside the pool. Run F executes in `sweet_ufs_init()`; a panic or silent damage to `userdata` is possible in that case.
+  Accepted for this development phone: re-flash `userdata` after any odd run.
