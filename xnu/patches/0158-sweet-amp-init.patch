@@ -1,0 +1,1189 @@
+SWEET AMP (patch 0158, plan 2026-11-14 oneshot-2 step A7), boot-arg sweetamp=1: the two CS35L41 speaker amps of oriole (USI13 / SPI13). Inert unless
+sweetamp=1 AND the ADT root model-number is "oriole". One synchronous run from sweet_ufs_init, before the touch / battery threads: the A1 identify
+(the port of the shim --amp-id, pk-amp shim/ampid.c with review F1-F3 fixed, review round 2 pending) and, on each amp that identified as CS35L41 B2 with OTP_BOOT_DONE, the
+stock probe-time writes: IRQ1_MASK1 = INT1_MASK_DEFAULT, the B2 errata patch, DSP1_CCM_CORE_CTRL = 0 (cs35l41.c:4300-4302, :3675-3686, :4351-4362,
+:4401). cs35l41_otp_unpack is NOT done (its bit maps are GPL data tables, cs35l41-tables.c: not copied; blocked). The write allowlist is exactly those
+12 (register, value) pairs; PWR_CTRL1 / GLOBAL_EN is never written (refused by name). Afterwards IRQ1_STATUS1 error bits must be 0, then both resets go
+low and every pad / controller / sysreg / mux word is restored and read back. Lines "SWEET AMP: ..."; pass "SWEET AMP: init ok l,r devid 35a40 rev b2,
+errors=0". Host test shim/amp_xnu_host_test.c (header extracted from this patch). BUILT, UNRUN; needs A1 PASS and an independent review first.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@
+ bsd/dev/sweet_gpu_gs101.c		standard
+ bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_hsi2c.c			standard
++bsd/dev/sweet_amp.c			standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_trusty.c		standard
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_amp.c
+@@ -0,0 +1,146 @@
++/*
++ * xnu patch 0158 (plan oneshot-2 step A7): the CS35L41 amp init of bsd/dev/sweet_amp.h, glue. Inert unless boot-arg sweetamp=1 AND the ADT root
++ * model-number is "oriole" (tools/mkadt.py writes the board codename there, tools/test_mkadt_board_identity.py): without both nothing is mapped and
++ * nothing is read. With them: seven pinned windows mapped (SPI13, the PERIC1 sysreg page, CMU_PERIC1, the PERIC1 / PERIC0 pad pages, and the ALIVE /
++ * FAR_ALIVE pad pages for the IRQ pads, read only), then ONE run of amp_init_run() synchronously, from sweet_ufs_init BEFORE the touch and battery
++ * threads start (gpp23 is shared with the touch chip select and the I2C12 pads; no other read-modify-write of those words can interleave).
++ * The run takes about 0.3 s (two 4 ms reset releases, up to 2 x 100 ms OTP polls, a few hundred SPI transfers at 6 MHz) and always ends with both resets
++ * low and every word back (the header's restore). The only stores of this file are in sa_wr32(), called only through the header's w32().
++ * Difference to the shim: XNU has no fault-guarded read; a read of an unclocked block is guarded only by the header's sysreg / CMU gate reads, which
++ * come first (the same order as the shim, whose run must pass before this one runs: plan A7 needs A1 PASS).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <stdint.h>
++#include <string.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++void sweet_amp_init(void);
++
++#define SA_NWIN 7
++/* the windows: page-aligned physical ranges; ro = read only (the IRQ pad banks) */
++static struct { uint64_t pa, len; int ro; volatile uint32_t *va; } sa_win[SA_NWIN] = {
++	{ 0x10D60000ull, 0x1000, 0, NULL },	/* SPI13 (AMP_SPI_BASE): controller words + USI_CON */
++	{ 0x10C21000ull, 0x1000, 0, NULL },	/* sysreg_peric1: the USI13 mode word +0x14 */
++	{ 0x10C00000ull, 0x4000, 0, NULL },	/* CMU_PERIC1: user mux +0x660, div +0x1814, gates +0x2034 / +0x2054, QCH +0x3034 */
++	{ 0x10C40000ull, 0x1000, 0, NULL },	/* PERIC1 pinctrl: gpp23 +0x60, gpp25 +0xA0 */
++	{ 0x10840000ull, 0x1000, 0, NULL },	/* PERIC0 pinctrl: gpp1 +0x20, gpp16 +0x200 */
++	{ 0x174D0000ull, 0x1000, 1, NULL },	/* ALIVE pinctrl: gpa9 +0xC0 (AMP_R_IRQ, read only) */
++	{ 0x174E0000ull, 0x1000, 1, NULL },	/* FAR_ALIVE pinctrl: gpa6 +0x0 (AMP_L_IRQ, read only) */
++};
++static uint64_t sa_freq;
++
++static volatile uint32_t *
++sa_va(uintptr_t pa, int write)
++{
++	unsigned i;
++
++	if (pa & 3u) {
++		return NULL;
++	}
++	for (i = 0; i < SA_NWIN; i++) {
++		if (sa_win[i].va != NULL && pa >= sa_win[i].pa && pa - sa_win[i].pa < sa_win[i].len) {
++			if (write && sa_win[i].ro) {
++				return NULL;
++			}
++			return sa_win[i].va + (pa - sa_win[i].pa) / 4u;
++		}
++	}
++	return NULL;
++}
++
++static int
++try_read32(uintptr_t pa, uint32_t *v)
++{
++	volatile uint32_t *p = sa_va(pa, 0);
++
++	if (p == NULL) {
++		return 0;
++	}
++	*v = *p;
++	return 1;
++}
++
++/* THE store: only inside a writable window, bounded to its length; dsb sy after it (osfmk/arm/atomic.h DSB_SY 0xf), as the shim's try_write32 */
++static int
++try_write32(uintptr_t pa, uint32_t v)
++{
++	volatile uint32_t *p = sa_va(pa, 1);
++
++	if (p == NULL) {
++		return 0;
++	}
++	*p = v;
++	__builtin_arm_dsb(0xf);
++	return 1;
++}
++
++static uint64_t
++counter_freq(void)
++{
++	return sa_freq;
++}
++
++static uint64_t
++touch_ticks(void)
++{
++	return mach_absolute_time();
++}
++
++static void
++con_str(const char *label, const char *s)
++{
++	if (strcmp(label, "SWEET") == 0) {
++		printf("SWEET %s\n", s);
++	} else {
++		printf("SWEET AMP: %s\n", s);
++	}
++}
++
++#include "sweet_amp.h"
++
++void
++sweet_amp_init(void)
++{
++	static int started;
++	uint32_t on = 0;
++	DTEntry root;
++	char const *model = NULL;
++	unsigned int msize = 0, i;
++	vm_offset_t va;
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (!PE_parse_boot_argn("sweetamp", &on, sizeof(on)) || on == 0) {
++		return;         /* default: no map, no read */
++	}
++	if (on != 1) {
++		printf("SWEET AMP: refused sweetamp=%u (only 1 is defined), not touched\n", on);
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "model-number", (void const **)&model, &msize) != kSuccess ||
++	    model == NULL || msize != sizeof("oriole") || strncmp(model, "oriole", sizeof("oriole")) != 0) {
++		printf("SWEET AMP: refused not an oriole ADT (model-number), not touched\n");
++		return;
++	}
++	for (i = 0; i < SA_NWIN; i++) {
++		va = ml_io_map((vm_offset_t)sa_win[i].pa, (vm_size_t)sa_win[i].len);
++		if (va == 0) {
++			printf("SWEET AMP: refused ml_io_map(%#llx) failed, not touched\n", sa_win[i].pa);
++			return;
++		}
++		sa_win[i].va = (volatile uint32_t *)va;
++	}
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sa_freq);
++	printf("SWEET AMP: init run (sweetamp=1), timebase %llu Hz\n", sa_freq);
++	(void)amp_init_run();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_amp.h
+@@ -0,0 +1,994 @@
++/*
++ * bsd/dev/sweet_amp.h - xnu patch 0158 (plan oneshot-2 step A7, boot-arg sweetamp=1): the two CS35L41 speaker amps of oriole on USI13 / SPI13.
++ * Pure logic, included by bsd/dev/sweet_amp.c (MMIO glue) and by the host test shim/amp_xnu_host_test.c. Every hardware access goes through the
++ * includer's try_read32 / try_write32 (physical addresses; the glue maps them), every store through w32() behind w32_allowed().
++ *
++ * Part 1 is the port of the shim --amp-id identify (pk-amp wip/shim-amp-id, shim/ampid.c with the F1-F3 fixes of docs/reviews/ampid-review-fable-1.md, round 2 pending):
++ * the same SPI13 master (Google soc-gs spi-s3c64xx.c polling path), the same pad / sysreg / mux allowlist, the same reset release and restore.
++ * Part 2 (A7) adds the probe-time register WRITES of the stock cs35l41_probe for revision B2, after the identify passed on that amp:
++ *   IRQ1_MASK1 0x10110 := CS35L41_INT1_MASK_DEFAULT 0x7FFCFE3F (AMP cs35l41.c:4300-4302; cs35l41.h:132, :702);
++ *   cs35l41_revb2_errata_patch (AMP cs35l41.c:3675-3686, applied at :4351-4362): TEST_KEY_CTL 0x40 := 0x5555, 0xAAAA; VIMON_SPKMON_RESYNC 0x4100 := 0;
++ *     0x4310 := 0; VPVBST_FS_SEL 0x4400 := 0; BSTCVRT_DCM_CTRL 0x381C := 0x51; DSP1_YM_ACCEL_PL0_PRI 0x2BC20E0 := 0; DSP1_XM_ACCEL_PL0_PRI 0x2BC2020 := 0;
++ *     TEST_KEY_CTL := 0xCCCC, 0x3333 (cs35l41.h:30, :76, :80, :84, :324, :330);
++ *   DSP1_CCM_CORE_CTRL 0x2BC1000 := 0 (AMP cs35l41.c:4401, cs35l41.h:318).
++ *   NOT done: cs35l41_otp_unpack (:4385, :1856-1975): it needs the OTP bit maps of cs35l41-tables.c:726-966 (GPL-2.0 data tables; copying them into an APSL
++ *   patch is not decided): recorded as blocked. Its trims matter for the output stage, which this patch never enables.
++ * The write allowlist is exactly those 13 (register, value) pairs; PWR_CTRL1 0x2014 (GLOBAL_EN, cs35l41.h:42, :667) is not in it and is refused by name.
++ * A write frame (AMP cs35l41-spi.c:32-45, GKI regmap-spi.c write = one transfer): the 32-bit address with bit 31 CLEAR, 2 pad bytes 0, the 32-bit value,
++ * big endian, 10 bytes. Its bytes are accepted by the TX allowlist only while an allowed pair is armed (amp_write), at their exact frame position.
++ * After the writes: IRQ1_STATUS1 0x10010 read; error bits AMP_SHORT_ERR 0x80000000, TEMP_ERR 0x20000, TEMP_WARN 0x8000, BST_SHORT_ERR 0x100,
++ * BST_DCM_UVP_ERR 0x80, BST_OVP_ERR 0x40 (cs35l41.h:124, :684-689) must be 0. Then the usual restore: both resets low (the amps lose the writes), every
++ * pad / controller / sysreg / mux word back. Pass line: "SWEET AMP: init ok l,r devid 35a40 rev b2, errors=0".
++ * Concurrency: the reset of the R amp (gpp23-7) shares the gpp23 pad words with the touch chip select (gpp23-3) and the I2C12 pads (gpp23-4/5): the glue runs
++ * this synchronously in sweet_ufs_init BEFORE the touch and battery threads start, so no other read-modify-write of those words can interleave.
++ */
++#ifndef SWEET_AMP_H
++#define SWEET_AMP_H
++#include <stdint.h>
++
++/* the includer provides these (bsd/dev/sweet_amp.c: ml_io_map'ed windows, mach_absolute_time; the host test: a fake SoC) */
++static int try_read32(uintptr_t pa, uint32_t *v);
++static int try_write32(uintptr_t pa, uint32_t v);
++static uint64_t counter_freq(void);
++static uint64_t touch_ticks(void);
++static void con_str(const char *label, const char *s);
++
++#define RAMLOG_LINE_MAX	96u
++#define SOC_GS101	1
++
++/* generated by pk-amp tools/boards.py --amp-board oriole (soc.json spi_usi, board.json amp; cites in their notes) and the PERI_* lines of board_config.h
++ * (soc.json peri, notes.peri); typed here because XNU builds without the generator */
++#define AMP_SPI_BASE 0x10d60000UL
++#define SPI_CH_CFG_OFF 0x0u
++#define SPI_CLK_CFG_OFF 0x4u
++#define SPI_MODE_CFG_OFF 0x8u
++#define SPI_SLAVE_SEL_OFF 0xcu
++#define SPI_INT_EN_OFF 0x10u
++#define SPI_STATUS_OFF 0x14u
++#define SPI_TX_DATA_OFF 0x18u
++#define SPI_RX_DATA_OFF 0x1cu
++#define SPI_PACKET_CNT_OFF 0x20u
++#define SPI_PENDING_CLR_OFF 0x24u
++#define SPI_SWAP_CFG_OFF 0x28u
++#define SPI_FB_CLK_OFF 0x2cu
++#define SPI_USI_CON_OFF 0xc4u
++#define SPI_USI_OPTION_OFF 0xc8u
++#define SPI_CH_TXCH_ON_BIT 0u
++#define SPI_CH_RXCH_ON_BIT 1u
++#define SPI_CH_CPHA_BIT 2u
++#define SPI_CH_CPOL_BIT 3u
++#define SPI_CH_SLAVE_BIT 4u
++#define SPI_CH_SW_RST_BIT 5u
++#define SPI_CH_HS_EN_BIT 6u
++#define SPI_PACKET_CNT_EN_BIT 16u
++#define SPI_SLAVE_SIG_INACT_BIT 0u
++#define SPI_SLAVE_AUTO_BIT 1u
++#define SPI_MODE_4BURST_BIT 0u
++#define SPI_MODE_TXDMA_BIT 1u
++#define SPI_MODE_RXDMA_BIT 2u
++#define SPI_SLAVE_NSC_CNT_2 0x20u
++#define SPI_TRAILCNT 0x3ffu
++#define SPI_TRAILCNT_OFF 0x13u
++#define SPI_PND_CLR_ALL 0x1eu
++#define SPI_TX_LVL_SHIFT 0x6u
++#define SPI_RX_LVL_SHIFT 0xfu
++#define SPI_LVL_MASK 0x7fu
++#define SPI_FIFO_BYTES 0x40u
++#define AMP_CMU_MUX 0x10c00660UL
++#define AMP_CMU_MUX_SEL_BIT 4u
++#define AMP_CMU_MUX_BUSY_BIT 16u
++#define AMP_OSC_HZ 24576000u
++#define AMP_SCK_DIV 4u
++#define AMP_REG_IRQ1_STATUS4 0x1001cu
++#define AMP_REG_IRQ1_STATUS3 0x10018u
++#define AMP_REG_DEVID 0x0u
++#define AMP_REG_REVID 0x4u
++#define AMP_READ_FLAG 0x80000000u
++#define AMP_ADDR_BYTES 4u
++#define AMP_PAD_BYTES 2u
++#define AMP_VAL_BYTES 4u
++#define AMP_DEVID 0x35a40u
++#define AMP_REVID 0xb2u
++#define AMP_OTP_BOOT_DONE 0x2u
++#define AMP_OTP_BOOT_ERR 0x80000000u
++#define AMP_OTP_POLLS 100u
++#define AMP_OTP_POLL_MS 1u
++#define AMP_RESET_MS 2u
++#define AMP_SPI_FUNC 2u
++#define AMP_DRV 1u
++#define AMP_FB_DELAY 1u
++#define AMP_MAX_HZ 25000000u
++#define AMP_PIN_CLK_BANK 0x10c400a0UL
++#define AMP_PIN_CLK_NR 0u
++#define AMP_PIN_CLK_ID "gpp25-0"
++#define AMP_PIN_MOSI_BANK 0x10c400a0UL
++#define AMP_PIN_MOSI_NR 1u
++#define AMP_PIN_MOSI_ID "gpp25-1"
++#define AMP_PIN_MISO_BANK 0x10c400a0UL
++#define AMP_PIN_MISO_NR 2u
++#define AMP_PIN_MISO_ID "gpp25-2"
++#define AMP_PIN_CS0_BANK 0x10c400a0UL
++#define AMP_PIN_CS0_NR 3u
++#define AMP_PIN_CS0_ID "gpp25-3"
++#define AMP_PIN_CS1_BANK 0x10840020UL
++#define AMP_PIN_CS1_NR 0u
++#define AMP_PIN_CS1_ID "gpp1-0"
++#define AMP_PIN_RST_L_BANK 0x10840200UL
++#define AMP_PIN_RST_L_NR 3u
++#define AMP_PIN_RST_L_ID "gpp16-3"
++#define AMP_PIN_RST_R_BANK 0x10c40060UL
++#define AMP_PIN_RST_R_NR 7u
++#define AMP_PIN_RST_R_ID "gpp23-7"
++#define AMP_PIN_IRQ_L_BANK 0x174e0000UL
++#define AMP_PIN_IRQ_L_NR 3u
++#define AMP_PIN_IRQ_L_ID "gpa6-3"
++#define AMP_PIN_IRQ_R_BANK 0x174d00c0UL
++#define AMP_PIN_IRQ_R_NR 6u
++#define AMP_PIN_IRQ_R_ID "gpa9-6"
++#define PERI_MODE_MASK 0x7UL
++#define PERI_GATE_CG_VAL_BIT 21u
++#define PERI_QCH_ENABLE_BIT 0u
++#define PERI_QCH_CLOCK_REQ_BIT 1u
++#define PERI_PAD_CON_OFF 0x0u
++#define PERI_PAD_DAT_OFF 0x4u
++#define PERI_PAD_PUD_OFF 0x8u
++#define PERI_PAD_DRV_OFF 0xcu
++#define PERI_SPI13_BASE 0x10d60000UL
++#define PERI_SPI13_MODE_REG 0x10c21014UL
++#define PERI_SPI13_MODE_VAL 0x2UL
++#define PERI_SPI13_CMU 0x10c00000UL
++#define PERI_SPI13_GATE_IPCLK 0x2034UL
++#define PERI_SPI13_GATE_PCLK 0x2054UL
++#define PERI_SPI13_QCH 0x3034UL
++#define PERI_SPI13_DIV 0x1814UL
++
++/* periprobe.h (shim, pk-amp 6c165fb): Samsung pad fields and the USI gate */
++static inline uint32_t peri_pin_field(uint32_t word, unsigned pin) { return pin < 8u ? (word >> (4u * pin)) & 0xfu : 0xfu; }
++static inline uint32_t peri_pin_bit(uint32_t dat, unsigned pin) { return pin < 8u ? (dat >> pin) & 1u : 0u; }
++enum peri_gate { PERI_GATE_OPEN = 0, PERI_GATE_MODE_UNREADABLE, PERI_GATE_MODE_OFF, PERI_GATE_CMU_UNREADABLE, PERI_GATE_IPCLK_GATED, PERI_GATE_PCLK_GATED,
++		 PERI_GATE_QCH_NO_CLKREQ };
++static inline enum peri_gate peri_gate(int mode_ok, uint32_t mode, uint32_t want, int ipclk_ok, uint32_t ipclk, int pclk_ok, uint32_t pclk, int qch_ok, uint32_t qch)
++{
++	const uint32_t cg = 1u << PERI_GATE_CG_VAL_BIT, qch_on = (1u << PERI_QCH_ENABLE_BIT) | (1u << PERI_QCH_CLOCK_REQ_BIT);
++
++	if (!mode_ok)
++		return PERI_GATE_MODE_UNREADABLE;
++	if ((mode & PERI_MODE_MASK) != want)
++		return PERI_GATE_MODE_OFF;
++	if (!ipclk_ok || !pclk_ok || !qch_ok)
++		return PERI_GATE_CMU_UNREADABLE;
++	if (!(ipclk & cg))
++		return PERI_GATE_IPCLK_GATED;
++	if (!(pclk & cg))
++		return PERI_GATE_PCLK_GATED;
++	if (!(qch & qch_on))
++		return PERI_GATE_QCH_NO_CLKREQ;
++	return PERI_GATE_OPEN;
++}
++static inline const char *peri_gate_name(enum peri_gate g)
++{
++	return g == PERI_GATE_OPEN ? "open" : g == PERI_GATE_MODE_UNREADABLE ? "sysreg-unreadable" : g == PERI_GATE_MODE_OFF ? "mode-not-selected" :
++	       g == PERI_GATE_CMU_UNREADABLE ? "cmu-unreadable" : g == PERI_GATE_IPCLK_GATED ? "ipclk-gated" : g == PERI_GATE_PCLK_GATED ? "pclk-gated" :
++	       g == PERI_GATE_QCH_NO_CLKREQ ? "qch-no-clkreq" : "?";
++}
++
++/* ---- A7: the probe-time register writes (cites in the header comment) ---- */
++#define AMP_REG_IRQ1_STATUS1	0x10010u
++#define AMP_REG_IRQ1_MASK1	0x10110u
++#define AMP_REG_TEST_KEY	0x40u
++#define AMP_REG_CCM_CORE	0x2BC1000u
++#define AMP_REG_PWR_CTRL1	0x2014u		/* GLOBAL_EN lives here: never written (refused by name below) */
++#define AMP_INT1_MASK_DEFAULT	0x7FFCFE3Fu
++#define AMP_ERR_BITS		(0x80000000u | 0x20000u | 0x8000u | 0x100u | 0x80u | 0x40u)
++#define AMP_WTX_BYTES		(AMP_ADDR_BYTES + AMP_PAD_BYTES + AMP_VAL_BYTES)
++/* the init sequence, in stock order: X(register, value) */
++#define AMP_INIT_SEQ(X) X(AMP_REG_IRQ1_MASK1, AMP_INT1_MASK_DEFAULT) \
++	X(AMP_REG_TEST_KEY, 0x5555u) X(AMP_REG_TEST_KEY, 0xAAAAu) X(0x4100u, 0u) X(0x4310u, 0u) X(0x4400u, 0u) X(0x381Cu, 0x51u) X(0x2BC20E0u, 0u) \
++	X(0x2BC2020u, 0u) X(AMP_REG_TEST_KEY, 0xCCCCu) X(AMP_REG_TEST_KEY, 0x3333u) X(AMP_REG_CCM_CORE, 0u)
++
++/* a (register, value) pair the init may write: exactly the 13 of AMP_INIT_SEQ; never PWR_CTRL1 */
++static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint32_t val)
++{
++	int ok = 0;
++
++	if (reg == AMP_REG_PWR_CTRL1)
++		return 0;
++#define AMP_W_OK(r, v) ok |= (reg == (r) && val == (v));
++	AMP_INIT_SEQ(AMP_W_OK)
++#undef AMP_W_OK
++	return ok;
++}
++
++/* byte `pos` of the 10-byte write frame of (reg, val): the address with bit 31 clear, 2 pad bytes 0, the value, all big endian */
++static inline __attribute__((always_inline)) uint32_t wframe_byte(uint32_t reg, uint32_t val, uint32_t pos)
++{
++	return pos < AMP_ADDR_BYTES ? ((reg & ~AMP_READ_FLAG) >> (8u * (AMP_ADDR_BYTES - 1u - pos))) & 0xffu :
++	       pos < AMP_ADDR_BYTES + AMP_PAD_BYTES ? 0u : (val >> (8u * (AMP_WTX_BYTES - 1u - pos))) & 0xffu;
++}
++
++/* the armed write: set only by amp_write() after amp_write_ok, cleared right after its frame; read by w32 only */
++struct amp_arm { int on; uint32_t reg, val; };
++static struct amp_arm amp_arm;
++
++
++_Static_assert(AMP_SPI_BASE == PERI_SPI13_BASE, "the amps are on spi13 (tools/boards.py)");
++_Static_assert(AMP_READ_FLAG == (1u << 31) && AMP_ADDR_BYTES == 4u && AMP_PAD_BYTES == 2u && AMP_VAL_BYTES == 4u, "regmap-spi read framing");
++_Static_assert(AMP_REG_IRQ1_STATUS4 < AMP_READ_FLAG && AMP_REG_IRQ1_STATUS3 < AMP_READ_FLAG && AMP_REG_DEVID < AMP_READ_FLAG && AMP_REG_REVID < AMP_READ_FLAG,
++	       "every frame starts with the read flag");
++_Static_assert(AMP_PIN_MOSI_BANK == AMP_PIN_CLK_BANK && AMP_PIN_MISO_BANK == AMP_PIN_CLK_BANK && AMP_PIN_CS0_BANK == AMP_PIN_CLK_BANK, "gpp25 holds the bus + CS0");
++_Static_assert(AMP_PIN_CS1_BANK != AMP_PIN_CLK_BANK && AMP_PIN_RST_L_BANK != AMP_PIN_CLK_BANK && AMP_PIN_RST_R_BANK != AMP_PIN_CLK_BANK &&
++	       AMP_PIN_CS1_BANK != AMP_PIN_RST_L_BANK && AMP_PIN_CS1_BANK != AMP_PIN_RST_R_BANK && AMP_PIN_RST_L_BANK != AMP_PIN_RST_R_BANK, "four banks");
++_Static_assert(AMP_OSC_HZ / AMP_SCK_DIV <= AMP_MAX_HZ, "oscclk SCK within spi-max-frequency");
++
++#define AMP_BASE	AMP_SPI_BASE
++#define AMP_XFER_MS	10u		/* per transfer; SGS wait_for_xfer allows max(len * 8 / speed * 10 + 30, 100) ms (:679-688); 6 bytes at 6.144 MHz take 8 us */
++#define AMP_POLLS	100000u		/* per wait, whatever the counter says */
++#define AMP_SPINS_MS	1000000u	/* counter reads per ms of a fixed delay before it counts as a dead counter */
++#define AMP_TICK_SPINS	1000u		/* reads of the counter to see it move */
++#define AMP_TX_BYTES	(AMP_ADDR_BYTES + AMP_PAD_BYTES)
++
++#define BIT(n)		(1u << (n))
++/* absolute addresses */
++#define A_CH		(AMP_BASE + SPI_CH_CFG_OFF)
++#define A_MODECFG	(AMP_BASE + SPI_MODE_CFG_OFF)
++#define A_SLAVE		(AMP_BASE + SPI_SLAVE_SEL_OFF)
++#define A_INTEN		(AMP_BASE + SPI_INT_EN_OFF)
++#define A_STATUS	(AMP_BASE + SPI_STATUS_OFF)
++#define A_TX		(AMP_BASE + SPI_TX_DATA_OFF)
++#define A_RX		(AMP_BASE + SPI_RX_DATA_OFF)
++#define A_PKT		(AMP_BASE + SPI_PACKET_CNT_OFF)
++#define A_PND		(AMP_BASE + SPI_PENDING_CLR_OFF)
++#define A_SWAP		(AMP_BASE + SPI_SWAP_CFG_OFF)
++#define A_FB		(AMP_BASE + SPI_FB_CLK_OFF)
++#define A_USICON	(AMP_BASE + SPI_USI_CON_OFF)
++#define A_SYS		PERI_SPI13_MODE_REG
++#define A_MUX		AMP_CMU_MUX
++#define A_DIV		(PERI_SPI13_CMU + PERI_SPI13_DIV)
++#define A_IPCLK		(PERI_SPI13_CMU + PERI_SPI13_GATE_IPCLK)
++#define A_PCLK		(PERI_SPI13_CMU + PERI_SPI13_GATE_PCLK)
++#define A_QCH		(PERI_SPI13_CMU + PERI_SPI13_QCH)
++/* the four pad banks: gpp25 (CLK, MOSI, MISO, CS0), gpp1 (CS1), gpp16 (RST_L), gpp23 (RST_R) */
++#define P25		AMP_PIN_CLK_BANK
++#define P1		AMP_PIN_CS1_BANK
++#define P16		AMP_PIN_RST_L_BANK
++#define P23		AMP_PIN_RST_R_BANK
++#define CON(b)		((b) + PERI_PAD_CON_OFF)
++#define DAT(b)		((b) + PERI_PAD_DAT_OFF)
++#define DRV(b)		((b) + PERI_PAD_DRV_OFF)
++#define AMP_B(w, nr)	peri_pin_bit((w), (nr))
++#define AMP_F25(w)	(peri_pin_field((w), AMP_PIN_CLK_NR) | peri_pin_field((w), AMP_PIN_MOSI_NR) << 4 | peri_pin_field((w), AMP_PIN_MISO_NR) << 8 | peri_pin_field((w), AMP_PIN_CS0_NR) << 12)
++#define AMP_D25(w)	(peri_pin_field((w), AMP_PIN_CLK_NR) | peri_pin_field((w), AMP_PIN_MOSI_NR) << 4)
++
++#define CH_TX		BIT(SPI_CH_TXCH_ON_BIT)
++#define CH_RX		BIT(SPI_CH_RXCH_ON_BIT)
++#define CH_CPHA		BIT(SPI_CH_CPHA_BIT)
++#define CH_CPOL		BIT(SPI_CH_CPOL_BIT)
++#define CH_SLAVE	BIT(SPI_CH_SLAVE_BIT)
++#define CH_SWRST	BIT(SPI_CH_SW_RST_BIT)
++#define CH_HS		BIT(SPI_CH_HS_EN_BIT)
++#define PKT_EN		BIT(SPI_PACKET_CNT_EN_BIT)
++#define MUX_SEL		BIT(AMP_CMU_MUX_SEL_BIT)
++#define MUX_BUSY	BIT(AMP_CMU_MUX_BUSY_BIT)
++#define TX_LVL(st)	(((st) >> SPI_TX_LVL_SHIFT) & SPI_LVL_MASK)
++#define RX_LVL(st)	(((st) >> SPI_RX_LVL_SHIFT) & SPI_LVL_MASK)
++
++/* the audited write values (cites at the use) */
++#define V_SLAVE_IDLE	BIT(SPI_SLAVE_SIG_INACT_BIT)
++#define V_SLAVE_AUTO	(BIT(SPI_SLAVE_SIG_INACT_BIT) | BIT(SPI_SLAVE_AUTO_BIT) | SPI_SLAVE_NSC_CNT_2)
++#define V_MODE		(SPI_TRAILCNT << SPI_TRAILCNT_OFF)
++#define V_SYS(old)	(((old) & ~PERI_MODE_MASK) | PERI_SPI13_MODE_VAL)
++
++/* the pads: X(pin, CON value, DAT writable, DRV writable) */
++#define AMP_PADS(X) X(CLK, AMP_SPI_FUNC, 0, 1) X(MOSI, AMP_SPI_FUNC, 0, 1) X(MISO, AMP_SPI_FUNC, 0, 0) X(CS0, 1u, 1, 0) X(CS1, 1u, 1, 0) \
++		    X(RST_L, 1u, 1, 0) X(RST_R, 1u, 1, 0)
++
++enum { AMP_OK = 0, AMP_TIMEOUT, AMP_ERROR };
++
++/* everything read before it is written; the restore writes exactly these back */
++struct amp_snap { uint32_t sys, mux, usicon, ch, mcfg, slave, inten, pkt, swap, fb, con25, dat25, drv25, con1, dat1, con16, dat16, con23, dat23; };
++struct amp_res { int read, otp; unsigned polls; uint32_t st4, st3, devid, revid; };
++
++__attribute__((noipa)) static unsigned put_txt(char *dst, unsigned cap, unsigned pos, const char *s)
++{
++	while (*s && pos + 1 < cap)
++		dst[pos++] = *s++;
++	return pos;
++}
++
++__attribute__((noipa)) static unsigned put_hex(char *dst, unsigned cap, unsigned pos, uint32_t v, unsigned digits)
++{
++	for (unsigned i = 0; i < digits && pos + 1 < cap; i++) {
++		unsigned d = (v >> (4 * (digits - 1 - i))) & 0xfu;
++
++		dst[pos++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
++	}
++	return pos;
++}
++
++/* lowercase hex without leading zeros (the stock "%x") */
++static unsigned put_hexmin(char *dst, unsigned cap, unsigned pos, uint32_t v)
++{
++	unsigned n = 1;
++
++	while (n < 8 && (v >> (4 * n)))
++		n++;
++	return put_hex(dst, cap, pos, v, n);
++}
++
++__attribute__((noipa)) static unsigned put_dec(char *dst, unsigned cap, unsigned pos, uint32_t v)
++{
++	char t[10];
++	unsigned n = 0;
++
++	while (n < sizeof(t) && (v || !n)) {
++		t[n++] = (char)('0' + v % 10u);
++		v /= 10u;
++	}
++	while (n && pos + 1 < cap)
++		dst[pos++] = t[--n];
++	return pos;
++}
++
++static void emit(const char *label, char *buf, unsigned pos)
++{
++	if (pos > RAMLOG_LINE_MAX - 8u)	/* room for the label (AMP / SWEET) and the space in the ramlog line */
++		pos = RAMLOG_LINE_MAX - 8u;
++	buf[pos] = 0;
++	con_str(label, buf);
++}
++
++static void say(const char *a, const char *b)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, a);
++
++	p = put_txt(line, sizeof(line), p, b);
++	emit("AMP", line, p);
++}
++
++/* "<what> <n1>=XXXXXXXX <n2>=XXXXXXXX <n3>=XXXXXXXX" */
++static void three(const char *what, const char *n1, uint32_t v1, const char *n2, uint32_t v2, const char *n3, uint32_t v3)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, what);
++
++	p = put_txt(line, sizeof(line), p, " ");
++	p = put_txt(line, sizeof(line), p, n1);
++	p = put_txt(line, sizeof(line), p, "=");
++	p = put_hex(line, sizeof(line), p, v1, 8);
++	p = put_txt(line, sizeof(line), p, " ");
++	p = put_txt(line, sizeof(line), p, n2);
++	p = put_txt(line, sizeof(line), p, "=");
++	p = put_hex(line, sizeof(line), p, v2, 8);
++	p = put_txt(line, sizeof(line), p, " ");
++	p = put_txt(line, sizeof(line), p, n3);
++	p = put_txt(line, sizeof(line), p, "=");
++	p = put_hex(line, sizeof(line), p, v3, 8);
++	emit("AMP", line, p);
++}
++
++static int r32(uintptr_t pa, uint32_t *v)
++{
++	return try_read32(pa, v);
++}
++
++/* byte `pos` of the 6-byte read frame of register `reg`: the address with the read flag, big endian, then the pad bytes 0 (AMP cs35l41-spi.c:32-45,
++ * GKI regmap-spi.c:107 read_flag_mask 0x80 on byte 0, regmap.c:1676-1689, :2840-2847) */
++static inline __attribute__((always_inline)) uint32_t frame_byte(uint32_t reg, uint32_t pos)
++{
++	return pos < AMP_ADDR_BYTES ? ((reg | AMP_READ_FLAG) >> (8u * (AMP_ADDR_BYTES - 1u - pos))) & 0xffu : 0u;
++}
++
++/* a TX byte is allowed only at its position in a read frame of one of the four registers; position 0 is therefore always 0x80 */
++static inline __attribute__((always_inline)) int tx_byte_ok(uint32_t pos, uint32_t v)
++{
++	return pos < AMP_TX_BYTES && (v == frame_byte(AMP_REG_IRQ1_STATUS4, pos) || v == frame_byte(AMP_REG_IRQ1_STATUS3, pos) ||
++				      v == frame_byte(AMP_REG_DEVID, pos) || v == frame_byte(AMP_REG_REVID, pos) ||
++				      v == frame_byte(AMP_REG_IRQ1_STATUS1, pos) || v == frame_byte(AMP_REG_IRQ1_MASK1, pos) || v == frame_byte(AMP_REG_CCM_CORE, pos));
++}
++
++/* The words a write may target. 0 = not writable (w32 then does not even read). */
++__attribute__((noipa)) static int amp_reg_writable(uintptr_t pa)
++{
++	return pa == A_SYS || pa == A_MUX || pa == A_USICON || pa == A_CH || pa == A_MODECFG || pa == A_SLAVE || pa == A_INTEN || pa == A_TX ||
++	       pa == A_PKT || pa == A_PND || pa == A_SWAP || pa == A_FB || pa == CON(P25) || pa == DAT(P25) || pa == DRV(P25) || pa == CON(P1) ||
++	       pa == DAT(P1) || pa == CON(P16) || pa == DAT(P16) || pa == CON(P23) || pa == DAT(P23);
++}
++
++/* the snapshot value of a word = the only value its restore may write (0 for TX_DATA / PENDING_CLR, never restored to a value) */
++static uint32_t snap_of(const struct amp_snap *s, uintptr_t pa)
++{
++	return pa == A_SYS ? s->sys : pa == A_MUX ? s->mux : pa == A_USICON ? s->usicon : pa == A_CH ? s->ch : pa == A_MODECFG ? s->mcfg :
++	       pa == A_SLAVE ? s->slave : pa == A_INTEN ? s->inten : pa == A_PKT ? s->pkt : pa == A_SWAP ? s->swap : pa == A_FB ? s->fb :
++	       pa == CON(P25) ? s->con25 : pa == DAT(P25) ? s->dat25 : pa == DRV(P25) ? s->drv25 : pa == CON(P1) ? s->con1 : pa == DAT(P1) ? s->dat1 :
++	       pa == CON(P16) ? s->con16 : pa == DAT(P16) ? s->dat16 : pa == CON(P23) ? s->con23 : pa == DAT(P23) ? s->dat23 : 0u;
++}
++
++/*
++ * The allowlist: (word, value) pairs; a pure function of its five arguments (the object audit evaluates the compiled code over a grid).
++ * old = the word read just before (for TX_DATA and PENDING_CLR: STATUS), aux = STATUS for CH_CFG / CH_CFG for TX_DATA, rv = the snapshot value.
++ * The transmitter can be switched on only in mode 0 as master without HS, with RX on, from off, with exactly one 6-byte frame in the TX FIFO; a TX
++ * byte only while the transmitter is off, at its frame position (= the TX FIFO level). A pad word may change only the fields of the amp pins, each to
++ * its stock value or back to the snapshot.
++ */
++__attribute__((noipa)) static int w32_allowed(uintptr_t pa, uint32_t old, uint32_t v, uint32_t aux, uint32_t rv, int arm, uint32_t areg, uint32_t aval)
++{
++	uint32_t m = 0;
++	int listed = 0, bad = 0;
++
++	if (pa == A_SYS)	/* the SW_CONF field only, := SPI (SGS :1593-1595 regmap_update_bits mask 0x7), or back */
++		return ((old ^ v) & ~PERI_MODE_MASK) == 0u && ((v & PERI_MODE_MASK) == PERI_SPI13_MODE_VAL || v == rv);
++	if (pa == A_MUX)	/* the select bit only, := 0 = oscclk (LX clk-gs101.c:4181, :4201-4203), or back */
++		return ((old ^ v) & ~MUX_SEL) == 0u && (!(v & MUX_SEL) || v == rv);
++	if (pa == A_USICON)	/* exynos_usi_init writes USI_RESET = 0 (SGS :1425-1440) */
++		return v == 0u || v == rv;
++	if (pa == A_CH) {
++		if (v == rv && !(v & (CH_TX | CH_RX)))
++			return 1;
++		if (v & ~(CH_TX | CH_RX | CH_SWRST))
++			return 0;	/* mode 0 (no CPOL / CPHA, the DT sets neither), master, no HS_EN (SGS :793-806, :613-616 only >= 30 MHz) */
++		if (!(v & CH_TX))
++			return 1;
++		if (arm)	/* A7: one armed, allowed write frame queued in full */
++			return amp_write_ok(areg, aval) && (v & CH_RX) && !(v & CH_SWRST) && !(old & CH_TX) && TX_LVL(aux) == AMP_WTX_BYTES;
++		return (v & CH_RX) && !(v & CH_SWRST) && !(old & CH_TX) && TX_LVL(aux) == AMP_TX_BYTES;
++	}
++	if (pa == A_MODECFG)	/* hwinit: 0, then the trailing count (SGS :1458-1478); byte width, no DMA / 4-burst / loopback */
++		return v == 0u || v == V_MODE || v == rv;
++	if (pa == A_SLAVE)	/* hwinit SIG_INACT (SGS :1453), enable_cs AUTO | NSC_CNT_2 (:664-669) */
++		return v == V_SLAVE_IDLE || v == V_SLAVE_AUTO || v == rv;
++	if (pa == A_INTEN || pa == A_SWAP)	/* hwinit (SGS :1456, :1472), config byte width with swap-mode (:834-836) */
++		return v == 0u || v == rv;
++	if (pa == A_FB)		/* fb_delay & 3 (SGS :992), samsung,spi-feedback-delay = 1 */
++		return v == AMP_FB_DELAY || v == rv;
++	if (pa == A_PND)	/* set and clear the four pending bits (SGS :1464-1470) */
++		return v == SPI_PND_CLR_ALL || v == 0u;
++	if (pa == A_PKT)	/* enable_datapath: count & ~EN, count, count | EN (SGS :572-581); flush 0 (:268) */
++		return v == 0u || v == AMP_TX_BYTES || v == AMP_VAL_BYTES || v == (AMP_TX_BYTES | PKT_EN) || v == (AMP_VAL_BYTES | PKT_EN) ||
++		       (v == rv && !(v & PKT_EN)) || (arm && amp_write_ok(areg, aval) && (v == AMP_WTX_BYTES || v == (AMP_WTX_BYTES | PKT_EN)));
++	if (pa == A_TX) {	/* one byte per 32-bit write (writesb_32, SGS :519-529) */
++		if (arm)	/* A7: exactly the armed write frame, byte by byte */
++			return !(aux & CH_TX) && amp_write_ok(areg, aval) && TX_LVL(old) < AMP_WTX_BYTES && v == wframe_byte(areg, aval, TX_LVL(old));
++		return !(aux & CH_TX) && tx_byte_ok(TX_LVL(old), v);
++	}
++#define PAD_W(P, fn, datw, drvw) \
++	if (pa == CON(AMP_PIN_##P##_BANK)) { \
++		uint32_t sh = 4u * AMP_PIN_##P##_NR, f = (v >> sh) & 0xfu; \
++		listed = 1; \
++		m |= 0xfu << sh; \
++		if ((((old ^ v) >> sh) & 0xfu) && f != (fn) && f != ((rv >> sh) & 0xfu)) \
++			bad = 1; \
++	} \
++	if ((datw) && pa == DAT(AMP_PIN_##P##_BANK)) { \
++		listed = 1; \
++		m |= 1u << AMP_PIN_##P##_NR; \
++	} \
++	if ((drvw) && pa == DRV(AMP_PIN_##P##_BANK)) { \
++		uint32_t sh = 4u * AMP_PIN_##P##_NR, f = (v >> sh) & 0xfu; \
++		listed = 1; \
++		m |= 0xfu << sh; \
++		if ((((old ^ v) >> sh) & 0xfu) && f != AMP_DRV && f != ((rv >> sh) & 0xfu)) \
++			bad = 1; \
++	}
++	AMP_PADS(PAD_W)
++#undef PAD_W
++	return listed && !bad && ((old ^ v) & ~m) == 0u;
++}
++
++/* The ONLY writer. pa = an absolute word address; reads before it writes; 0 = written, -1 = fault, -2 = refused (nothing written).
++ * noipa keeps the one try_write32 call and the allowlist call inside this symbol (the object audit checks it). */
++__attribute__((noipa)) static int w32(const struct amp_snap *s, uintptr_t pa, uint32_t v)
++{
++	uint32_t old = 0, aux = 0;
++
++	if (!amp_reg_writable(pa))
++		return -2;			/* not a listed word: not even read */
++	if (!try_read32(pa == A_TX || pa == A_PND ? A_STATUS : pa, &old))
++		return -1;			/* TX_DATA / PENDING_CLR: STATUS is read, never the data / clear register */
++	if ((pa == A_TX || pa == A_CH) && !try_read32(pa == A_TX ? A_CH : A_STATUS, &aux))
++		return -1;
++	if (!w32_allowed(pa, old, v, aux, snap_of(s, pa), amp_arm.on, amp_arm.reg, amp_arm.val))
++		return -2;
++	return try_write32(pa, v) ? 0 : -1;
++}
++
++/* read-modify-write of one pad field (width 4: CON / DRV, width 1: DAT) through w32 */
++static int pad_put(const struct amp_snap *s, uintptr_t pa, uint32_t nr, uint32_t width, uint32_t val)
++{
++	uint32_t w = 0, sh = width * nr, mk = width == 4u ? 0xfu : 1u;
++
++	if (!r32(pa, &w))
++		return -1;
++	return w32(s, pa, (w & ~(mk << sh)) | ((val & mk) << sh));
++}
++
++/* read the counter until it moves (bounded): 1 = running */
++static int counter_runs(void)
++{
++	uint64_t t0 = touch_ticks();
++
++	for (unsigned i = 0; i < AMP_TICK_SPINS; i++)
++		if (touch_ticks() != t0)
++			return 1;
++	return 0;
++}
++
++/* a fixed delay on the counter, bounded by AMP_SPINS_MS reads per ms: 0 = the time passed, -1 = the bound hit first */
++static int wait_ms(uint32_t ms)
++{
++	uint64_t t0 = touch_ticks(), lim = counter_freq() / 1000u * ms;
++
++	for (uint32_t i = 0; i < AMP_SPINS_MS * ms; i++)
++		if (touch_ticks() - t0 >= lim)
++			return 0;
++	return -1;
++}
++
++/* bounded wait on a STATUS level: what 0 = RX level >= n, 1 = TX level == 0; the counter AND a poll count bound it */
++static int wait_lvl(unsigned what, uint32_t n)
++{
++	uint64_t t0 = touch_ticks(), lim = counter_freq() / 1000u * AMP_XFER_MS;
++	uint32_t st = 0;
++
++	for (unsigned i = 0; i < AMP_POLLS; i++) {
++		if (!r32(A_STATUS, &st))
++			return AMP_ERROR;
++		if (what == 0 ? RX_LVL(st) >= n : TX_LVL(st) == 0u)
++			return AMP_OK;
++		if (touch_ticks() - t0 > lim)
++			break;
++	}
++	return AMP_TIMEOUT;
++}
++
++/* the mux busy bit clears (bounded) */
++static int mux_idle(void)
++{
++	uint64_t t0 = touch_ticks(), lim = counter_freq() / 1000u;
++	uint32_t m = 0;
++
++	for (unsigned i = 0; i < AMP_POLLS; i++) {
++		if (!r32(A_MUX, &m))
++			return AMP_ERROR;
++		if (!(m & MUX_BUSY))
++			return AMP_OK;
++		if (touch_ticks() - t0 > lim)
++			break;
++	}
++	return AMP_TIMEOUT;
++}
++
++/* SGS flush_fifo (:258-305): channels off, PACKET_CNT 0, SW_RST (HS_EN off), TX drained, RX read out, SW_RST released. The final MODE_CFG
++ * read-modify-write (clear DMA bits) is a no-op here (never set) and skipped. */
++static int flush(const struct amp_snap *s)
++{
++	uint32_t ch = 0, st = 0, b = 0;
++	int e = AMP_OK;
++
++	if (!r32(A_CH, &ch) || w32(s, A_CH, ch & ~(CH_RX | CH_TX)))
++		return AMP_ERROR;
++	if (w32(s, A_PKT, 0u))
++		return AMP_ERROR;
++	if (!r32(A_CH, &ch) || w32(s, A_CH, (ch | CH_SWRST) & ~CH_HS))
++		return AMP_ERROR;
++	if (wait_lvl(1, 0u) != AMP_OK)
++		e = AMP_TIMEOUT;		/* Linux only warns ("Timed out flushing TX FIFO", :280-281) */
++	for (unsigned i = 0; i < 2u * SPI_FIFO_BYTES; i++) {
++		if (!r32(A_STATUS, &st))
++			return AMP_ERROR;
++		if (!RX_LVL(st))
++			break;
++		if (!r32(A_RX, &b))
++			return AMP_ERROR;
++	}
++	if (!r32(A_CH, &ch) || w32(s, A_CH, ch & ~CH_SWRST))
++		return AMP_ERROR;
++	return e;
++}
++
++/* one transfer of a message (SGS enable_datapath :543-636 polling branch, wait_for_xfer, flush_fifo): tx = the 6 frame bytes of reg out (RX on, the
++ * RX bytes discarded: a TX-only transfer, :720-724), else 4 bytes in with the transmitter off, big endian into *val */
++static int xfer(const struct amp_snap *s, uint32_t reg, int tx, uint32_t *val)
++{
++	uint32_t ch = 0, pk = 0, b = 0, v = 0, n = tx == 2 ? AMP_WTX_BYTES : tx ? AMP_TX_BYTES : AMP_VAL_BYTES;
++	int e, f;
++
++	if (!r32(A_CH, &ch) || !r32(A_PKT, &pk))
++		return AMP_ERROR;
++	ch = (ch & ~CH_TX) | CH_RX;						/* ref: SGS :551-552, :570 */
++	if (w32(s, A_PKT, pk & ~PKT_EN) || w32(s, A_PKT, n) || w32(s, A_PKT, n | PKT_EN))	/* ref: SGS :572-581 */
++		return AMP_ERROR;
++	for (uint32_t p = 0; tx && p < n; p++)
++		if (w32(s, A_TX, tx == 2 ? wframe_byte(amp_arm.reg, amp_arm.val, p) : frame_byte(reg, p)))				/* ref: SGS :608-611 writesb_32 */
++			return AMP_ERROR;
++	if (w32(s, A_CH, ch | (tx ? CH_TX : 0u)))				/* ref: SGS :594, :635 */
++		return AMP_ERROR;
++	e = wait_lvl(0, n);							/* ref: SGS :692-697 */
++	for (uint32_t i = 0; e == AMP_OK && !tx && i < AMP_VAL_BYTES; i++) {
++		if (!r32(A_RX, &b))
++			e = AMP_ERROR;
++		v = (v << 8) | (b & 0xffu);					/* REGMAP_ENDIAN_BIG (AMP cs35l41-spi.c:37-38) */
++	}
++	f = flush(s);								/* ref: SGS :1122 after every transfer, :1103 on error */
++	*val = v;
++	return e != AMP_OK ? e : f;
++}
++
++/* one regmap read on chip select cs (0 = L gpp25-3, 1 = R gpp1-0): CS low + SLAVE_SEL auto, the 6-byte address transfer, the 4-byte data transfer,
++ * CS high (always, also after an error) */
++static int amp_read(const struct amp_snap *s, int cs, uint32_t reg, uint32_t *val)
++{
++	uintptr_t dat = cs ? DAT(AMP_PIN_CS1_BANK) : DAT(AMP_PIN_CS0_BANK), odat = cs ? DAT(AMP_PIN_CS0_BANK) : DAT(AMP_PIN_CS1_BANK);
++	uint32_t nr = cs ? AMP_PIN_CS1_NR : AMP_PIN_CS0_NR, onr = cs ? AMP_PIN_CS0_NR : AMP_PIN_CS1_NR, dummy = 0, o = 0;
++	int e = AMP_OK;
++
++	*val = 0;
++	if (!r32(odat, &o) || !peri_pin_bit(o, onr))
++		return AMP_ERROR;		/* the other chip select must read high: never both amps on the bus (a failed CS release stops here) */
++	if (pad_put(s, dat, nr, 1u, 0u) || w32(s, A_SLAVE, V_SLAVE_AUTO))	/* ref: SGS enable_cs :662-669 (gpiod_set_value 1 = active low) */
++		e = AMP_ERROR;
++	if (e == AMP_OK)
++		e = xfer(s, reg, 1, &dummy);
++	if (e == AMP_OK)
++		e = xfer(s, 0u, 0, val);
++	if (pad_put(s, dat, nr, 1u, 1u))					/* ref: SGS disable_cs :762-763 (AUTO: SLAVE_SEL not written) */
++		e = AMP_ERROR;
++	return e;
++}
++
++/* A7: one regmap write on chip select cs: only an allowed pair; armed for exactly its one 10-byte transfer (regmap-spi write = one transfer) */
++static int amp_write(const struct amp_snap *s, int cs, uint32_t reg, uint32_t val)
++{
++	uintptr_t dat = cs ? DAT(AMP_PIN_CS1_BANK) : DAT(AMP_PIN_CS0_BANK), odat = cs ? DAT(AMP_PIN_CS0_BANK) : DAT(AMP_PIN_CS1_BANK);
++	uint32_t nr = cs ? AMP_PIN_CS1_NR : AMP_PIN_CS0_NR, onr = cs ? AMP_PIN_CS0_NR : AMP_PIN_CS1_NR, dummy = 0, o = 0;
++	int e = AMP_OK;
++
++	if (!amp_write_ok(reg, val))
++		return AMP_ERROR;
++	if (!r32(odat, &o) || !peri_pin_bit(o, onr))
++		return AMP_ERROR;		/* never both amps on the bus */
++	if (pad_put(s, dat, nr, 1u, 0u) || w32(s, A_SLAVE, V_SLAVE_AUTO))
++		e = AMP_ERROR;
++	if (e == AMP_OK) {
++		amp_arm.reg = reg;
++		amp_arm.val = val;
++		amp_arm.on = 1;
++		e = xfer(s, 0u, 2, &dummy);
++	}
++	amp_arm.on = 0;
++	amp_arm.reg = 0;
++	amp_arm.val = 0;
++	if (pad_put(s, dat, nr, 1u, 1u))
++		e = AMP_ERROR;
++	return e;
++}
++
++/* A7: the B2 probe writes in stock order, then IRQ1_STATUS1 / IRQ1_MASK1 / DSP1_CCM_CORE_CTRL read back. 0 = all written, read back, no error bit */
++static int amp_init(const struct amp_snap *s, int cs, const char *name)
++{
++	uint32_t st1 = 0, mask = 0, ccm = 0;
++	unsigned n = 0;
++	int e = AMP_OK;
++	char line[RAMLOG_LINE_MAX];
++	unsigned p;
++
++#define AMP_W_DO(r, v) if (e == AMP_OK) { e = amp_write(s, cs, (r), (v)); n++; }
++	AMP_INIT_SEQ(AMP_W_DO)
++#undef AMP_W_DO
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &st1);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_IRQ1_MASK1, &mask);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_CCM_CORE, &ccm);
++	p = put_txt(line, sizeof(line), 0, name);
++	p = put_txt(line, sizeof(line), p, " init writes=");
++	p = put_dec(line, sizeof(line), p, n);
++	p = put_txt(line, sizeof(line), p, " st1=");
++	p = put_hex(line, sizeof(line), p, st1, 8);
++	p = put_txt(line, sizeof(line), p, " mask1=");
++	p = put_hex(line, sizeof(line), p, mask, 8);
++	p = put_txt(line, sizeof(line), p, " ccm=");
++	p = put_hex(line, sizeof(line), p, ccm, 8);
++	p = put_txt(line, sizeof(line), p, e == AMP_OK ? "" : " FAILED");
++	emit("AMP", line, p);
++	if (e == AMP_OK && (st1 & AMP_ERR_BITS))
++		say(name, " !!! amp error bit in IRQ1_STATUS1 (H8: no output steps for the rest of the run)");
++	return e == AMP_OK && !(st1 & AMP_ERR_BITS) && mask == AMP_INT1_MASK_DEFAULT && ccm == 0u ? AMP_OK : AMP_ERROR;
++}
++
++/* AMP cs35l41.c:4210-4230: reset requested GPIOD_OUT_LOW (DAT 0, then output), 2 ms, release (1), 2 ms */
++static int reset_release(const struct amp_snap *s, uintptr_t bank, uint32_t nr)
++{
++	if (pad_put(s, DAT(bank), nr, 1u, 0u) || pad_put(s, CON(bank), nr, 4u, 1u))
++		return AMP_ERROR;
++	if (wait_ms(AMP_RESET_MS))
++		return AMP_TIMEOUT;
++	if (pad_put(s, DAT(bank), nr, 1u, 1u))
++		return AMP_ERROR;
++	if (wait_ms(AMP_RESET_MS))
++		return AMP_TIMEOUT;
++	return AMP_OK;
++}
++
++/* one amp, the probe order of AMP cs35l41.c:4232-4261: up to 100 x (1 ms, IRQ1_STATUS4) for OTP_BOOT_DONE, then IRQ1_STATUS3, DEVID, REVID.
++ * Reads only; a DEVID of 0 or 0xffffffff is read once more ("twice"). */
++static int amp_probe(const struct amp_snap *s, int cs, struct amp_res *r)
++{
++	int e = AMP_OK;
++
++	for (unsigned i = 0; e == AMP_OK && i < AMP_OTP_POLLS && !r->otp; i++) {
++		if (wait_ms(AMP_OTP_POLL_MS))
++			e = AMP_TIMEOUT;
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_REG_IRQ1_STATUS4, &r->st4);
++		r->polls = i + 1u;
++		r->otp = e == AMP_OK && (r->st4 & AMP_OTP_BOOT_DONE);
++	}
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_IRQ1_STATUS3, &r->st3);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_DEVID, &r->devid);
++	if (e == AMP_OK && (r->devid == 0u || r->devid == ~0u))
++		e = amp_read(s, cs, AMP_REG_DEVID, &r->devid);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_REVID, &r->revid);
++	r->read = e == AMP_OK;
++	return e;
++}
++
++static void amp_line(const char *name, const struct amp_res *r, int e)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, name);
++
++	p = put_txt(line, sizeof(line), p, r->otp ? " otp=1 polls=" : " otp=0 polls=");
++	p = put_dec(line, sizeof(line), p, r->polls);
++	p = put_txt(line, sizeof(line), p, " st4=");
++	p = put_hex(line, sizeof(line), p, r->st4, 8);
++	p = put_txt(line, sizeof(line), p, " st3=");
++	p = put_hex(line, sizeof(line), p, r->st3, 8);
++	p = put_txt(line, sizeof(line), p, " devid=");
++	p = put_hex(line, sizeof(line), p, r->devid, 8);
++	p = put_txt(line, sizeof(line), p, " revid=");
++	p = put_hex(line, sizeof(line), p, r->revid, 8);
++	p = put_txt(line, sizeof(line), p, e == AMP_OK ? "" : e == AMP_TIMEOUT ? " timeout" : " error");
++	emit("AMP", line, p);
++	if (r->read && (r->devid == 0u || r->devid == ~0u))
++		say(name, " DEVID read 0 or all-ones twice: no MISO answer");
++	if (r->read && (r->st3 & AMP_OTP_BOOT_ERR))
++		say(name, " OTP_BOOT_ERR set in IRQ1_STATUS3 (stock probe would fail)");
++}
++
++static unsigned put_amp(char *line, unsigned cap, unsigned p, const char *tag, const struct amp_res *r)
++{
++	p = put_txt(line, cap, p, tag);
++	if (!r->read || !r->otp || (r->st3 & AMP_OTP_BOOT_ERR))	/* review F3: stock fails the probe in these cases (AMP cs35l41.c:4233-4249) */
++		return put_txt(line, cap, p, "none");
++	p = put_txt(line, cap, p, "0x");
++	p = put_hexmin(line, cap, p, r->devid);
++	p = put_txt(line, cap, p, "/0x");
++	return put_hexmin(line, cap, p, r->revid);
++}
++
++static void result(const struct amp_res *l, const struct amp_res *r, const char *restore_s)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, "AMP RESULT: ");
++
++	p = put_amp(line, sizeof(line), p, "l=", l);
++	p = put_amp(line, sizeof(line), p, " r=", r);
++	p = put_txt(line, sizeof(line), p, " restore=");
++	p = put_txt(line, sizeof(line), p, restore_s);
++	emit("SWEET", line, p);
++}
++
++static int refuse(const char *why)
++{
++	struct amp_res z = { 0 };
++
++	say("refused: ", why);
++	result(&z, &z, "n/a");
++	return 1;
++}
++
++/* the pads before any write: readable; SPI pads function 0 or 2, chip selects 0 or 1, resets input or output low (= the amps in reset) */
++static const char *pads_why(struct amp_snap *s)
++{
++	uint32_t pud = 0, x = 0;
++
++	if (!r32(CON(P25), &s->con25) || !r32(DAT(P25), &s->dat25) || !r32(DRV(P25), &s->drv25) || !r32(CON(P1), &s->con1) || !r32(DAT(P1), &s->dat1) ||
++	    !r32(CON(P16), &s->con16) || !r32(DAT(P16), &s->dat16) || !r32(CON(P23), &s->con23) || !r32(DAT(P23), &s->dat23) ||
++	    !r32(AMP_PIN_CLK_BANK + PERI_PAD_PUD_OFF, &pud))
++		return "pad words unreadable, nothing written";
++	three("pad gpp25", "CON", s->con25, "DAT", s->dat25, "DRV", s->drv25);
++	three("pad cs1/rst", "CON1", s->con1, "CON16", s->con16, "CON23", s->con23);
++	three("pad dat", "DAT1", s->dat1, "DAT16", s->dat16, "DAT23", s->dat23);
++	if (r32(CON(AMP_PIN_IRQ_L_BANK), &x))
++		three("pad irq", "CONA6", x, "PUD25", pud, "-", 0u);
++	if ((peri_pin_field(s->con25, AMP_PIN_CLK_NR) != 0u && peri_pin_field(s->con25, AMP_PIN_CLK_NR) != AMP_SPI_FUNC) ||
++	    (peri_pin_field(s->con25, AMP_PIN_MOSI_NR) != 0u && peri_pin_field(s->con25, AMP_PIN_MOSI_NR) != AMP_SPI_FUNC) ||
++	    (peri_pin_field(s->con25, AMP_PIN_MISO_NR) != 0u && peri_pin_field(s->con25, AMP_PIN_MISO_NR) != AMP_SPI_FUNC))
++		return "SPI13 pads not function 0 / 2";
++	if (peri_pin_field(s->con25, AMP_PIN_CS0_NR) > 1u || peri_pin_field(s->con1, AMP_PIN_CS1_NR) > 1u)
++		return "chip-select pads not input / output";
++	if (peri_pin_field(s->con16, AMP_PIN_RST_L_NR) > 1u || peri_pin_field(s->con23, AMP_PIN_RST_R_NR) > 1u ||
++	    peri_pin_bit(s->dat16, AMP_PIN_RST_L_NR) || peri_pin_bit(s->dat23, AMP_PIN_RST_R_NR))
++		return "a reset pad not input / output, or reads high: reset not touched";	/* review F1: any reset DAT bit 1 refuses (doc 46 (d) step 2) */
++	return 0;
++}
++
++/* Put back what was read before, in this order: both resets driven low (DAT, then the pad back to its function), the chip selects back, the bus pads,
++ * then (stage >= 2) the controller words and USI_CON, then the sysreg mode, then the mux. Then everything read back. 1 = every write accepted and
++ * every word equal. Writes that equal the current value are written anyway (harmless; keeps the sequence fixed). */
++static int restore(const struct amp_snap *s, int stage)
++{
++	uint32_t ch = 0, pkt = 0, mc = 0, sl = 0, ie = 0, sw = 0, fb = 0, uc = 0, sys = 0, mux = 0;
++	uint32_t c25 = 0, d25 = 0, r25 = 0, c1 = 0, d1 = 0, c16 = 0, d16 = 0, c23 = 0, d23 = 0;
++	int e = 0, ok = 1;
++
++	e |= pad_put(s, DAT(P16), AMP_PIN_RST_L_NR, 1u, 0u);	/* resets low first; read-modify-write of the reset bit only (review F2) */
++	e |= pad_put(s, DAT(P23), AMP_PIN_RST_R_NR, 1u, 0u);
++	e |= w32(s, CON(P16), s->con16);
++	e |= w32(s, CON(P23), s->con23);
++	e |= w32(s, CON(P25), s->con25);	/* chip selects to input before their DAT goes back (no CS edge with SCK) */
++	e |= w32(s, CON(P1), s->con1);
++	e |= pad_put(s, DAT(P25), AMP_PIN_CS0_NR, 1u, peri_pin_bit(s->dat25, AMP_PIN_CS0_NR));	/* the chip-select bits := snapshot, nothing else (review F2) */
++	e |= pad_put(s, DAT(P1), AMP_PIN_CS1_NR, 1u, peri_pin_bit(s->dat1, AMP_PIN_CS1_NR));
++	e |= w32(s, DRV(P25), s->drv25);
++	if (stage >= 2) {
++		e |= w32(s, A_CH, s->ch);
++		e |= w32(s, A_PKT, s->pkt);
++		e |= w32(s, A_MODECFG, s->mcfg);
++		e |= w32(s, A_SLAVE, s->slave);
++		e |= w32(s, A_INTEN, s->inten);
++		e |= w32(s, A_SWAP, s->swap);
++		e |= w32(s, A_FB, s->fb);
++		e |= w32(s, A_USICON, s->usicon);
++		ok = r32(A_CH, &ch) && r32(A_PKT, &pkt) && r32(A_MODECFG, &mc) && r32(A_SLAVE, &sl) && r32(A_INTEN, &ie) && r32(A_SWAP, &sw) &&
++		     r32(A_FB, &fb) && r32(A_USICON, &uc);
++		ok = ok && ch == s->ch && pkt == s->pkt && mc == s->mcfg && sl == s->slave && ie == s->inten && sw == s->swap && fb == s->fb && uc == s->usicon;
++		three("restore spi", "CH", ch, "USI_CON", uc, "SLAVE", sl);
++	}
++	e |= w32(s, A_SYS, s->sys);
++	if (s->mux & MUX_SEL) {
++		e |= w32(s, A_MUX, s->mux);
++		if (mux_idle() != AMP_OK)
++			e = -1;
++	}
++	ok = ok && r32(A_SYS, &sys) && r32(A_MUX, &mux) && r32(CON(P25), &c25) && r32(DAT(P25), &d25) && r32(DRV(P25), &r25) && r32(CON(P1), &c1) &&
++	     r32(DAT(P1), &d1) && r32(CON(P16), &c16) && r32(DAT(P16), &d16) && r32(CON(P23), &c23) && r32(DAT(P23), &d23);
++	three("restore", "SYS", sys, "MUX", mux, "CON25", c25);
++	three("restore", "DAT16", d16, "DAT23", d23, "CON16", c16);
++	/* review F2: only the amp pins' fields / bits are compared (another pin's input level may change meanwhile); the resets must read 0 */
++	return e == 0 && ok && sys == s->sys && mux == s->mux && AMP_F25(c25) == AMP_F25(s->con25) && AMP_B(d25, AMP_PIN_CS0_NR) == AMP_B(s->dat25, AMP_PIN_CS0_NR) &&
++	       AMP_D25(r25) == AMP_D25(s->drv25) && peri_pin_field(c1, AMP_PIN_CS1_NR) == peri_pin_field(s->con1, AMP_PIN_CS1_NR) &&
++	       AMP_B(d1, AMP_PIN_CS1_NR) == AMP_B(s->dat1, AMP_PIN_CS1_NR) && peri_pin_field(c16, AMP_PIN_RST_L_NR) == peri_pin_field(s->con16, AMP_PIN_RST_L_NR) &&
++	       peri_pin_field(c23, AMP_PIN_RST_R_NR) == peri_pin_field(s->con23, AMP_PIN_RST_R_NR) && !AMP_B(d16, AMP_PIN_RST_L_NR) && !AMP_B(d23, AMP_PIN_RST_R_NR);
++}
++
++/* exynos_usi_init + s3c64xx_spi_hwinit + s3c64xx_spi_config + the FB_CLK write, then the pads (pinctrl default, the CS GPIOs output inactive) */
++static int bring_up(const struct amp_snap *s)
++{
++	uint32_t ch = 0;
++
++	if (w32(s, A_USICON, 0u))			/* ref: SGS :1425-1440 exynos_usi_init (USI_RESET 0) */
++		return AMP_ERROR;
++	if (w32(s, A_SLAVE, V_SLAVE_IDLE) || w32(s, A_INTEN, 0u) || w32(s, A_MODECFG, 0u) || w32(s, A_PKT, 0u) ||
++	    w32(s, A_PND, SPI_PND_CLR_ALL) || w32(s, A_PND, 0u) || w32(s, A_SWAP, 0u) || w32(s, A_MODECFG, V_MODE))	/* ref: SGS :1442-1478 */
++		return AMP_ERROR;
++	if (flush(s) != AMP_OK)				/* ref: SGS :1480 */
++		return AMP_ERROR;
++	if (!r32(A_CH, &ch) || w32(s, A_CH, ch & ~(CH_SLAVE | CH_CPOL | CH_CPHA)))	/* ref: SGS :789-801, mode 0 */
++		return AMP_ERROR;
++	if (w32(s, A_FB, AMP_FB_DELAY))			/* ref: SGS :992 */
++		return AMP_ERROR;
++	/* pads: REF dt spi13-bus (gpp25-0..2 function 2), cs35l41-clk / -mosi drive 1; cs-gpios as outputs, inactive = high (active low) */
++	if (pad_put(s, DAT(P25), AMP_PIN_CS0_NR, 1u, 1u) || pad_put(s, DAT(P1), AMP_PIN_CS1_NR, 1u, 1u))
++		return AMP_ERROR;
++	if (pad_put(s, CON(P25), AMP_PIN_CS0_NR, 4u, 1u) || pad_put(s, CON(P1), AMP_PIN_CS1_NR, 4u, 1u))
++		return AMP_ERROR;
++	if (pad_put(s, CON(P25), AMP_PIN_CLK_NR, 4u, AMP_SPI_FUNC) || pad_put(s, CON(P25), AMP_PIN_MOSI_NR, 4u, AMP_SPI_FUNC) ||
++	    pad_put(s, CON(P25), AMP_PIN_MISO_NR, 4u, AMP_SPI_FUNC))
++		return AMP_ERROR;
++	if (pad_put(s, DRV(P25), AMP_PIN_CLK_NR, 4u, AMP_DRV) || pad_put(s, DRV(P25), AMP_PIN_MOSI_NR, 4u, AMP_DRV))
++		return AMP_ERROR;
++	return AMP_OK;
++}
++
++static int amp_init_run(void)
++{
++	struct amp_snap s = { 0 };
++	struct amp_res l = { 0 }, r = { 0 };
++	uint32_t div = 0, ip = 0, pc = 0, q = 0, st = 0;
++	enum peri_gate g;
++	const char *why;
++	int e = AMP_OK, el = AMP_ERROR, er = AMP_ERROR, il = AMP_ERROR, ir = AMP_ERROR, stage = 1, restored;
++	char gl[48];
++	unsigned gp;
++
++	if (!counter_freq())
++		return refuse("no timer, nothing written");
++	if (!counter_runs())
++		return refuse("counter not running, nothing written");
++	if (!r32(A_SYS, &s.sys) || !r32(A_MUX, &s.mux) || !r32(A_DIV, &div) || !r32(A_IPCLK, &ip) || !r32(A_PCLK, &pc) || !r32(A_QCH, &q))
++		return refuse("sysreg / CMU words unreadable, nothing written");
++	three("before", "SYS", s.sys, "MUX", s.mux, "DIV", div);
++	three("before", "IPCLK", ip, "PCLK", pc, "QCH", q);
++	/* the CMU half of the periprobe gate (the mode half is the next check: 0 or SPI is accepted, the probe selects SPI itself) */
++	g = peri_gate(1, PERI_SPI13_MODE_VAL, PERI_SPI13_MODE_VAL, 1, ip, 1, pc, 1, q);
++	if (g != PERI_GATE_OPEN) {
++		gp = put_txt(gl, sizeof(gl), 0, "spi13 gate ");
++		gp = put_txt(gl, sizeof(gl), gp, peri_gate_name(g));
++		gl[gp] = 0;
++		return refuse(gl);
++	}
++	if ((s.sys & PERI_MODE_MASK) != 0u && (s.sys & PERI_MODE_MASK) != PERI_SPI13_MODE_VAL)
++		return refuse("USI13 sysreg mode selects another protocol");
++	if (s.mux & MUX_BUSY)
++		return refuse("USI13 CMU mux busy");
++	why = pads_why(&s);
++	if (why)
++		return refuse(why);
++	{
++		char line[RAMLOG_LINE_MAX];
++		unsigned p = put_txt(line, sizeof(line), 0, "sck_hz=");
++
++		p = put_dec(line, sizeof(line), p, AMP_OSC_HZ / ((div & 0xfu) + 1u) / AMP_SCK_DIV);
++		p = put_txt(line, sizeof(line), p, s.mux & MUX_SEL ? " (mux moved from the TOP source to oscclk)" : " (oscclk, mux not written)");
++		emit("AMP", line, p);
++	}
++
++	/* writes from here on: every path ends in restore() */
++	if ((s.mux & MUX_SEL) && (w32(&s, A_MUX, s.mux & ~MUX_SEL) || mux_idle() != AMP_OK))	/* ref: LX clk-gs101.c:4201-4203; doc 21 ABL rule */
++		e = AMP_ERROR;
++	if (e == AMP_OK && w32(&s, A_SYS, V_SYS(s.sys)))		/* ref: SGS :1593-1595 */
++		e = AMP_ERROR;
++	if (e == AMP_OK && (!r32(A_USICON, &s.usicon) || !r32(A_CH, &s.ch) || !r32(A_MODECFG, &s.mcfg) || !r32(A_SLAVE, &s.slave) ||
++			    !r32(A_INTEN, &s.inten) || !r32(A_PKT, &s.pkt) || !r32(A_SWAP, &s.swap) || !r32(A_FB, &s.fb) || !r32(A_STATUS, &st))) {
++		say("stop: ", "SPI13 controller unreadable after the mode write");
++		e = AMP_ERROR;
++	} else if (e == AMP_OK) {
++		stage = 2;
++		three("spi before", "USI_CON", s.usicon, "CH", s.ch, "MODE", s.mcfg);
++		three("spi before", "SLAVE", s.slave, "PKT", s.pkt, "STATUS", st);
++		if ((s.ch & (CH_TX | CH_RX)) || (s.pkt & PKT_EN)) {
++			say("stop: ", "controller not idle (a channel on or PACKET_CNT enabled)");
++			e = AMP_ERROR;
++		}
++	}
++	if (e == AMP_OK)
++		e = bring_up(&s);
++	if (e == AMP_OK) {
++		el = reset_release(&s, P16, AMP_PIN_RST_L_NR);
++		if (el == AMP_OK)
++			el = amp_probe(&s, 0, &l);
++		amp_line("L", &l, el);
++		if (el == AMP_OK && l.otp && l.devid == AMP_DEVID && l.revid == AMP_REVID)
++			il = amp_init(&s, 0, "L");
++		er = reset_release(&s, P23, AMP_PIN_RST_R_NR);
++		if (er == AMP_OK)
++			er = amp_probe(&s, 1, &r);
++		amp_line("R", &r, er);
++		if (er == AMP_OK && r.otp && r.devid == AMP_DEVID && r.revid == AMP_REVID)
++			ir = amp_init(&s, 1, "R");
++	}
++
++	/* ALWAYS put everything back (a write was attempted on every path that reaches here) */
++	restored = restore(&s, stage);
++	if (!restored) {
++		say("!!! RESTORE FAILED: ", "a word differs (restore lines)");
++		say("!!! RESTORE FAILED: ", "a phone reset clears it (guess)");
++	}
++	result(&l, &r, restored ? "ok" : "FAILED");
++	if (il == AMP_OK && ir == AMP_OK && restored)
++		con_str("SWEET", "AMP: init ok l,r devid 35a40 rev b2, errors=0");
++	else
++		con_str("SWEET", "AMP: init FAILED (see the AMP lines)");
++	return il == AMP_OK && ir == AMP_OK && e == AMP_OK && el == AMP_OK && er == AMP_OK && l.otp && r.otp && !(l.st3 & AMP_OTP_BOOT_ERR) && !(r.st3 & AMP_OTP_BOOT_ERR) &&
++	       l.devid == AMP_DEVID && l.revid == AMP_REVID && r.devid == AMP_DEVID &&
++	       r.revid == AMP_REVID && restored ? 0 : 1;
++}
++
++
++#endif /* SWEET_AMP_H */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -58,6 +58,7 @@
+ extern void sweet_gpu_gs101_init(void);     /* bsd/dev/sweet_gpu_gs101.c, read-only, needs boot-arg sweetgpu= */
+ extern void sweet_wlan_init(void);          /* bsd/dev/sweet_wlan.c, read-only stage 1, needs boot-arg sweetwlan= and ADT /sweet-wlan */
+ extern void sweet_batt_init(void);          /* bsd/dev/sweet_hsi2c.c, fuel-gauge READs, needs boot-arg sweetbatt=1 and ADT /sweet-batt */
++extern void sweet_amp_init(void);           /* bsd/dev/sweet_amp.c, CS35L41 identify + B2 probe writes, needs boot-arg sweetamp=1 and an oriole ADT */
+ extern void sweet_trusty_init(void);        /* bsd/dev/sweet_trusty.c, version fastcalls only, needs boot-arg sweettrusty=1 */
+ 
+ #define REG_CAP         0x00
+@@ -704,6 +705,7 @@
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	sweet_keys_gs101_start();
++	sweet_amp_init();             /* no-op without boot-arg sweetamp=1; synchronous, BEFORE the touch / battery threads (shared gpp23 pad words) */
+ 	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
+ 	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */
+ 	sweet_wlan_init();            /* no-op without boot-arg sweetwlan= */

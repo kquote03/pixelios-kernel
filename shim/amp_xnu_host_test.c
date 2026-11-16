@@ -68,6 +68,7 @@ static struct {
 struct amp {
 	uint32_t mask1, ccm, st1;	/* IRQ1_MASK1, DSP1_CCM_CORE_CTRL, IRQ1_STATUS1 */
 	unsigned nwr, seq_bad;	/* write frames seen, out-of-sequence writes */
+	uint32_t st3;	/* IRQ1_STATUS3 (OTP_BOOT_ERR bit 31) */
 	int booted;		/* OTP done after boot_polls status reads since the reset release */
 	unsigned boot_polls, reads_since;
 	int absent;		/* no MISO answer: reads give 0 */
@@ -94,6 +95,7 @@ static uint64_t first_frame_tick[2];
 static char lines[512][RAMLOG_LINE_MAX + 8];
 static unsigned nl;
 static uint32_t ch_snap_inject;
+static unsigned flip_at; static int flip_bank; static uint32_t flip_bit;	/* at write #flip_at, DAT of flip_bank toggles flip_bit (another pin's input level) */
 static unsigned mux_writes;
 
 static void violate(const char *s)
@@ -247,7 +249,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	if (addr == 0x1001Cu && p == 6 && !m->booted && ++m->reads_since >= m->boot_polls)
 		m->booted = 1;
 	val = addr == 0x0u ? 0x35A40u : addr == 0x4u ? 0xB2u : addr == 0x1001Cu ? (m->booted ? 0x2u : 0u) : addr == 0x10110u ? m->mask1 :
-	      addr == 0x2BC1000u ? m->ccm : addr == 0x10010u ? m->st1 : 0u;
+	      addr == 0x2BC1000u ? m->ccm : addr == 0x10010u ? m->st1 : addr == 0x10018u ? m->st3 : 0u;
 	return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
 }
 
@@ -322,6 +324,8 @@ static int try_write32(uintptr_t pa, uint32_t v)
 	int b;
 
 	nw++;
+	if (flip_at && nw == flip_at)
+		h.dat[flip_bank] ^= flip_bit;
 	if (wfault_n && nw == wfault_n)
 		return 0;
 	if (ignore_from && nw >= ignore_from)
@@ -377,6 +381,7 @@ static void reset_hw(void)
 	h.ch |= ch_snap_inject;
 	for (int a = 0; a < 2; a++) { amp[a].boot_polls = 3; amp[a].mask1 = 0xFFFFFFFFu; amp[a].ccm = 0x1u; }
 	nw = nreads = nframes = violations = mux_writes = 0; why_v[0] = 0;
+	flip_at = 0; flip_bank = 0; flip_bit = 0;
 	rfault_pa = 0; rfault_after = 0; rfault_cnt = 0; wfault_n = 0; ignore_from = 0; no_clock = 0;
 	ticks = 1000; tick_step = 1; freq = 1000000;		/* 1 MHz counter: 1 ms = 1000 ticks */
 	nl = 0;
@@ -401,7 +406,7 @@ static void dump(void)
 static int restored_exact(void)
 {
 	for (int i = 0; i < 4; i++)
-		if (h.con[i] != h0.con[i] || h.dat[i] != h0.dat[i] || h.pud[i] != h0.pud[i] || h.drv[i] != h0.drv[i])
+		if (h.con[i] != h0.con[i] || (h.dat[i] ^ h0.dat[i]) != (i == flip_bank ? flip_bit : 0u) || h.pud[i] != h0.pud[i] || h.drv[i] != h0.drv[i])
 			return 0;
 	return h.sys == h0.sys && h.mux == h0.mux && h.usicon == h0.usicon && h.ch == h0.ch && h.mode == h0.mode && h.slave == h0.slave &&
 	       h.inten == h0.inten && h.pkt == h0.pkt && h.swap == h0.swap && h.fb == h0.fb && !released(0) && !released(1);
@@ -463,6 +468,8 @@ static void s_spifunc(void) { h.con[0] |= 0x3u; }
 static void s_csfunc(void) { h.con[1] |= 0x2u; }
 static void s_rsthigh(void) { h.con[2] |= 0x1000u; h.dat[2] |= 8u; }
 static void s_rstfunc(void) { h.con[3] |= 0x20000000u; }
+static void s_rstinhigh(void) { h.dat[2] |= 8u; }	/* review F1: reset pad an INPUT that reads high */
+static void s_rstrinhigh(void) { h.dat[3] |= 0x80u; }
 
 /* a stop after writes: exact restore, no violation, result line not ok */
 static void stopped(const char *label, int want_restore_ok)
@@ -478,6 +485,25 @@ static void stopped(const char *label, int want_restore_ok)
 	}
 	printf("ok: stopped and restored: %s (%u writes)\n", label, nw);
 }
+
+#ifndef amp_init_run_or_id
+#define amp_init_run_or_id amp_init_run
+#endif
+/* review F2: another pin of a bank changes its input level during the run: still a pass, an exact restore of the amp bits, resets low */
+static void flipped(const char *label)
+{
+	int rc = amp_init_run_or_id();
+
+	CHECK(rc == 0, label);
+	CHECK(violations == 0, why_v);
+	CHECK(restored_exact(), label);
+	CHECK(has("restore=ok"), label);
+	printf("ok: other-pin flip: %s\n", label);
+}
+
+#ifndef amp_init_run_or_id
+#define amp_init_run_or_id amp_init_run
+#endif
 
 static void unit_writes(void)
 {
@@ -605,18 +631,31 @@ int main(void)
 	refused("CS pad in another function", s_csfunc, "chip-select");
 	refused("reset already high", s_rsthigh, "reset");
 	refused("reset pad in another function", s_rstfunc, "reset");
+	refused("L reset input reading high (review F1)", s_rstinhigh, "reset");
+	refused("R reset input reading high (review F1)", s_rstrinhigh, "reset");
 
 	/* stops after writes */
 	reset_hw(); ch_snap_inject = CH_RX; reset_hw(); ch_snap_inject = 0; stopped("CH_CFG has a channel on after the mode write", 1);
 	CHECK(has("controller not idle"), "the reason");
 	reset_hw(); rfault_pa = R_CH; stopped("controller unreadable after the mode write", 1);
 	reset_hw(); amp[0].absent = 1; amp[1].absent = 1; stopped("no amp answers (MISO 0)", 1);
-	CHECK(has("SWEET AMP RESULT: l=0x0/0x0 r=0x0/0x0 restore=ok"), "zeros reported");
+	CHECK(has("SWEET AMP RESULT: l=none r=none restore=ok"), "no answer: no values in the result line");
 	CHECK(has("twice"), "zero twice reported");
 	reset_hw(); amp[0].ff = 1; amp[0].absent = 1; stopped("L MISO stuck high", 1);
-	CHECK(has("l=0xffffffff/0xffffffff"), "ones reported");
+	CHECK(has("l=none") && has("devid=ffffffff"), "ones: no pass value, the raw words in the AMP L line");
 	reset_hw(); amp[1].boot_polls = 1000; stopped("R never OTP_BOOT_DONE", 1);
 	CHECK(has("AMP R otp=0"), "otp timeout reported");
+	CHECK(has("r=none") && !has("r=0x35a40/0xb2"), "no OTP_BOOT_DONE: no pass value in the result line (review F3)");
+	reset_hw(); amp[0].st3 = 0x80000000u; stopped("L OTP_BOOT_ERR", 1);
+	CHECK(has("l=none") && !has("l=0x35a40/0xb2") && has("OTP_BOOT_ERR"), "OTP_BOOT_ERR: no pass value in the result line (review F3)");
+	reset_hw(); flip_at = 200; flip_bank = 2; flip_bit = 4u; flipped("gpp16-2 (BT_REG_ON) input flips mid-run (review F2 H7)");
+	CHECK(!released(0) && !released(1) && has("restore=ok"), "H7: resets low, restore ok");
+	reset_hw(); h.con[2] |= 0x1000u; h0 = h; flip_at = 200; flip_bank = 2; flip_bit = 4u; flipped("H7b: same, reset started as output low");
+	CHECK(!released(0) && !released(1) && has("restore=ok"), "H7b: resets low, restore ok");
+	CHECK(!(h.dat[2] & 8u), "H7b: the reset bit is 0");
+	reset_hw(); flip_at = 1; flip_bank = 0; flip_bit = 2u; (void)0;
+	{ unsigned tot; reset_hw(); (void)amp_init_run_or_id(); tot = nw; reset_hw(); flip_at = tot - 8u; flip_bank = 0; flip_bit = 2u; flipped("H8: MOSI reads high during the restore"); }
+	CHECK(has("restore=ok"), "H8: restore ok");
 	reset_hw(); amp[1].st1 = 0x40u; stopped("R reports BST_OVP_ERR after the init", 1);
 	CHECK(has("!!! amp error bit") && has("SWEET AMP: init FAILED"), "error bit reported, no pass");
 	reset_hw(); amp[0].absent = 1; stopped("L absent: no write frame to it", 1);
