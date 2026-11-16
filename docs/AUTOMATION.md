@@ -738,63 +738,92 @@ plus the one replacement `launchd.plist` (kept as `.sweetorig`; `sweetdev=restor
 One-client rule (0105): with `sweetmali=1` and no `sweetenv`, backboardd does not load libsweetgl and never opens SweetMali, so the self-test is the only
 client; the user client accepts root (the job runs as root).
 
-### G5 self-test runs: size ramp, files, launchd job (PREPARED, UNRUN; after g5-dev3d; review pending)
+### G5 self-test runs: size ramp, files, launchd job (PREPARED, UNRUN; after g5-dev3d)
 
-Same kernel and `C` flag list as the dev runs above (`xnu-local-lane-g-63384af`: 0117 dev overlay, 0104/0105 SweetMali, 0048 /dev/null tee; reviewed 0155,
-no 0157), plus `--fail-on 'ramdisk overlaps kernel memory'` on every row below. Same re-pack + sha256 check before each run.
+Review: `docs/reviews/g5-selftest-runs-review-fable-1.md` (SAFE-AFTER-FIXES; F1-F11 applied here). Same kernel and `C` flag list as the dev runs
+above (`xnu-local-lane-g-63384af`, sha256 `f3e3d113…`: 0117 dev overlay, 0104/0105 SweetMali, 0048 /dev/null tee; reviewed 0155, no 0157). Same
+re-pack + sha256 check before each run. Read the forwarded `sweetgl_once:`/`sweetgl_selftest:`/`sweetgl:` lines of every st run (review F4: the launcher
+retries every `clear=SKIP tri=SKIP` result without a renderer line, also a permanent `dlopen` failure; its "service never appeared" text can be wrong).
 
-| Dir (`$A/gpu/g5/`) | Files (mode, owner 0:0) | Bytes | Archive sha256 |
-|---|---|---|---|
-| `ov-ramp1` | `/private/var/dev/ramp-1m.bin` 0644 (bytes 0..255 repeated) | 1048576 | `3dfafca0ab5933740b0b4d92bbcaa6fd6816f83a67f2f41b0b0b1070e4e1e1c2` |
-| `ov-ramp8` | `/private/var/dev/ramp-8m.bin` 0644 | 8388608 | `78a4ea7eb532818d0d48766404d013a30a3e233d07212905942caa73e73d0452` |
-| `ov-ramp24` | `/private/var/dev/ramp-24m.bin` 0644 | 25165824 | `87c8950075161254e8eb4e88f23f07dd7b8ac373d7c1d5091f589be7c4e2fa02` |
-| `ov-st1` | `/usr/local/bin/sweetgl_once` 0755 (`cf7a9376…`), `/usr/local/bin/sweetgl_selftest` 0755 (`67733d40…`), `/usr/local/lib/libsweetgl.dylib` 0755 (`f2b31a68…`), copies of `$A/gpu/out/` | 21057040 total | `69ced5a3bf7c0a0cd3d97c51816d18356678125079e83a0d51ddcba9e9a18795` |
-| `ov-st2` | `/System/Library/xpc/launchd.plist` 0644 = `tools/mk_launchd_job.py $A/gpu/g5/root-ro/launchd.plist OUT --sha256 7aab4ecb…` (523 -> 524 jobs, file sha256 `7c764fd52774ca0dd3f471ceee565bc812a3f8069c03d023c857dde71d5b24a4`) | 792710 | `011ac014b8ef063b65855b5da96920abb92587ccafd2646f16a04602d3adc904` |
-| `ov-st2orig` | `/System/Library/xpc/launchd.plist` 0644 = the root's own cache (`7aab4ecb…`), only to read a restore back | 792460 | `60fe4a3454ae976e1cb9fbf8dfa39fa2a4013f852087e6c33dd479bb938ec484` |
+| Dir (`$A/gpu/g5/`) | Files (mode, owner 0:0) | File bytes | Archive bytes | Archive sha256 |
+|---|---|---|---|---|
+| `ov-ramp1` | `/private/var/dev/ramp-1m.bin` 0644 (bytes 0..255 repeated) | 1048576 | 1048656 | `3dfafca0ab5933740b0b4d92bbcaa6fd6816f83a67f2f41b0b0b1070e4e1e1c2` |
+| `ov-ramp8` | `/private/var/dev/ramp-8m.bin` 0644 | 8388608 | 8388688 | `78a4ea7eb532818d0d48766404d013a30a3e233d07212905942caa73e73d0452` |
+| `ov-ramp24` | `/private/var/dev/ramp-24m.bin` 0644 | 25165824 | 25165904 | `87c8950075161254e8eb4e88f23f07dd7b8ac373d7c1d5091f589be7c4e2fa02` |
+| `ov-st1` | `/usr/local/bin/sweetgl_once` 0755 (`cf7a9376…`), `/usr/local/bin/sweetgl_selftest` 0755 (`67733d40…`), `/usr/local/lib/libsweetgl.dylib` 0755 (`f2b31a68…`), copies of `$A/gpu/out/` | 21056832 | 21057040 | `69ced5a3bf7c0a0cd3d97c51816d18356678125079e83a0d51ddcba9e9a18795` |
+| `ov-st2` | `/System/Library/xpc/launchd.plist` 0644 = `tools/mk_launchd_job.py $A/gpu/g5/root-ro/launchd.plist OUT --sha256 7aab4ecb…` (523 -> 524 jobs; the job has no UserName key, launchd's default for a LaunchDaemon is root [guess]; file sha256 `7c764fd52774ca0dd3f471ceee565bc812a3f8069c03d023c857dde71d5b24a4`) | 792710 | 792800 | `011ac014b8ef063b65855b5da96920abb92587ccafd2646f16a04602d3adc904` |
+| `ov-st2orig` | `/System/Library/xpc/launchd.plist` 0644 = the root's own cache (`7aab4ecb…`): pre-check and restore read-back | 792460 | 792544 | `60fe4a3454ae976e1cb9fbf8dfa39fa2a4013f852087e6c33dd479bb938ec484` |
 
 All paths are inside the 0117 allowlist (`/private/var/dev/`, `/usr/local/`, exactly `/System/Library/xpc/launchd.plist`); every archive is under
-the 40 MiB cap; `mkdevoverlay.parse` reads all back with crc ok [obs]. The 24 MiB ramp covers `ov-st1` (21.06 MB), the largest RAM disk of G5.
-Boot-args of g5-st1 (args-only hook of build-xnu-image.sh): 473 bytes of the 607-byte budget [obs].
+the 40 MiB cap; `mkdevoverlay.parse` reads all back with crc ok [obs]. The 24 MiB ramp covers `ov-st1` (21.06 MB archive), the largest RAM disk of G5.
+Boot-args of g5-st1b (args-only hook of build-xnu-image.sh, with xrun's `--rw` and remote/usblog args): 520 bytes of the 607-byte budget [obs review].
 
 ```bash
 # (A, K, C, D as in the dev block above)
-R=(--fail-on 'ramdisk overlaps kernel memory')
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-ramp1  --label g5-ramp1  --expect 'SWEET DEV: wrote /private/var/dev/ramp-1m.bin 1048576 bytes [0-9]+ ms'  --expect "$D 1 written, 0 skipped, 0 refused/failed"
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-ramp8  --label g5-ramp8  --expect 'SWEET DEV: wrote /private/var/dev/ramp-8m.bin 8388608 bytes [0-9]+ ms'  --expect "$D 1 written, 0 skipped, 0 refused/failed"
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-ramp24 --label g5-ramp24 --expect 'SWEET DEV: wrote /private/var/dev/ramp-24m.bin 25165824 bytes [0-9]+ ms' --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-ramp1  --label g5-ramp1  --expect 'SWEET DEV: wrote /private/var/dev/ramp-1m.bin 1048576 bytes [0-9]+ ms'  --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-ramp8  --label g5-ramp8  --expect 'SWEET DEV: wrote /private/var/dev/ramp-8m.bin 8388608 bytes [0-9]+ ms'  --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-ramp24 --label g5-ramp24 --expect 'SWEET DEV: wrote /private/var/dev/ramp-24m.bin 25165824 bytes [0-9]+ ms' --expect "$D 1 written, 0 skipped, 0 refused/failed"
 # three new files; no job references them yet, so nothing executes them
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-st1 --label g5-st0a --expect "$D 3 written, 0 skipped, 0 refused/failed" \
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st1 --label g5-st0a --expect "$D 3 written, 0 skipped, 0 refused/failed" \
   --expect 'SWEET DEV: wrote /usr/local/lib/libsweetgl.dylib 20920496 bytes [0-9]+ ms'
-# read-back: the three files are on disk
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-st1 --label g5-st0b --expect "$D 0 written, 3 skipped, 0 refused/failed"
-# the one replacement of a file iOS needs to boot + the GPU service; one client: sweetmali=1, no sweetenv (backboardd never opens SweetMali)
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-st2 --gpu-handover --intent gpu --label g5-st1 \
-  --args 'sweetmali=1 sweetnull=backboardd,SpringBoard,sweetgl_once,sweetgl_selftest' \
-  --expect 'SWEET DEV: wrote /System/Library/xpc/launchd.plist 792710 bytes \(original kept\)' --expect "$D 1 written, 0 skipped, 0 refused/failed" \
-  --expect 'sweetgl selftest: clear=PASS tri=PASS' --stop-on 'sweetgl_once: (done|gave up)' --fail-on 'sweetgl_once: gave up' --fail-on 'sweetgl selftest: clear=FAIL|tri=FAIL'
-# recovery / end state: put the root's own cache back, then read it back
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-st2 --args 'sweetdev=restore' --label g5-st-restore \
-  --expect 'SWEET DEV: restored /System/Library/xpc/launchd.plist' --expect "$D 1 written, 0 skipped, 0 refused/failed"
-SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" "${R[@]}" --overlay $A/gpu/g5/ov-st2orig --label g5-st-check \
-  --expect 'SWEET DEV: skipped /System/Library/xpc/launchd.plist 792460 bytes \(identical\)' --expect "$D 0 written, 1 skipped, 0 refused/failed"
+# read-back: the three files are on disk (any write = FAIL)
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st1 --label g5-st0b --expect "$D 0 written, 3 skipped, 0 refused/failed" --fail-on 'SWEET DEV: wrote'
+# pre-check (F6): the phone's live cache is the 7aab4ecb… one this series was built from (any write = FAIL; stop G5 st if it fails)
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st2orig --label g5-st-pre \
+  --expect 'SWEET DEV: skipped /System/Library/xpc/launchd.plist 792460 bytes \(identical\)' --expect "$D 0 written, 1 skipped, 0 refused/failed" --fail-on 'SWEET DEV: wrote'
 ```
+Then, in **one phone-lock session** (F2: the restore and its read-back are unconditional, also after a PASS, so no later boot of any lane runs the job):
+```bash
+tools/phone-lock run --owner lane-g --wait 3600 -- bash -c '
+# g5-st1a (F3): cache + job + exec of an overlay-written binary + dlopen, NO GPU work (no sweetmali: the service is absent, every try is SKIP)
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st2 --label g5-st1a \
+  --args "sweetnull=backboardd,SpringBoard,sweetgl_once,sweetgl_selftest" \
+  --expect "SWEET DEV: wrote /System/Library/xpc/launchd.plist 792710 bytes \(original kept\)" --expect "$D 1 written, 0 skipped, 0 refused/failed" \
+  --expect "sweetgl_selftest: loaded /usr/local/lib/libsweetgl.dylib" --expect "sweetgl_once: gave up after 30 tries" \
+  --stop-on SBCoverSheet --stop-on "sweetgl_once: (done|gave up)"
+# g5-st1b: the same cache again (read back), then the GPU self-test; one client: sweetmali=1, no sweetenv (backboardd never opens SweetMali)
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st2 --gpu-handover --intent gpu --label g5-st1b \
+  --args "sweetmali=1 sweetnull=backboardd,SpringBoard,sweetgl_once,sweetgl_selftest" \
+  --expect "SWEET DEV: skipped /System/Library/xpc/launchd.plist 792710 bytes \(identical\)" --expect "$D 0 written, 1 skipped, 0 refused/failed" \
+  --expect "sweetgl selftest: clear=PASS tri=PASS" --stop-on SBCoverSheet --stop-on "sweetgl_once: (done|gave up)" \
+  --fail-on "sweetgl_once: gave up" --fail-on "sweetgl selftest: clear=FAIL|tri=FAIL"
+# unconditional: put the root own cache back, then read it back (also if st1a/st1b failed, and before any other lane boots)
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st2 --args "sweetdev=restore" --label g5-st-restore \
+  --expect "SWEET DEV: restored /System/Library/xpc/launchd.plist" --expect "$D 1 written, 0 skipped, 0 refused/failed"
+SWEET_USBLOG_PORT=64738 tools/xrun "${C[@]}" --overlay $A/gpu/g5/ov-st2orig --label g5-st-check \
+  --expect "SWEET DEV: skipped /System/Library/xpc/launchd.plist 792460 bytes \(identical\)" --expect "$D 0 written, 1 skipped, 0 refused/failed" --fail-on "SWEET DEV: wrote"
+'
+```
+(Inside the session each `xrun` already holds the lock; the `C` array and `$D` must be defined in that `bash -c` too, e.g. by `source` of a small
+env file. If st1a fails, skip st1b but still run st-restore and st-check.)
 
-Order and stops: g5-ramp1 -> ramp8 -> ramp24 -> st0a -> st0b -> st1 -> st-restore -> st-check, one per boot, stop at the first FAIL. A ramp FAIL with
-`ramdisk overlaps` or no `SWEET DEV` line = the bootloader/loader limit is below that size: G5 st stops (DEFERRED: smaller dylib or a split overlay).
-**g5-st1 is the only run that replaces a boot-critical file.** If it does not reach SBCoverSheet, or launchd starts nothing, run g5-st-restore at once
-(the hook runs before launchd, so the restore works even if the new cache is bad), then g5-st-check; a root that still does not boot is the
-checklist's re-flash case (user only, `--force`). Run g5-st-restore + st-check also after a PASS, unless the orchestrator wants the job kept.
-Outcomes of g5-st1 (besides the C fail-on list):
-* PASS: the three expects; `sweetgl_once: done after N tries` with N small (the service comes up with the GPU probe, ~+118 s [obs G2/G4]).
-* `sweetgl_once: gave up` (40 tries x 5 s): SweetMali never answered (service not registered, `sweetmali=1` missing, or another client): no GPU work ran.
-* no `sweetgl_once` line at all after SBCoverSheet + 4 min: launchd did not start the job (cache not accepted, exec refused: U4 below).
-* `clear=FAIL` / `tri=FAIL` / a crash line: the userland driver (G3) on hardware; record the forwarded `sweetgl:` lines; no rerun before a fix.
-Unknowns for g5-st1 (U4), each with its evidence:
+Order and stops: g5-ramp1 -> ramp8 -> ramp24 -> st0a -> st0b -> st-pre -> [st1a -> st1b -> st-restore -> st-check], one per boot, stop at the first
+FAIL (the bracket always ends with st-restore + st-check). **Ramp:** check the `N ms` of ramp1: more than ~10 s for 1 MiB (F9: the 600 s restart timer
+is armed before the root mount and runs during the hook, so 24 MiB needs > ~45 KiB/s) stops the ramp. A RAM disk the bootloader or loader rejects
+does not reach the USB log (F7: `ramdisk overlaps kernel memory` is printed by the shim to the screen/pstore only): it shows as an fboot error or as
+`NO DATAGRAM`/no `SWEET DEV` line; then G5 st stops (DEFERRED: smaller dylib or a split overlay). **st1a/st1b** are the only runs with a replaced
+boot-critical file on disk. If one does not reach SBCoverSheet, or launchd starts nothing, go straight to st-restore (the hook runs before launchd, so
+the restore works even if the new cache is bad), then st-check; a root that still does not boot is the checklist's re-flash case (user only, `--force`).
+Outcomes:
+* st1a PASS: the four expects + SBCoverSheet: the cache was accepted, the job ran, AMFI let the overlay-written binary exec and `dlopen` the dylib.
+  `gave up after 30 tries` is expected here (30 tries x 2 s delay, each try bounded to 30 s; worst case 30 x (30 + 2) s = 16 min, longer than the
+  600 s run: bounded all the same [src review F5]).
+* st1a: `loaded` missing but `sweetgl_once` lines present = exec ok, `dlopen` refused (library validation, U4); no `sweetgl_once` line at all after
+  SBCoverSheet = launchd did not start the job (cache or exec, U4).
+* st1b PASS: the three expects; `sweetgl_once: done after N tries` with N small (the service comes up with the GPU probe, ~+118 s [obs G2/G4]).
+* st1b `gave up`: SweetMali never answered (not registered, `sweetmali=1` missing, another client): no GPU work ran.
+* st1b `clear=FAIL` / `tri=FAIL` / a crash line: the userland driver (G3) on hardware; record the forwarded `sweetgl:` lines; no rerun before a fix.
+Unknowns (U4), each with its evidence:
 * AMFI and an ad-hoc signed binary written by the overlay: the built-in SWEET AMFI marks every binary on the root filesystem as a platform binary and
   leaves signature/page-hash validation to the kernel (`bsd/kern/sweet_amfi.c:13-20` of the built tree) [src]; the iOS system binaries pass the same
   path [obs: the root boots]. Ours are signed `ldid -S` (CodeDirectory v=20400, sha256) [obs note 52 s.11]. Not yet observed for a file the overlay wrote [guess].
-* launchd accepting the modified cache: base boot-args carry `launchd_unsecure_cache=1` [obs, args above]; earlier roots booted edited caches
-  (`pixelios-userland/tools/patch-launchd-plist.py`, `sweet-root-tweaks.py:373`) [src]; `enforce_xpc_cache_code_signing` is already off on this root
-  (`sweet-root-tweaks.py:411-415`, ExtensionKit) [src]. Exec from `/usr/local/bin`: no rule found that forbids it [guess].
+* launchd accepting the modified cache: base boot-args carry `launchd_unsecure_cache=1` [obs, args above; `Using unsecure cache` in 4 run logs, review];
+  earlier roots booted edited caches (`pixelios-userland/tools/patch-launchd-plist.py`, `sweet-root-tweaks.py:373`) [src]; `enforce_xpc_cache_code_signing`
+  is already off on this root (`sweet-root-tweaks.py:411-415`, ExtensionKit) [src]. Exec from `/usr/local/bin`: no rule found that forbids it [guess].
 * `dlopen` of `/usr/local/lib/libsweetgl.dylib` by a platform binary: the dylib is on the root filesystem, so it is a platform binary too [src, same hook] [guess for library validation].
 * sweetnull matching: `sweetgl_selftest` is 16 characters (MAXCOMLEN) [guess that p_comm holds all 16]; the launcher forwards the child's lines under its own name anyway.
+* Owner (F8): the image's cache is `0:80` mode 0644 [obs review, catalog read]; the overlay writes `0:0` 0644 (one owner per archive). The restore
+  renames the original inode back, so `0:80` returns. Whether launchd's cache loader looks at the group is unknown [guess: no].
+Leftovers after the series (F11; permanent, `restore` removes nothing the overlay created; tell the owner of the root): `/private/var/dev/ramp-{1m,8m,24m}.bin`
+(33 MiB), `/usr/local/bin/sweetgl_once`, `/usr/local/bin/sweetgl_selftest`, `/usr/local/lib/libsweetgl.dylib` (21 MB), directories `/usr/local/bin`,
+`/usr/local/lib` (plus the dev-run leftovers listed above). The launchd cache is the original again after st-restore (checked by st-check).
