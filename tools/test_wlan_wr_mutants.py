@@ -286,6 +286,22 @@ def audit_store_path(hdr, glue):
     return f
 
 
+def audit_board_glue(glue):
+    """Review 0154 F4: the glue half of the board binding, on the full glue text WITH its string literals (audit_store_path strips them): the root lookup by "/", the property
+    "model-number", swl_board_id() of exactly that property, and the hand-over condition of the image (level >= 4 and not an identity of this board -> x.img = NULL)."""
+    f = []
+    b = body(strip_comments(glue), "sweet_wlan_stage3")
+    if 'hw->board = SecureDTLookupEntry(NULL, "/", &root) == kSuccess && SecureDTGetProperty(root, "model-number", (void const **)&mn, &mnsz) == kSuccess ? swl_board_id(mn, mnsz) : 0;' not in b:
+        f.append("the board is not swl_board_id() of the root model-number")
+    cond = "if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {"
+    i, j = b.find(cond), b.find("x.img = NULL;")
+    if i < 0 or j < 0 or not i < j or b.count("x.img = NULL;") != 1:
+        f.append("the image is not withheld from stage 3 when it is not an identity of this board")
+    if b.find("x.board = hw->board;") < 0 or b.find("x.board = hw->board;") > b.find("swl_stage3(&x)"):
+        f.append("x.board is not set before swl_stage3")
+    return f
+
+
 # (name, [(old, new)], equivalent-because or None). Strings are literal; every occurrence is replaced.
 MUTANTS = [
     # --- patch 0159 (run F, docs/research/51 rules R1..R9). The nine patterns re-pinned below changed only because 0159 changed their text (the run filter of the allowlist search, the SWT_DYN flag,
@@ -759,8 +775,7 @@ MUTANTS = [
     ("identity: board not compared (N3)", [("&& board == swl_fwids[i].board", "")], None),
     ("identity: oriole row on the bluejay board (N3)", [("{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE }", "{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_BLUEJAY }")], None),
     ("identity: W14 pin ignores the board (N3)", [("if (!swl_fw_known(x->img_len, x->img_crc, x->board)) {", "if (!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY)) {")], None),
-    ("identity: reset-vector tuple ignores the board (N3)", [("!swl_fw_known(x->img_len, x->img_crc, x->board) || val", "!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY) || val")],
-     "swl_fw_pin(x) with the same (img_len, img_crc, board) runs before any store in swl_stage3 (row 14) and again at the start of swl_w14, so a store reaching the SWT_RV check already passed the board-bound pin"),
+    ("identity: reset-vector tuple ignores the board (N3)", [("!swl_fw_known(x->img_len, x->img_crc, x->board) || val", "!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY) || val")], None),   # review 0154 F3: killed by the direct swl_wr case in rund()
     ("board id: prefix accepted (N3)", [("if (n != b[i].len) {", "if (n > b[i].len) {")], None),
     ("board id: length ignored (N3)", [("if (n != b[i].len) {\n\t\t\tcontinue;\n\t\t}\n", "")], None),
     ("board id: NULL followed (N3)", [("\tif (s == NULL) {\n\t\treturn 0;\n\t}\n", "")], None),
@@ -1343,6 +1358,21 @@ class WlanWrMutants(unittest.TestCase):
 
     def test_store_path_audit_is_clean_on_the_patch(self):
         self.assertEqual(audit_store_path(final_header(), glue_added_lines()), [])
+
+    def test_board_glue_is_pinned(self):
+        g = glue_after()
+        self.assertEqual(audit_board_glue(g), [])
+        for old, new, why in (
+            ('SecureDTLookupEntry(NULL, "/", &root)', 'SecureDTLookupEntry(NULL, "/sweet-wlan", &root)', "root model-number"),
+            ('"model-number"', '"model"', "root model-number"),
+            ("? swl_board_id(mn, mnsz) : 0;", "? SWW_BOARD_ORIOLE : 0;", "root model-number"),
+            ("if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {", "if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, SWW_BOARD_ORIOLE)) {", "withheld"),
+            ("if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {", "if (level >= 6 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {", "withheld"),
+            ("\tx.board = hw->board;\n", "\n", "x.board"),
+        ):
+            self.assertIn(old, g)
+            got = audit_board_glue(g.replace(old, new, 1))
+            self.assertTrue(any(why in m for m in got), "%s -> %s not caught: %s" % (old, new, got))
 
     def test_store_path_audit_fails_on_a_hostile_corpus(self):
         hdr = final_header()
