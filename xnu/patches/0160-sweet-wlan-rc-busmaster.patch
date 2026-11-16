@@ -1,0 +1,218 @@
+SWEET WLAN root port bus master (patch 0160, plan 2026-11-14 oneshot-2 step W7, second iteration; docs/research/51 U8). Run o5-w7-l8 (patch 0159) set up the
+rings and switched the endpoint's Bus Master on, but the firmware never fetched a request from host memory ("h2d w 2 fw r 0", completion ring untouched). The
+root port forwards the endpoint's memory requests upstream only while its own Command register has Bus Master Enable; Linux sets it on every bridge above an
+enabled device (drivers/pci/pci.c:2071-2090, v6.18), and the shim's link bring-up never writes that register. Level 8 now reads and prints the root port's
+Command/Status word (RC-local DBI 0x04, no TLP), adds the memory and master bits before the endpoint's Bus Master store, and puts the word back after the
+endpoint's Bus Master is off; a stop restores the endpoint first, then the root port. New space SWW_DBI: one readable and writable word, only at level 8.
+The value is derived in swl_wr() from the word read (on: old | 0x6; off: the recorded old word), the Status half is written as 0. Glue: the DBI page is mapped
+only at level 8; sw3_wr() lets only that word through, only after the release, only if no bit other than memory/master differs from the live word, and the
+master bit only with a host pool. Levels 1..7 are unchanged.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -50,11 +50,13 @@
+ #define SW_ATU      0x14B00000ull   /* soc.json wlan.atu: DBI + 0x300000 */
+ #define SW_ELBI     0x14520000ull   /* soc.json wlan.elbi: PCIe1 ELBI, +0x2C8 RDLH_LINKUP (rc.h:50-51), &0x3F == 0x11 is L0 */
+ #define SW_CPUHALT  0x20u           /* SICF_CPUHALT, DHD include/siutils.h:306 (865527e): the CA7 wrapper IOCTL bit that holds the core (patch 0154 release gate) */
++#define SW_DBI      0x14800000ull   /* soc.json wlan.dbi: the root port's DBI (its own configuration space), readable after the shim's probe rows (shim/wlanlink.c WLB_DBI) */
+ #define SW_F_STORES 96u             /* patch 0159: the most chip-RAM stores sw3_wr() lets through after the CA7 release at level 8 (run F makes 39) */
+ #define SW_ISO      0x17463EC4ull   /* soc.json wlan.pmu_pcie1_iso: PCIe1 PHY isolation, bit 0 = de-isolated (always-on PMU block) */
+ 
+ struct sw_hw {
+ 	volatile uint32_t *cfg, *mem, *atu, *elbi, *iso, *tcm;
++	volatile uint32_t *dbi;  /* patch 0160: the root port's DBI page, mapped only at level 8; only word 0x04 is ever used */
+ 	uint32_t win;
+ 	int level;
+ 	int l3;         /* patch 0132: the stage 3 level (sweetwlan), 0 until sweet_wlan_stage3() */
+@@ -232,6 +234,8 @@
+ 		return off < 0x1000 ? &h->mem[off / 4] : NULL;
+ 	case SWW_BAR2:
+ 		return h->tcm != NULL && off < SWW_TCM_BYTES ? &h->tcm[off / 4] : NULL;
++	case SWW_DBI:
++		return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;      /* patch 0160: the Command/Status word only */
+ 	}
+ 	return NULL;
+ }
+@@ -259,7 +263,12 @@
+ 	uint32_t io;
+ 
+ 	f = h->l3 >= 8 && h->released;  /* patch 0159: the run F stores exist only at level 8 and only after the CA7 release */
+-	if (space != SWW_CFG && space != SWW_ATU && space != SWW_BAR0 && space != SWW_BAR2) {
++	if (space != SWW_CFG && space != SWW_ATU && space != SWW_BAR0 && space != SWW_BAR2 && space != SWW_DBI) {
++		return -1;
++	}
++	/* patch 0160: the root port's Command: only at level 8 after the release, the Status half written as 0, only the memory and master bits may differ from the live word, and the master bit
++	 * only with a host pool */
++	if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL && (v >> 16) == 0 && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0 && (!(v & 0x4u) || h->pool != NULL))) {
+ 		return -1;
+ 	}
+ 	/* only the offsets swl_wt[] and swl_rs[] name: cfg 0x80, cfg 0x84 only as 0 or SWW_WIN_TAIL; ATU region 2 base, limit, target, CR2; BAR0 IOCTL, RESET_CTL, bankidx; BAR2 (patch 0130): window 0 from the RAM base up (sw3_ptr stops at 4 MiB), window SWW_WIN_TAIL up to the last word of a 6 MiB RAM; patch 0132: window 0 offset 0 once (rv_done) at level 6 and only the pinned container's first dword (rv_ok, review 0132 F5) */
+@@ -533,6 +542,7 @@
+ 	hw.elbi = elbi;
+ 	hw.iso = &isop[(SW_ISO & 0xFFFull) / 4];
+ 	hw.tcm = NULL;
++	hw.dbi = level >= 8 ? sw_map(SW_DBI, 0x1000) : NULL;
+ 	printf("SWEET WLAN: EP Command/Status %#x BAR0 %#x %#x window %#x\n", hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4], hw.win);
+ 	bad = swl_pre_ep(hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4]);
+ 	if (bad) {
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -144,7 +144,7 @@
+ 	return 0;
+ }
+ 
+-enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
++enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO, SWW_DBI };       /* SWW_DBI (patch 0160): the root port's own configuration space (RC-local DBI, no TLP) */
+ 
+ /* phase flags (what the steps proved), required by swl_wt[].need */
+ #define SWF_W0      0x001u
+@@ -178,6 +178,7 @@
+ #define SWW_RG_SM   2u
+ #define SWW_RG_CA   4u
+ #define SWW_RG_W84  8u          /* cfg 0x84 back to 0 */
++#define SWW_RG_RCBM 32u         /* patch 0160: the root port's Command back to the value read before run F changed it (restored after SWW_RG_BM) */
+ #define SWW_RG_BM   16u         /* patch 0159: EP Command back to memory-only (bus master off), the FIRST restore */
+ 
+ #define SWT_ONCE    1u          /* consumed on success */
+@@ -189,6 +190,7 @@
+ #define SWT_RV      128u        /* run D reset vector: val is image word 0 of the pinned firmware (decided in swl_wr), only at BAR2 window 0 offset 0 */
+ #define SWT_TW      64u         /* run C tail word: val is the next word of the tail kind that the address names (swl_tw_kind), off ascending from that kind's base */
+ #define SWT_DYN     0x100u      /* run F (patch 0159): a chip-RAM word whose address and value swl_f_kind() derives from the shared area, ring_info and the host pool (not from the caller) */
++#define SWT_RC      0x400u      /* patch 0160: the root port's Command register: the value is derived in swl_wr() from the word read (on: old | memory | master; off: the old word) */
+ #define SWT_WO      0x200u      /* run F: a write-only doorbell register: no old-value read, no read-back */
+ 
+ #define SWK_VARS    1               /* tail kinds: the NVRAM text (varsize bytes), the length token (the last RAM word), the rTLV (value, length word, type word) */
+@@ -235,10 +237,11 @@
+ 	SWT_W84_TAIL_E, SWT_W84_ZERO_E,                                 /* W16/W17 reads beyond window 0 */
+ 	SWT_F_LO, SWT_F_HI,                                             /* run F (patch 0159): chip-RAM words of the msgbuf setup, window 0 / tail window */
+ 	SWT_BM_ON, SWT_BM_OFF,                                          /* W22 and the end of run F: EP Command bus master */
++	SWT_RC_BM_ON, SWT_RC_BM_OFF,                                    /* patch 0160: root port Command, before the endpoint's bus master and after it */
+ 	SWT_DB_RDY, SWT_DB_H2D,                                         /* W23 host ready, W24/W25 H2D doorbell */
+ 	SWT_N
+ };
+-_Static_assert(SWT_N <= 64, "x->done is a 64-bit tuple mask (patch 0159: 40 tuples)");
++_Static_assert(SWT_N <= 64, "x->done is a 64-bit tuple mask (patch 0160: 42 tuples)");
+ #define SWT_BIT(t)  ((uint64_t)1 << (t))      /* patch 0150: the bit of tuple t in x->done */
+ 
+ /*
+@@ -333,7 +336,14 @@
+ 	 * write-only, only with bus master on. */
+ 	[SWT_F_LO]       = { .row = 19, .run = 6, .space = SWW_BAR2, .flags = SWT_DYN, .win = 0, .off = SWW_RAM_BASE, .hi = SWW_TCM_BYTES - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W18 },
+ 	[SWT_F_HI]       = { .row = 19, .run = 6, .space = SWW_BAR2, .flags = SWT_DYN | SWT_TAIL, .win = SWW_WIN_TAIL, .off = 0, .hi = SWW_LAST_HI_MAX, .vmask = 0xFFFFFFFFu, .need = SWF_W18 },
+-	[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = SWT_ONCE, .off = SWW_CFG_CMD, .val = SWW_CMD_MEM_BM, .vmask = 0xFFFFu,
++	/* Patch 0160: the root port forwards a memory request from the endpoint upstream only while its own Command has Bus Master Enable (PCI Express Base: Command register of a Type 1 function;
++	 * Linux v6.18 drivers/pci/pci.c:2071-2090 pci_enable_bridge(): enabling a device first enables every bridge above it and calls pci_set_master() on it; the DesignWare host setup also sets
++	 * MEMORY and MASTER on the root port (dw_pcie_setup_rc, not in the pinned checkout: [guess] for the exact line). The shim's link bring-up never writes that register (shim/wlanlink.c writes DBI + 0x890 only), and run o5-w7-l8 showed the firmware never fetching a
++	 * request (h2d fw r 0). Run F therefore sets the memory and master bits on the root port before the endpoint's, and puts the word back afterwards. The value is not the caller's: swl_wr()
++	 * requires old | 0x6 (on) or the recorded old word (off); the Status half is written as 0 (write-1-to-clear). */
++	[SWT_RC_BM_ON]   = { .row = 22, .run = 6, .space = SWW_DBI, .rgrp = SWW_RG_RCBM, .flags = SWT_ONCE | SWT_RC, .off = SWW_CFG_CMD, .vmask = 0xFFFFu, .need = SWF_W21 },
++	[SWT_RC_BM_OFF]  = { .row = 25, .run = 6, .space = SWW_DBI, .flags = SWT_ONCE | SWT_RC, .pred1 = SWT_RC_BM_ON + 1, .off = SWW_CFG_CMD, .vmask = 0xFFFFu, .need = SWF_W21 },
++	[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = SWT_ONCE, .pred1 = SWT_RC_BM_ON + 1, .off = SWW_CFG_CMD, .val = SWW_CMD_MEM_BM, .vmask = 0xFFFFu,
+ 	                     .omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = SWF_W21 },
+ 	[SWT_BM_OFF]     = { .row = 25, .run = 6, .space = SWW_CFG, .flags = SWT_ONCE, .pred1 = SWT_BM_ON + 1, .off = SWW_CFG_CMD, .val = SWW_CMD_MEM, .vmask = 0xFFFFu,
+ 	                     .omask = 0xFFFFu, .oval = SWW_CMD_MEM_BM, .need = SWF_BM },
+@@ -363,12 +373,14 @@
+ 	{ 1, SWW_BAR2, 0, SWW_RAM_BASE, SWW_RAM_BASE },
+ 	{ 1, SWW_BAR2, 0, 0, 0 },
+ 	{ 2, SWW_BAR2, 0, SWW_RAM_BASE, SWW_TCM_BYTES - 4u },                   /* W9/W10: the old and read-back words of the image and of the last word (window 0) */
++	{ SWW_RUN_F, SWW_DBI, 0, SWW_CFG_CMD, SWW_CFG_CMD },                    /* patch 0160: the root port's Command/Status word (RC-local) */
+ 	{ 2, SWW_BAR2, SWW_WIN_TAIL, 0, SWW_LAST_HI_MAX },                      /* W9: the last word beyond window 0 */
+ };
+ 
+ /* Restore: what XNU itself writes at a STOP (docs/research/43 s.2 "Restore at STOP"), only for the groups armed by the failing step. */
+ static const struct swl_rs swl_rs[] = {
+ 	{ SWW_RG_BM, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },   /* patch 0159: bus master off before anything else (docs/research/51 rule R2) */
++	{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },          /* patch 0160: then the root port's Command back to x->rc_cmd_old (the value field is not used for this group) */
+ 	{ SWW_RG_ATU2, SWW_ATU, 0, SWW_R2(0x04), 0u, SWW_ATU_ENABLE },
+ 	{ SWW_RG_SM, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_RESET_CTL, 1u, 1u },
+ 	{ SWW_RG_CA, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u, 1u },
+@@ -486,6 +498,8 @@
+ 	uint32_t f_ri[SWM_RI_WORDS];                    /* ring_info as read (if_bwfm_pci.h:168-185) */
+ 	uint32_t f_ringmem, f_hw, f_hr, f_dw, f_dr;     /* backplane addresses: ring memory table, H2D write / read index arrays, D2H write / read index arrays */
+ 	uint32_t f_w0, f_r0;                            /* H2D control submit: the next write index (host owned); D2H control complete: the next read index (host owned) */
++	uint32_t rc_cmd_old;                            /* patch 0160: the root port's Command (low half) as read before SWT_RC_BM_ON changed it */
++	int rc_have;                                    /* ... and whether that read happened (the restore and SWT_RC_BM_OFF need it) */
+ 	uint32_t f_trans, f_nstore, f_ndb, f_other;     /* ioctl transaction counter; chip-RAM stores, doorbells and unexpected completion items of run F */
+ };
+ 
+@@ -815,7 +829,7 @@
+ 			if (val < SWW_BANK_ROM) {
+ 				return (int)i;
+ 			}
+-		} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN)) {
++		} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)) {
+ 			return (int)i;
+ 		} else if (p->val == val) {
+ 			return (int)i;
+@@ -938,7 +952,7 @@
+ swl_restore(struct swl_wx *x)
+ {
+ 	unsigned i;
+-	uint32_t live, rb;
++	uint32_t live, rb, rv;
+ 	int bad = 0, did = 0, skipped = 0, pre = -1, lpre = -1, ok;
+ 
+ 	for (i = 0; i < sizeof swl_rs / sizeof swl_rs[0]; i++) {
+@@ -976,9 +990,16 @@
+ 				continue;
+ 			}
+ 		}
++		rv = r->val;
++		if (r->grp == SWW_RG_RCBM) {    /* patch 0160: the word read before the change; nothing to put back if it was never read */
++			if (!x->rc_have) {
++				continue;
++			}
++			rv = x->rc_cmd_old;
++		}
+ 		did = 1;
+-		ok = !swl_store(x, r->space, r->win, r->off, r->val) && !swl_rdx(x, r->space, r->win, r->off, &rb) && !((rb ^ r->val) & r->vmask);
+-		printf("SWEET WLAN: restore space %d win %#x off %#x := %#x %s\n", r->space, r->win, r->off, r->val, ok ? "ok" : "FAILED");
++		ok = !swl_store(x, r->space, r->win, r->off, rv) && !swl_rdx(x, r->space, r->win, r->off, &rb) && !((rb ^ rv) & r->vmask);
++		printf("SWEET WLAN: restore space %d win %#x off %#x := %#x %s\n", r->space, r->win, r->off, rv, ok ? "ok" : "FAILED");
+ 		bad |= !ok;
+ 		if (ok) {
+ 			x->rs_ok |= r->grp;
+@@ -1121,6 +1142,17 @@
+ 			}
+ 		}
+ 	}
++	if (p->flags & SWT_RC) {        /* patch 0160: only the memory and master bits may be added to the word just read; back only to that word; never while the endpoint is a master */
++		if (t == SWT_RC_BM_ON) {
++			if (val != ((old & 0xFFFFu) | SWW_CMD_MEM_BM)) {
++				return swl_stop(x, SWW_E_OLD);
++			}
++			x->rc_cmd_old = old & 0xFFFFu;
++			x->rc_have = 1;
++		} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {
++			return swl_stop(x, SWW_E_ORDER);
++		}
++	}
+ 	if (fk == SWM_K_IDX && (old >> 16) != 0u) {     /* run F rule R4: an index slot is stored as a 32-bit word only while its upper half reads 0 */
+ 		return swl_stop(x, SWW_E_OLD);
+ 	}
+@@ -2350,10 +2382,13 @@
+ {
+ 	uint8_t mac[6], ver[SWM_VER_MAX + 1u];
+ 	char vt[SWM_VER_MAX + 1u];
+-	uint32_t n = 0, i, k = 0, bad;
++	uint32_t n = 0, i, k = 0, bad, rc = 0;
+ 
+ 	x->row = 22;
+ 	SWW_TRY(swl_w84_zero(x));
++	SWW_RD(x, SWW_DBI, 0, SWW_CFG_CMD, rc);
++	printf("SWEET WLAN: W22 root port Command/Status %#x (memory %s, bus master %s)\n", rc, (rc & 0x2u) ? "on" : "off", (rc & 0x4u) ? "on" : "off");
++	SWW_TRY(swl_wr(x, SWW_DBI, 0, SWW_CFG_CMD, (rc & 0xFFFFu) | SWW_CMD_MEM_BM));
+ 	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM_BM));
+ 	printf("SWEET WLAN: W22 bus master ON (EP Command %#x)\n", SWW_CMD_MEM_BM);
+ 	x->row = 23;
+@@ -2385,6 +2420,8 @@
+ 	}
+ 	SWW_TRY(swl_w84_zero(x));
+ 	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM));
++	SWW_TRY(swl_wr(x, SWW_DBI, 0, SWW_CFG_CMD, x->rc_cmd_old));
++	printf("SWEET WLAN: W25 root port Command back at %#x\n", x->rc_cmd_old);
+ 	printf("SWEET WLAN: W25 bus master off, guards intact; run F stored %u chip-RAM words, rang %u doorbells, ignored %u items\n", x->f_nstore, x->f_ndb, x->f_other);
+ 	printf("SWEET WLAN: fw version %s mac xx:xx:xx:xx:%02x:%02x\n", vt, mac[4], mac[5]);
+ 	return swl_done(x, 0);

@@ -29,6 +29,7 @@ PATCH0147 = os.path.join(ROOT, "xnu", "patches", "0147-sweet-wlan-fw-ident.patch
 PATCH0150 = os.path.join(ROOT, "xnu", "patches", "0150-sweet-wlan-fw-ready.patch")
 PATCH0154 = os.path.join(ROOT, "xnu", "patches", "0154-sweet-wlan-ca7-latch.patch")
 PATCH0159 = os.path.join(ROOT, "xnu", "patches", "0159-sweet-wlan-msgbuf.patch")
+PATCH0160 = os.path.join(ROOT, "xnu", "patches", "0160-sweet-wlan-rc-busmaster.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
 TEST_NV = os.path.join(ROOT, "shim", "wlan_nv_host_test.c")
 HDR_PATH = "bsd/dev/sweet_wlan_wr.h"
@@ -67,7 +68,7 @@ def apply_chain(path, patches):
 
 
 def final_header():
-    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154, PATCH0159))
+    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154, PATCH0159, PATCH0160))
 
 
 def glue_before():
@@ -75,7 +76,7 @@ def glue_before():
 
 
 def glue_after():
-    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154, PATCH0159))
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154, PATCH0159, PATCH0160))
 
 
 def new_file(patch, path):
@@ -165,6 +166,7 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_init", "hw.tcm = NULL;"),
     # patch 0159 (run F): the level 8 gates of sw3_wr keep three flags; the host pool is allocated once, checked for contiguity and handed to the writer; no store through a pointer is added
     ("sw3_wr", "f = h->l3 >= 8 && h->released;"),
+    ("sweet_wlan_init", "hw.dbi = level >= 8 ? sw_map(SW_DBI, 0x1000) : NULL;"),  # patch 0160: the root port's DBI page, only at level 8
     ("sw3_wr", "h->bm = (v & 0x4u) != 0;"),  # the master bit of the last EP Command store: the doorbells need it
     ("sw3_wr", "h->f_stores++;"),  # the bounded number of chip-RAM stores after the release
     ("sw3_wr", "io = h->mem[SWL_AGENT_IOCTL / 4];"),  # review 0154 F1: a READ of the live CA7 IOCTL before a RESET_CTL store that takes the core out of reset
@@ -279,6 +281,10 @@ def audit_store_path(hdr, glue):
         f.append("sw3_wr does not limit EP Command to level 8 after the release and to memory / memory + master")
     if "!(f && h->bm && win == SWW_WIN_PCIE && (off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) && v == 1u)" not in w or "h->bm = (v & 0x4u) != 0;" not in w:
         f.append("sw3_wr does not limit the doorbells to bus master on, the PCIe core window and value 1")
+    # patch 0160: the root port's Command: level 8 after the release, Status half 0, only memory/master may differ from the live word, master only with a pool; one word of the page
+    if "if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL && (v >> 16) == 0 && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0 && (!(v & 0x4u) || h->pool != NULL))) {" not in w \
+            or "return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;" not in body(glue, "sw3_ptr") or w.find("space == SWW_DBI && !(f") > store:
+        f.append("sw3_wr does not limit the root port to its Command word at level 8 with only memory/master changing")
     if not re.search(r"^#define SW_F_STORES\s+96u\b", glue, re.M) or w.find("h->f_stores++;") < 0 or w.find("h->f_stores++;") > store:
         f.append("sw3_wr does not bound the chip-RAM stores after the release")
     if not re.search(r"^#define SW_CPUHALT\s+0x20u\b", glue, re.M):
@@ -304,6 +310,21 @@ def audit_board_glue(glue):
 
 # (name, [(old, new)], equivalent-because or None). Strings are literal; every occurrence is replaced.
 MUTANTS = [
+    # --- patch 0160: the root port's Command before the endpoint's bus master
+    ("0160: root port may get any value", [("\t\t\tif (val != ((old & 0xFFFFu) | SWW_CMD_MEM_BM)) {\n\t\t\t\treturn swl_stop(x, SWW_E_OLD);\n\t\t\t}\n", "")], None),
+    ("0160: root port off to any word", [("} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {", "} else if (!x->rc_have || (x->flags & SWF_BM)) {")], None),
+    ("0160: root port off while the endpoint is a master", [("} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {", "} else if (!x->rc_have || val != x->rc_cmd_old) {")], None),
+    ("0160: root port off without a recorded word", [("} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {", "} else if (val != x->rc_cmd_old || (x->flags & SWF_BM)) {")], None),
+    ("0160: endpoint may be a master before the root port", [(".rgrp = SWW_RG_BM, .flags = SWT_ONCE, .pred1 = SWT_RC_BM_ON + 1, .off = SWW_CFG_CMD,", ".rgrp = SWW_RG_BM, .flags = SWT_ONCE, .off = SWW_CFG_CMD,")], None),
+    ("0160: root port restore not armed", [("[SWT_RC_BM_ON]   = { .row = 22, .run = 6, .space = SWW_DBI, .rgrp = SWW_RG_RCBM,", "[SWT_RC_BM_ON]   = { .row = 22, .run = 6, .space = SWW_DBI,")], None),
+    ("0160: root port restore entry removed", [("\t{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },", "\t{ 0, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },")], None),
+    ("0160: root port restore writes 0, not the old word", [("\t\t\trv = x->rc_cmd_old;\n", "")], None),
+    ("0160: root port restored before the endpoint", [("\t{ SWW_RG_BM, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },   /* patch 0159: bus master off before anything else (docs/research/51 rule R2) */\n\t{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },          /* patch 0160: then the root port's Command back to x->rc_cmd_old (the value field is not used for this group) */\n",
+                                                        "\t{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },\n\t{ SWW_RG_BM, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },\n")], None),
+    ("0160: root port left a master at the end", [("\tSWW_TRY(swl_wr(x, SWW_DBI, 0, SWW_CFG_CMD, x->rc_cmd_old));\n", "")], None),
+    ("0160: root port not made a master", [("\tSWW_TRY(swl_wr(x, SWW_DBI, 0, SWW_CFG_CMD, (rc & 0xFFFFu) | SWW_CMD_MEM_BM));\n", "")], None),
+    ("0160: root port word readable below level 8", [("\t{ SWW_RUN_F, SWW_DBI, 0, SWW_CFG_CMD, SWW_CFG_CMD },", "\t{ 1, SWW_DBI, 0, SWW_CFG_CMD, SWW_CFG_CMD },")], "EQUIVALENT for stores: a read of that word below level 8 has no caller (swl_w22 runs at level 8 only) and the glue has no DBI page mapped then (sw3_ptr returns NULL)"),
+    ("0160: root port tuples visible below level 8 (dynamic-value family dropped)", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)) {", "} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN)) {")], None),
     # --- review 0159-1 (F1..F4, F8)
     ("W18: host index-buffer words not required to be 0 (review F1)", [("\t\tif (x->f_ri[i] != 0u) {\n\t\t\treturn swl_stop(x, SWW_E_MSG);\n\t\t}\n", "")], None),
     ("W18: only the first host index-buffer word checked (review F1)", [("for (i = SWM_RI_HOSTIDX0; i <= SWM_RI_HOSTIDX1; i++) {", "for (i = SWM_RI_HOSTIDX0; i <= SWM_RI_HOSTIDX0; i++) {")], None),
@@ -615,7 +636,7 @@ MUTANTS = [
     ("run C pick: takeover at a level that does not allow it", [("if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {", "if (n <= t) {")], None),
     ("run C pick: no match reports DENIED", [("\t\t\treturn first;\n\t\t}\n\t\tt = n;", "\t\t\treturn -1;\n\t\t}\n\t\tt = n;")], None),
     ("run C pick: not used", [("t = swl_wr_pick(x, space, win, off, val);", "t = swl_wr_ok(space, win, off, val);")], None),
-    ("run C ok: tail tuples need the tuple's value", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN)) {", "} else if (p->flags & (SWT_BULK | SWT_RV | SWT_DYN)) {")], None),
+    ("run C ok: tail tuples need the tuple's value", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)) {", "} else if (p->flags & (SWT_BULK | SWT_RV | SWT_DYN | SWT_RC)) {")], None),
     ("run C wr: geometry not checked", [("\t\tgr = swl_geo_get(x, &g);\n\t\tif (gr) {\n\t\t\treturn swl_stop(x, gr);\n\t\t}\n", "\t\tgr = swl_geo_get(x, &g);\n")], None),
     ("run C wr: kind index not bounded", [("ti >= swl_tw_n(&g, p->kind) || ", "")], None),
     ("run C wr: address not the next word of the kind", [("win + off != swl_tw_base(&g, p->kind) + 4u * ti || ", "")], None),
@@ -705,7 +726,7 @@ MUTANTS = [
     ("run D tuple: not once", [(".flags = SWT_ONCE | SWT_RV,", ".flags = SWT_RV,")], None),
     ("run D tuple: the whole of window 0", [(".win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }", ".win = 0, .off = 0, .hi = SWW_TCM_BYTES - 4u, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }")], None),
     ("run D tuple: value from the table", [("SWT_ONCE | SWT_RV, .win = 0", "SWT_ONCE, .win = 0")], None),
-    ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV | SWT_DYN)", "(SWT_BULK | SWT_TW | SWT_DYN)")], None),
+    ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)", "(SWT_BULK | SWT_TW | SWT_DYN | SWT_RC)")], None),
     ("run D swl_wr: guard removed", [("if ((p->flags & SWT_RV) && (x->img == NULL", "if (0 && (x->img == NULL")], None),
     ("run D swl_wr: no image", [("(p->flags & SWT_RV) && (x->img == NULL || !swl_fw_known", "(p->flags & SWT_RV) && (!swl_fw_known")], None),
     ("run D swl_wr: identity not checked", [("|| !swl_fw_known(x->img_len, x->img_crc, x->board) || val != swl_img_word(x, 0)", "|| val != swl_img_word(x, 0)")], None),
@@ -911,6 +932,7 @@ struct sw_hw {
 	uint64_t pool_pa;
 	int bm;
 	unsigned f_stores;
+	volatile uint32_t *dbi;
 };
 #define SW_CPUHALT 0x20u        /* the glue's define (audit_store_path pins it there) */
 #define SW_F_STORES 96u         /* the glue's define (patch 0159; audit_store_path pins it there) */
@@ -938,8 +960,9 @@ int main(void)
 	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
 	static const uint32_t vals[] = { 0xDEADBEEFu, 0u, 0x400000u };
 	static const uint32_t bwins[] = { 0u, 0x400000u, 0x200000u, 0x800000u, 0x18001000u };
-	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 	static uint8_t fakepool[16];
+	static uint32_t dbiw[0x1000 / 4];
 	int bad = 0, acc = 0;
 
 	(void)sw3_rd;
@@ -1135,6 +1158,39 @@ int main(void)
 		for (int a = 0; a < 6; a++)
 			for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
 	}
+	/* patch 0160: the root port's Command (space SWW_DBI, word 0x04): only at level 8 after the release, the Status half 0, no bit but memory (0x2) and master (0x4) different from the live
+	 * word, the master bit only with a host pool; no other word of the page; nothing without the page mapped */
+	{
+		static const uint32_t lv[] = { 0x00100000u, 0x00100101u, 0x00100006u, 0x00100002u };
+		static const uint32_t xv[] = { 0x0u, 0x2u, 0x4u, 0x6u, 0x1u, 0x100u, 0x106u, 0x10006u, 0x8u };
+
+		for (int l3 = 0; l3 < 10; l3++) {
+			for (int rel = 0; rel < 2; rel++) {
+				for (int pl = 0; pl < 2; pl++) {
+					for (int mp = 0; mp < 2; mp++) {
+						for (unsigned li = 0; li < 4; li++) {
+							for (unsigned vi = 0; vi < 9; vi++) {
+								for (uint32_t off = 0; off <= 8; off += 4) {
+									uint32_t live = lv[li], v = (live & 0xFFFFu) ^ xv[vi];
+
+									if (vi == 7) v = (live & 0xFFFFu) | 0x10006u;
+									hw.l3 = l3; hw.released = rel; hw.pool = pl ? fakepool : NULL; hw.dbi = mp ? dbiw : NULL; hw.bm = 0;
+									dbiw[0] = 0x11111111u; dbiw[1] = live; dbiw[2] = 0x22222222u;
+									int r = sw3_wr(&hw, SWW_DBI, 0, off, v);
+									int want = l3 >= 8 && rel && mp && off == 4 && (v >> 16) == 0 && ((v ^ live) & 0xFFFFu & ~0x6u) == 0 && (!(v & 4u) || pl);
+									if ((r == 0) != want || dbiw[0] != 0x11111111u || dbiw[2] != 0x22222222u || dbiw[1] != (r == 0 ? v : live) || hw.bm) {
+										if (bad++ < 20) printf("BAD root port l3 %d released %d pool %d mapped %d live %#x off %#x val %#x: ret %d word %#x, want accept %d\n", l3, rel, pl, mp, live, off, v, r, dbiw[1], want);
+									}
+									acc += r == 0;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		hw.released = 0; hw.l3 = 0; hw.pool = NULL; hw.dbi = NULL;
+	}
 	/* patch 0159 (run F): three gates that exist only at stage 3 level 8 after the release.
 	 * EP Command (cfg 0x04): only 0x2 (memory) or 0x6 (memory + master), the latter only with a host pool; the store records the master bit in bm.
 	 * The PCIe core doorbells 0x140 / 0x144: only value 1, only on the live PCIe core window, only while bm is set.
@@ -1275,7 +1331,7 @@ GLUE_MUTANTS = [
     ("cfg 0x84 only 0", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == 0)")]),
     ("cfg 0x84 only the tail window", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == SWW_WIN_TAIL)")]),
     ("cfg 0x88 writable too", [("(off == SWW_CFG_WIN2 &&", "(off >= SWW_CFG_WIN2 &&")]),
-    ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2) {", "space != SWW_BAR0) {")]),
+    ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2 && space != SWW_DBI) {", "space != SWW_BAR0 && space != SWW_DBI) {")]),      # patch 0160 re-pinned the text: one more space
     ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == 0 && off == 0 && h->l3 >= 6 && h->rv_ok && !h->rv_done && v == h->rv) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
     # patch 0132: the one word at backplane address 0
     ("reset vector: no level gate", [("off == 0 && h->l3 >= 6 && h->rv_ok", "off == 0 && h->rv_ok")]),
@@ -1322,6 +1378,14 @@ GLUE_MUTANTS = [
     ("only SYS_MEM refused after the release", [("h->released && (win == SWW_WIN_SYSMEM || win == SWW_WIN_SMWRAP)", "h->released && (win == SWW_WIN_SYSMEM)")]),
     ("every BAR0 store refused after the release", [("h->released && (win == SWW_WIN_SYSMEM || win == SWW_WIN_SMWRAP)", "h->released")]),
     ("SYS_MEM refused before the release too", [("if (space == SWW_BAR0 && h->released && (win == SWW_WIN_SYSMEM", "if (space == SWW_BAR0 && (win == SWW_WIN_SYSMEM")]),
+    # patch 0160: the root port's Command
+    ("root port without the run F gate", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD", "if (space == SWW_DBI && !(off == SWW_CFG_CMD")]),
+    ("root port: any word of the page", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL", "if (space == SWW_DBI && !(f && h->dbi != NULL"), ("return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;", "return h->dbi != NULL && off < 0x1000 ? &h->dbi[off / 4] : NULL;")]),
+    ("root port: Status half written", [(" && (v >> 16) == 0 && ((v ^ h->dbi", " && ((v ^ h->dbi")]),
+    ("root port: any Command bit may change", [(" && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0", "")]),
+    ("root port: the IO bit may change too", [("& 0xFFFFu & ~SWW_CMD_MEM_BM) == 0", "& 0xFFFFu & ~(SWW_CMD_MEM_BM | 0x1u)) == 0")]),
+    ("root port: master without a pool", [(" && (!(v & 0x4u) || h->pool != NULL))) {", "))) {")]),
+    ("root port: space refused", [("space != SWW_BAR0 && space != SWW_BAR2 && space != SWW_DBI) {", "space != SWW_BAR0 && space != SWW_BAR2) {")]),
     # patch 0159 (run F): the level 8 gates
     ("run F gates open at level 7", [("f = h->l3 >= 8 && h->released;", "f = h->l3 >= 7 && h->released;")]),
     ("run F gates open before the release", [("f = h->l3 >= 8 && h->released;", "f = h->l3 >= 8;")]),

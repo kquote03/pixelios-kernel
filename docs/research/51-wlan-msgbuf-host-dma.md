@@ -208,3 +208,19 @@ A power cycle resets the chip.
 - **Residual risk, stated plainly (review item 12).** If device→host requests were translated to another address, a chip write could land
   in kernel memory outside the pool. Run F executes in `sweet_ufs_init()`; a panic or silent damage to `userdata` is possible in that case.
   Accepted for this development phone: re-flash `userdata` after any odd run.
+
+## 11. First level-8 run and patch 0160 (2026-11-16)
+
+- **[obs]** Run `o5-w7-l8` (PORT.md): every setup step passed, the endpoint's Bus Master was switched on, and then nothing: `h2d w 2 fw r 0`,
+  the D2H write index stayed 0 and the completion ring in the pool stayed untouched. Clean stop, bus master off, guards intact, no panic.
+  The firmware did not even fetch the two requests, so the failure is in the chip reaching host memory at all (or in the doorbell), not in
+  the answer path.
+- **[src]** The shim's link bring-up writes only `DBI + 0x890` of the root port (`shim/wlanlink.c`); the root port's Command register is
+  never written. Linux enables every bridge above a device and calls `pci_set_master()` on it (`drivers/pci/pci.c:2071-2090`, v6.18).
+- **[guess]** (U8) The root port's Bus Master Enable is clear, so it refuses the endpoint's memory requests. Not observed yet: the word has
+  never been read on the phone.
+- **Patch 0160:** level 8 reads and prints the root port's Command/Status (RC-local DBI 0x04), adds the memory and master bits before the
+  endpoint's Bus Master store, and puts the word back after the endpoint's Bus Master is off; a stop restores the endpoint first, then the
+  root port. One word of one new space (`SWW_DBI`), level 8 only.
+- **If the second run prints `bus master on` for the root port before the change**, U8 is wrong and the next candidates are the doorbell
+  (U5) and the S2MPU (U2); that would be the third and last iteration the plan allows.
