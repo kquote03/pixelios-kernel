@@ -1,5 +1,5 @@
 /* Host test for xnu patch 0158 (bsd/dev/sweet_amp.h, boot-arg sweetamp=1): the A1 identify of shim/ampid_host_test.c (same fake SoC and fake CS35L41,
- * typed from the driver text) plus the A7 checks: every write frame is one of the 12 stock B2 probe writes in stock order (cs35l41.c:4300-4302,
+ * typed from the driver text) plus the A7 checks: every write frame is one of the 12 stock B2 probe writes in stock order (cs35l41.c:4306-4308,
  * :3675-3686, :4401), only after that amp was identified, never PWR_CTRL1; an error bit in IRQ1_STATUS1 fails the init; the armed-write allowlist.
  * The header is extracted from the patch by shim/build.sh:
  *   gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c */
@@ -69,6 +69,8 @@ struct amp {
 	uint32_t mask1, ccm, st1;	/* IRQ1_MASK1, DSP1_CCM_CORE_CTRL, IRQ1_STATUS1 */
 	unsigned nwr, seq_bad;	/* write frames seen, out-of-sequence writes */
 	uint32_t revid;		/* 0 = B2 (0xB2) */
+	uint32_t devid;		/* 0 = CS35L41 (0x35A40) */
+	uint32_t st1_late; unsigned st1_late_at;	/* IRQ1_STATUS1 |= st1_late once write #st1_late_at is done */
 	int ignore_mask;	/* the IRQ1_MASK1 write does not stick */
 	int drop_cs1_after_st1;	/* right after the pre-write IRQ1_STATUS1 read (L), CS1 is driven low (stuck) */
 	int st1_seen;
@@ -229,6 +231,8 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 				violate("a write outside the stock B2 sequence or out of order");
 			}
 			m->nwr++;
+			if (m->st1_late_at && m->nwr >= m->st1_late_at)
+				m->st1 |= m->st1_late;
 			if (wa == 0x10110u && !m->ignore_mask) m->mask1 = wv;
 			if (wa == 0x2BC1000u) m->ccm = wv;
 		}
@@ -254,7 +258,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 	if (addr == 0x1001Cu && p == 6 && !m->booted && ++m->reads_since >= m->boot_polls)
 		m->booted = 1;
-	val = addr == 0x0u ? 0x35A40u : addr == 0x4u ? (m->revid ? m->revid : 0xB2u) : addr == 0x1001Cu ? (m->booted ? 0x2u : 0u) : addr == 0x10110u ? m->mask1 :
+	val = addr == 0x0u ? (m->devid ? m->devid : 0x35A40u) : addr == 0x4u ? (m->revid ? m->revid : 0xB2u) : addr == 0x1001Cu ? (m->booted ? 0x2u : 0u) : addr == 0x10110u ? m->mask1 :
 	      addr == 0x2BC1000u ? m->ccm : addr == 0x10010u ? m->st1 : addr == 0x10018u ? m->st3 : 0u;
 	return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
 }
@@ -666,7 +670,7 @@ int main(void)
 	reset_hw(); flip_at = 1; flip_bank = 0; flip_bit = 2u; (void)0;
 	{ unsigned tot; reset_hw(); (void)amp_init_run_or_id(); tot = nw; reset_hw(); flip_at = tot - 8u; flip_bank = 0; flip_bit = 2u; flipped("H8: MOSI reads high during the restore"); }
 	CHECK(has("restore=ok"), "H8: restore ok");
-	reset_hw(); amp[1].st1 = 0x40u; stopped("R reports BST_OVP_ERR after the init", 1);
+	reset_hw(); amp[1].st1 = 0x40u; stopped("R reports BST_OVP_ERR before the init (pre-write read)", 1);
 	CHECK(has("!!! amp error bit") && has("SWEET AMP: init FAILED"), "error bit reported, no pass");
 	reset_hw(); amp[0].absent = 1; stopped("L absent: no write frame to it", 1);
 	CHECK(amp[0].nwr == 0, "no write to an unidentified amp");
@@ -687,6 +691,30 @@ int main(void)
 	CHECK(!has("init ok") && has("init FAILED"), "read-back mismatch: no pass");
 	reset_hw(); amp[0].drop_cs1_after_st1 = 1; stopped("CS1 stuck low before the L writes (amp_write checks the other CS)", 1);
 	CHECK(amp[0].nwr == 0 && !has("init ok"), "the other chip select low: no write frame");
+	{
+		static const uint32_t bits[7] = { 0x80000000u, 0x20000u, 0x10000u, 0x8000u, 0x100u, 0x80u, 0x40u };	/* cs35l41.h:684-689 + bit 16 */
+		static const unsigned at[2] = { 1u, 12u };
+
+		for (int b = 0; b < 7; b++)
+			for (int a = 0; a < 2; a++)
+				for (int k = 0; k < 2; k++) {
+					reset_hw();
+					amp[a].st1_late = bits[b];
+					amp[a].st1_late_at = at[k];
+					rc = amp_init_run();
+					CHECK(rc == 1 && violations == 0, "a post-write error bit fails the run");
+					CHECK(has("!!! amp error bit in IRQ1_STATUS1 (H8"), "the post-write check reports it");
+					CHECK(!has("init ok"), "no pass line");
+					CHECK(a == 1 || amp[1].nwr == 0, "no R write after an L error bit");
+					CHECK(restored_exact() && has("restore=ok"), "restored");
+				}
+		printf("ok: each of the 7 error bits after write 1 or 12, on each amp: fail, reported, no R write after L, restored\n");
+	}
+	reset_hw(); amp[1].devid = 0x35B40u; stopped("R DEVID is CS35L41R 0x35B40 (gate needs devid)", 1);
+	CHECK(amp[1].nwr == 0 && !has("init ok"), "wrong DEVID: no write to R");
+	reset_hw(); amp[0].st3 = 0x20000000u; amp[1].st3 = 0x20000000u; rc = amp_init_run();
+	CHECK(rc == 0 && has("init ok (no otp unpack)") && amp[0].nwr == 12 && amp[1].nwr == 12, "st3 = 0x20000000 (the observed hardware value, bit 29) passes");
+	printf("ok: st3 = 0x20000000 on both amps (observed o5-a1-ampid) passes\n");
 	reset_hw(); no_clock = 1; stopped("the bus never clocks (RX timeout)", 1);
 	CHECK(has("timeout"), "timeout reported");
 	reset_hw(); (void)amp_init_run(); unsigned nfull = nw;

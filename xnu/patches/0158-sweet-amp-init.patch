@@ -1,11 +1,11 @@
 SWEET AMP (patch 0158, plan 2026-11-14 oneshot-2 step A7), boot-arg sweetamp=1: the two CS35L41 speaker amps of oriole (USI13 / SPI13). Inert unless
 sweetamp=1 AND the ADT root model-number is "oriole". One synchronous run from sweet_ufs_init, before the touch / battery threads: the A1 identify
-(the port of the shim --amp-id, pk-amp shim/ampid.c 4c7be85, review SAFE round 2) and, on each amp that identified as CS35L41 B2 with OTP_BOOT_DONE, the
+(the port of the shim --amp-id, pk-amp shim/ampid.c 4c7be85, review SAFE round 2; A1 PASS on hardware o5-a1-ampid) and, on each amp that identified as CS35L41 B2 with OTP_BOOT_DONE, the
 stock probe-time writes: IRQ1_MASK1 = INT1_MASK_DEFAULT, the B2 errata patch, DSP1_CCM_CORE_CTRL = 0 (cs35l41.c:4306-4308, :3675-3686, :4351-4362,
 :4401). cs35l41_otp_unpack is NOT done (its bit maps are GPL data tables, cs35l41-tables.c: not copied; blocked). The write allowlist is exactly those
-12 (register, value) pairs; PWR_CTRL1 / GLOBAL_EN is never written (refused by name). Afterwards IRQ1_STATUS1 error bits must be 0, then both resets go
-low and every pad / controller / sysreg / mux word is restored and read back. Lines "SWEET AMP: ..."; pass "SWEET AMP: init ok l,r devid 35a40 rev b2,
-errors=0" (A7 PARTIAL: no OTP unpack). Host test shim/amp_xnu_host_test.c (header extracted from this patch). BUILT, UNRUN; needs A1 PASS and an independent review first.
+12 (register, value) pairs; PWR_CTRL1 / GLOBAL_EN is never written (refused by name). IRQ1_STATUS1 error bits (seven) must be 0 before the first write and after the writes, then both resets go
+low and every pad / controller / sysreg / mux word is restored and read back. Lines "SWEET AMP: ..."; pass "SWEET AMP: init ok (no otp unpack) l,r devid 35a40
+rev b2, errors=0" (A7 PARTIAL), then "SWEET AMP: verdict PASS". Host test shim/amp_xnu_host_test.c (header extracted from this patch). BUILT, UNRUN; needs A1 PASS and an independent review first.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -173,7 +173,7 @@ diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_amp.h
-@@ -0,0 +1,1004 @@
+@@ -0,0 +1,1007 @@
 +/*
 + * bsd/dev/sweet_amp.h - xnu patch 0158 (plan oneshot-2 step A7, boot-arg sweetamp=1): the two CS35L41 speaker amps of oriole on USI13 / SPI13.
 + * Pure logic, included by bsd/dev/sweet_amp.c (MMIO glue) and by the host test shim/amp_xnu_host_test.c. Every hardware access goes through the
@@ -192,8 +192,9 @@ new file mode 100644
 + * The write allowlist is exactly those 12 (register, value) pairs; PWR_CTRL1 0x2014 (GLOBAL_EN, cs35l41.h:42, :667) is not in it and is refused by name.
 + * A write frame (AMP cs35l41-spi.c:32-45, GKI regmap-spi.c write = one transfer): the 32-bit address with bit 31 CLEAR, 2 pad bytes 0, the 32-bit value,
 + * big endian, 10 bytes. Its bytes are accepted by the TX allowlist only while an allowed pair is armed (amp_write), at their exact frame position.
-+ * After the writes: IRQ1_STATUS1 0x10010 read; error bits AMP_SHORT_ERR 0x80000000, TEMP_ERR 0x20000, TEMP_WARN 0x8000, BST_SHORT_ERR 0x100,
-+ * BST_DCM_UVP_ERR 0x80, BST_OVP_ERR 0x40 (cs35l41.h:124, :684-689) must be 0. Then the usual restore: both resets low (the amps lose the writes), every
++ * IRQ1_STATUS1 0x10010 is read before the first write (st0: any error bit = no write) and after the writes (st1); error bits AMP_SHORT_ERR 0x80000000,
++ * TEMP_ERR 0x20000, bit 16 (unmasked by INT1_MASK_DEFAULT, unnamed), TEMP_WARN 0x8000, BST_SHORT_ERR 0x100, BST_DCM_UVP_ERR 0x80, BST_OVP_ERR 0x40
++ * (cs35l41.h:124, :684-689) must all be 0. Then the usual restore: both resets low (the amps lose the writes), every
 + * pad / controller / sysreg / mux word back. Pass line (A7 PARTIAL: no OTP unpack, review F3): "SWEET AMP: init ok (no otp unpack) l,r devid 35a40 rev b2,
 + * errors=0". Any later step that sets GLOBAL_EN must first add the OTP unpack. Worst-case run time about 9.3 s (review F8).
 + * The read check is per byte position, so about 90 addresses are readable, all with the read flag (0x80 / 0x82 first byte); no write (review F8).
@@ -874,6 +875,8 @@ new file mode 100644
 +	p = put_txt(line, sizeof(line), 0, name);
 +	p = put_txt(line, sizeof(line), p, " init writes=");
 +	p = put_dec(line, sizeof(line), p, n);
++	p = put_txt(line, sizeof(line), p, " st0=");
++	p = put_hex(line, sizeof(line), p, st0, 8);
 +	p = put_txt(line, sizeof(line), p, " st1=");
 +	p = put_hex(line, sizeof(line), p, st1, 8);
 +	p = put_txt(line, sizeof(line), p, " mask1=");

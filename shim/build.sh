@@ -615,6 +615,8 @@ else
 	chk "amp_xnu_host_test" $O/amp_xnu_host_test
 	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c
 	chk "amp_xnu_asan_host_test" $O/amp_xnu_asan_host_test
+	# review 0158 round 2 N2: every listed mutant of the header must fail the host test
+	chk "amp_xnu_mutants" "$PYTHON" ../tools/amp_xnu_mutants.py
 	# the inputs may have been edited while the tests ran: stamp only if the digest is unchanged (otherwise the next build runs them again)
 	if [ "$(htdigest)" = "$ht" ]; then mkdir -p "$htdir" && : >"$htdir/$ht.ok.$$" && mv -f "$htdir/$ht.ok.$$" "$htdir/$ht.ok"; else echo "host tests: inputs changed while they ran, no stamp"; fi
 fi

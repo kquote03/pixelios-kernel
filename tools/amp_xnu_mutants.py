@@ -19,6 +19,15 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("no pre-write error check (F6)", "\tif (e == AMP_OK && (st0 & AMP_ERR_BITS)) {", "\tif (0) {"),
     ("R written after a failed L (F4)", "\t\tif (il == AMP_OK && AMP_ID_OK(er, r))", "\t\tif (AMP_ID_OK(er, r))"),
     ("pass line from another condition (F1)", 'con_str("SWEET", pass ? "AMP: init ok', 'con_str("SWEET", 1 ? "AMP: init ok'),
+    # review 0158 round 2 N2: the post-write check and read, each error bit, the DEVID gate
+    ("post-write error check removed (n01)", "\treturn e == AMP_OK && !(st1 & AMP_ERR_BITS) && mask", "\treturn e == AMP_OK && mask"),
+    ("post-write status read removed (n20)", "\tif (e == AMP_OK)\n\t\te = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &st1);\n", ""),
+    ("AMP_SHORT_ERR dropped (n11)", "(0x80000000u | 0x20000u |", "(0x20000u |"),
+    ("TEMP_ERR dropped (n17)", "0x80000000u | 0x20000u | 0x10000u", "0x80000000u | 0x10000u"),
+    ("TEMP_WARN dropped (n10)", "0x10000u | 0x8000u | 0x100u", "0x10000u | 0x100u"),
+    ("BST_SHORT_ERR dropped (n18)", "0x8000u | 0x100u | 0x80u", "0x8000u | 0x80u"),
+    ("BST_OVP_ERR dropped", "0x80u | 0x40u)", "0x80u)"),
+    ("gate without devid (m15)", " && (rr).devid == AMP_DEVID && (rr).revid", " && (rr).revid"),
     # removing the by-name PWR_CTRL1 refusal alone is an equivalent mutant (0x2014 is not in AMP_INIT_SEQ either); the 13th-pair mutant shows the refusal works
     ("a 13th pair", "X(AMP_REG_CCM_CORE, 0u)", "X(AMP_REG_CCM_CORE, 0u) X(0x2014u, 1u)"),
 ]
