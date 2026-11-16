@@ -1,4 +1,4 @@
-"""tools/build-xnu-image.sh --wlan-level: 1..6 (patches 0124/0129-0132: sweetwlan=N), only with --wlan-hold; levels >= 4 copy the image and need --wlanfw."""
+"""tools/build-xnu-image.sh --wlan-level: 1..8 (patches 0124/0129-0132, 0150, 0159: sweetwlan=N), only with --wlan-hold; levels >= 4 copy the image and need --wlanfw."""
 import os, subprocess, tempfile, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,8 +17,8 @@ class WlanLevel(unittest.TestCase):
     def tearDown(self):
         self.t.close()
 
-    def test_levels_1_to_6(self):
-        for n in range(1, 7):
+    def test_levels_1_to_8(self):
+        for n in range(1, 9):
             extra = ["--wlanfw", self.t.name] if n >= 4 else []
             rc, out = run("--wlan-hold", "--wlan-level", str(n), *extra)
             self.assertEqual(rc, 0, out)
@@ -26,7 +26,7 @@ class WlanLevel(unittest.TestCase):
             self.assertEqual(out.count("sweetwlan="), 1, out)
 
     def test_bad_levels_refused(self):
-        for n in ("0", "7", "x", "3a"):
+        for n in ("0", "9", "10", "x", "3a"):
             rc, out = run("--wlan-hold", "--wlan-level", n)
             self.assertEqual(rc, 2, n + out)
 
@@ -35,7 +35,7 @@ class WlanLevel(unittest.TestCase):
         self.assertEqual(rc, 2, out)
 
     def test_image_levels_need_firmware(self):
-        for n in ("4", "5", "6"):
+        for n in ("4", "5", "6", "7", "8"):
             rc, out = run("--wlan-hold", "--wlan-level", n)
             self.assertEqual(rc, 2, out)
             self.assertIn("--wlanfw", out)

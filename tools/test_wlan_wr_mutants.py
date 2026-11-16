@@ -4,7 +4,7 @@ Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in 
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
 EQUIVALENT with the clause that implies it (CR-02). A pattern that matches nothing fails too (the header changed under the mutant list).
 Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; patch 0131 (run C: W11 NVRAM text, W12 length token, W13 rTLV) changes them again; patch 0132 (run D: W14 reset vector, firmware identity pin) once more; the texts under test are the files
-after 0124, 0128, 0129, 0130, 0131, 0132, 0147, 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
+after 0124, 0128, 0129, 0130, 0131, 0132, 0147, 0150 are applied in order (apply_chain; 0147: firmware identity table, review F1/F5; 0150: run E, CA7 release + read-only firmware-ready dump; 0154: the glue release gate and BAR2 latch, review 0150 G1, and the board-bound identity table, review 0147 N3). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
 process_nvram_vars port); a mutant is killed when either fails.
 Run: python3 -B tools/test_wlan_wr_mutants.py  (also picked up by `unittest discover -s tools -p 'test_*.py'`)."""
 import concurrent.futures
@@ -27,6 +27,9 @@ PATCH0131 = os.path.join(ROOT, "xnu", "patches", "0131-sweet-wlan-nvram-rtlv.pat
 PATCH0132 = os.path.join(ROOT, "xnu", "patches", "0132-sweet-wlan-reset-vector.patch")
 PATCH0147 = os.path.join(ROOT, "xnu", "patches", "0147-sweet-wlan-fw-ident.patch")
 PATCH0150 = os.path.join(ROOT, "xnu", "patches", "0150-sweet-wlan-fw-ready.patch")
+PATCH0154 = os.path.join(ROOT, "xnu", "patches", "0154-sweet-wlan-ca7-latch.patch")
+PATCH0159 = os.path.join(ROOT, "xnu", "patches", "0159-sweet-wlan-msgbuf.patch")
+PATCH0160 = os.path.join(ROOT, "xnu", "patches", "0160-sweet-wlan-rc-busmaster.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
 TEST_NV = os.path.join(ROOT, "shim", "wlan_nv_host_test.c")
 HDR_PATH = "bsd/dev/sweet_wlan_wr.h"
@@ -65,7 +68,7 @@ def apply_chain(path, patches):
 
 
 def final_header():
-    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150))
+    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154, PATCH0159, PATCH0160))
 
 
 def glue_before():
@@ -73,7 +76,7 @@ def glue_before():
 
 
 def glue_after():
-    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150))
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132, PATCH0147, PATCH0150, PATCH0154, PATCH0159, PATCH0160))
 
 
 def new_file(patch, path):
@@ -126,7 +129,13 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_stage3", "x.b = &wb;"),
     ("sweet_wlan_stage3", "x.level = level;"),
     ("sweet_wlan_stage3", "hw->l3 = level;"),  # patch 0132: sw3_wr allows backplane address 0 only at level 6 ...
-    ("sweet_wlan_stage3", "hw->rv_ok = level >= 6 && sw_fw.p != NULL && swl_fw_known(sw_fw.len, sw_fw.crc);"),  # review 0132 F5: the pin, in the glue too (patch 0147: the identity table)
+    ("sweet_wlan_stage3", "hw->rv_ok = level >= 6 && sw_fw.p != NULL && swl_fw_known(sw_fw.len, sw_fw.crc, hw->board);"),  # review 0132 F5: the pin, in the glue too (patch 0147: the identity table; 0154: of this board)
+    ("sweet_wlan_stage3", "char const *mn = NULL;"),  # patch 0154 (review 0147 N3): the root ADT model-number
+    ("sweet_wlan_stage3", "unsigned int mnsz = 0;"),
+    ("sweet_wlan_stage3", 'hw->board = SecureDTLookupEntry(NULL, "", &root) == kSuccess && SecureDTGetProperty(root, "", (void const **)&mn, &mnsz) == kSuccess ? swl_board_id(mn, mnsz) : 0;'),
+    ("sweet_wlan_stage3", "hw->released = 0;"),  # patch 0154 (review 0150 G1): the latch starts open at every stage 3 run ...
+    ("sweet_wlan_stage3", "x.board = hw->board;"),
+    ("sw3_wr", "h->released = 1;"),  # ... and closes at the first CA7 IOCTL store without CPUHALT
     ("sweet_wlan_stage3", "hw->rv_done = 0;"),
     ("sw3_wr", "h->rv_done = 1;"),  # the one store at backplane address 0 is made once
     ("sweet_wlan_stage3", "hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;"),  # ... and only this word
@@ -155,6 +164,26 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_init", "hw.elbi = elbi;"),
     ("sweet_wlan_init", "hw.iso = &isop[(SW_ISO & 0xFFFull) / 4];"),
     ("sweet_wlan_init", "hw.tcm = NULL;"),
+    # patch 0159 (run F): the level 8 gates of sw3_wr keep three flags; the host pool is allocated once, checked for contiguity and handed to the writer; no store through a pointer is added
+    ("sw3_wr", "f = h->l3 >= 8 && h->released;"),
+    ("sweet_wlan_init", "hw.dbi = level >= 8 ? sw_map(SW_DBI, 0x1000) : NULL;"),  # patch 0160: the root port's DBI page, only at level 8
+    ("sw3_wr", "h->bm = (v & 0x4u) != 0;"),  # the master bit of the last EP Command store: the doorbells need it
+    ("sw3_wr", "h->f_stores++;"),  # the bounded number of chip-RAM stores after the release
+    ("sw3_wr", "io = h->mem[SWL_AGENT_IOCTL / 4];"),  # review 0154 F1: a READ of the live CA7 IOCTL before a RESET_CTL store that takes the core out of reset
+    ("sw3_wr", "h->released = 1;"),  # review 0154 F1: ... which is the release too when CPUHALT is clear (second place that sets the latch)
+    ("sw3_sync", "struct sw_hw *h = ctx;"),
+    ("sweet_wlan_stage3", "vm_offset_t pva = 0;"),
+    ("sweet_wlan_stage3", "wb.sync = sw3_sync;"),
+    ("sweet_wlan_stage3", "hw->bm = 0;"),
+    ("sweet_wlan_stage3", "hw->f_stores = 0;"),
+    ("sweet_wlan_stage3", "hw->pool_pa = (uint64_t)kvtophys(pva);"),
+    ("sweet_wlan_stage3", "for (pi = 0;"),
+    ("sweet_wlan_stage3", "pi += PAGE_SIZE) { if ((uint64_t)kvtophys(pva + pi) != hw->pool_pa + pi) { hw->pool_pa = 0;"),
+    ("sweet_wlan_stage3", "hw->pool_pa = 0;"),  # a pool that is not physically contiguous is not used
+    ("sweet_wlan_stage3", "hw->pool = (uint8_t *)pva;"),
+    ("sweet_wlan_stage3", "x.pool = hw->pool;"),
+    ("sweet_wlan_stage3", "x.pool_pa = hw->pool != NULL ? hw->pool_pa : 0;"),
+    ("sweet_wlan_stage3", "x.pool_len = hw->pool != NULL ? SWM_POOL_LEN : 0;"),
 ])
 ASSIGN_OP = re.compile(r"(?<![=!<>])(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--")
 
@@ -239,18 +268,146 @@ def audit_store_path(hdr, glue):
     # review 0131 F2: the rTLV entropy is drawn in full
     if body(glue, "sw3_rng").count("read_random(buf, n);") != 1:
         f.append("sw3_rng does not draw all n bytes with read_random")
+    # patch 0154 (review 0150 G1): the release gate and the BAR2 latch are in sw3_wr, the latch before the store, the CPUHALT bit is DHD's SICF_CPUHALT
+    w = body(glue, "sw3_wr")
+    gate = w.find("!(v & SW_CPUHALT) && (h->l3 < 7 || !h->rv_done)) {")
+    latch = w.find("if (space == SWW_BAR2 && h->released && !(f && h->f_stores < SW_F_STORES)) {")       # patch 0159: level 8 may store a bounded number of chip-RAM words after the release
+    setl = w.find("h->released = 1;")
+    store = w.find("*p = v;")
+    if gate < 0 or latch < 0 or setl < 0 or store < 0 or not (gate < store and latch < store and setl < store):
+        f.append("sw3_wr has no release gate / BAR2 latch before the store")
+    # patch 0159 (run F): the three glue gates exist only at level 8 after the release; EP Command only as memory / memory + master (the latter only with a pool); doorbells only with the master bit
+    if "f = h->l3 >= 8 && h->released;" not in w or "!(off == SWW_CFG_CMD && f && (v == SWW_CMD_MEM || (v == SWW_CMD_MEM_BM && h->pool != NULL)))" not in w:
+        f.append("sw3_wr does not limit EP Command to level 8 after the release and to memory / memory + master")
+    if "!(f && h->bm && win == SWW_WIN_PCIE && (off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) && v == 1u)" not in w or "h->bm = (v & 0x4u) != 0;" not in w:
+        f.append("sw3_wr does not limit the doorbells to bus master on, the PCIe core window and value 1")
+    # patch 0160: the root port's Command: level 8 after the release, Status half 0, only memory/master may differ from the live word, master only with a pool; one word of the page
+    if "if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL && (v >> 16) == 0 && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0 && (!(v & 0x4u) || h->pool != NULL))) {" not in w \
+            or "return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;" not in body(glue, "sw3_ptr") or w.find("space == SWW_DBI && !(f") > store:
+        f.append("sw3_wr does not limit the root port to its Command word at level 8 with only memory/master changing")
+    if not re.search(r"^#define SW_F_STORES\s+96u\b", glue, re.M) or w.find("h->f_stores++;") < 0 or w.find("h->f_stores++;") > store:
+        f.append("sw3_wr does not bound the chip-RAM stores after the release")
+    if not re.search(r"^#define SW_CPUHALT\s+0x20u\b", glue, re.M):
+        f.append("SW_CPUHALT is not 0x20u")
+    return f
+
+
+def audit_board_glue(glue):
+    """Review 0154 F4: the glue half of the board binding, on the full glue text WITH its string literals (audit_store_path strips them): the root lookup by "/", the property
+    "model-number", swl_board_id() of exactly that property, and the hand-over condition of the image (level >= 4 and not an identity of this board -> x.img = NULL)."""
+    f = []
+    b = body(strip_comments(glue), "sweet_wlan_stage3")
+    if 'hw->board = SecureDTLookupEntry(NULL, "/", &root) == kSuccess && SecureDTGetProperty(root, "model-number", (void const **)&mn, &mnsz) == kSuccess ? swl_board_id(mn, mnsz) : 0;' not in b:
+        f.append("the board is not swl_board_id() of the root model-number")
+    cond = "if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {"
+    i, j = b.find(cond), b.find("x.img = NULL;")
+    if i < 0 or j < 0 or not i < j or b.count("x.img = NULL;") != 1:
+        f.append("the image is not withheld from stage 3 when it is not an identity of this board")
+    if b.find("x.board = hw->board;") < 0 or b.find("x.board = hw->board;") > b.find("swl_stage3(&x)"):
+        f.append("x.board is not set before swl_stage3")
     return f
 
 
 # (name, [(old, new)], equivalent-because or None). Strings are literal; every occurrence is replaced.
 MUTANTS = [
+    # --- patch 0160: the root port's Command before the endpoint's bus master
+    ("0160: root port may get any value", [("\t\t\tif (val != ((old & 0xFFFFu) | SWW_CMD_MEM_BM)) {\n\t\t\t\treturn swl_stop(x, SWW_E_OLD);\n\t\t\t}\n", "")], None),
+    ("0160: root port off to any word", [("} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {", "} else if (!x->rc_have || (x->flags & SWF_BM)) {")], None),
+    ("0160: root port off while the endpoint is a master", [("} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {", "} else if (!x->rc_have || val != x->rc_cmd_old) {")], None),
+    ("0160: root port off without a recorded word", [("} else if (!x->rc_have || val != x->rc_cmd_old || (x->flags & SWF_BM)) {", "} else if (val != x->rc_cmd_old || (x->flags & SWF_BM)) {")], None),
+    ("0160: endpoint may be a master before the root port", [(".rgrp = SWW_RG_BM, .flags = SWT_ONCE, .pred1 = SWT_RC_BM_ON + 1, .off = SWW_CFG_CMD,", ".rgrp = SWW_RG_BM, .flags = SWT_ONCE, .off = SWW_CFG_CMD,")], None),
+    ("0160: root port restore not armed", [("[SWT_RC_BM_ON]   = { .row = 22, .run = 6, .space = SWW_DBI, .rgrp = SWW_RG_RCBM,", "[SWT_RC_BM_ON]   = { .row = 22, .run = 6, .space = SWW_DBI,")], None),
+    ("0160: root port restore entry removed", [("\t{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },", "\t{ 0, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },")], None),
+    ("0160: root port restore writes 0, not the old word", [("\t\t\trv = x->rc_cmd_old;\n", "")], None),
+    ("0160: root port restored before the endpoint", [("\t{ SWW_RG_BM, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },   /* patch 0159: bus master off before anything else (docs/research/51 rule R2) */\n\t{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },          /* patch 0160: then the root port's Command back to x->rc_cmd_old (the value field is not used for this group) */\n",
+                                                        "\t{ SWW_RG_RCBM, SWW_DBI, 0, SWW_CFG_CMD, 0u, 0xFFFFu },\n\t{ SWW_RG_BM, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },\n")], None),
+    ("0160: root port left a master at the end", [("\tSWW_TRY(swl_wr(x, SWW_DBI, 0, SWW_CFG_CMD, x->rc_cmd_old));\n", "")], None),
+    ("0160: root port not made a master", [("\tSWW_TRY(swl_wr(x, SWW_DBI, 0, SWW_CFG_CMD, (rc & 0xFFFFu) | SWW_CMD_MEM_BM));\n", "")], None),
+    ("0160: root port word readable below level 8", [("\t{ SWW_RUN_F, SWW_DBI, 0, SWW_CFG_CMD, SWW_CFG_CMD },", "\t{ 1, SWW_DBI, 0, SWW_CFG_CMD, SWW_CFG_CMD },")], "EQUIVALENT for stores: a read of that word below level 8 has no caller (swl_w22 runs at level 8 only) and the glue has no DBI page mapped then (sw3_ptr returns NULL)"),
+    ("0160: root port tuples visible below level 8 (dynamic-value family dropped)", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)) {", "} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN)) {")], None),
+    # --- review 0159-1 (F1..F4, F8)
+    ("W18: host index-buffer words not required to be 0 (review F1)", [("\t\tif (x->f_ri[i] != 0u) {\n\t\t\treturn swl_stop(x, SWW_E_MSG);\n\t\t}\n", "")], None),
+    ("W18: only the first host index-buffer word checked (review F1)", [("for (i = SWM_RI_HOSTIDX0; i <= SWM_RI_HOSTIDX1; i++) {", "for (i = SWM_RI_HOSTIDX0; i <= SWM_RI_HOSTIDX0; i++) {")], None),
+    ("W18: 36-bit bus address limit dropped (review F2)", [(" ||\n\t    x->pool_pa + SWM_POOL_LEN > SWM_DMA_LIMIT) {", ") {")], None),
+    ("W18: bus address limit one page too high (review F2)", [("x->pool_pa + SWM_POOL_LEN > SWM_DMA_LIMIT) {", "x->pool_pa + SWM_POOL_LEN > SWM_DMA_LIMIT + SWM_POOL_ALIGN) {")], None),
+    ("run F: an unwritten completion item is consumed (review F3)", [("\t\t\tif (typ == 0u) {       /* review 0159-1 F3", "\t\t\tif (0) {       /* review 0159-1 F3")], None),
+    ("run F: no guard report after a stop (review F4)", [("\t\tswl_left(x);\n\t\tswl_left_f(x);\n", "\t\tswl_left(x);\n")], None),
+    ("run F: guard report without the cache callback (review F4)", [("\tx->b->sync(x->b->ctx, 0, SWM_POOL_LEN);\n\tbad = swm_guard(x, 0);\n\tprintf(\"SWEET WLAN: left after stop:", "\tbad = swm_guard(x, 0);\n\tprintf(\"SWEET WLAN: left after stop:")], "EQUIVALENT on the host: the fake pool is ordinary memory, the callback only counts; on the phone it is the cache invalidate before the read"),
+    ("run F: response buffer address in the item is outside the pool (review F8)", [("\tswm_w32(it + 16, (uint32_t)pa);\n\tswm_w32(it + 20, (uint32_t)(pa >> 32));", "\tswm_w32(it + 16, (uint32_t)pa + SWM_POOL_LEN);\n\tswm_w32(it + 20, (uint32_t)(pa >> 32));")], None),
+    ("run F: request buffer high word in the item dropped (review F8)", [("\tswm_w32(it + 24, (uint32_t)pa);\n\tswm_w32(it + 28, (uint32_t)(pa >> 32));", "\tswm_w32(it + 24, (uint32_t)pa);\n\tswm_w32(it + 28, 0u);")], None),
+    ("run F: request buffer not synced before the doorbell (review F8)", [("\tswm_sync(x, SWM_O_REQ, SWM_L_REQ);\n", "")], None),
+    ("run F: ring item not synced before the doorbell (review F8)", [("\tswm_sync(x, swm_ring[0].off + x->f_w0 * SWM_ITEM_H2D, SWM_ITEM_H2D);\n", "")], None),
+    ("run F: completion item not synced before it is read (review F8)", [("\t\t\tswm_sync(x, swm_ring[SWM_NH2D].off + x->f_r0 * SWM_ITEM_D2H, SWM_ITEM_D2H);\n", "")], None),
+    ("run F: answer not synced before it is read (review F8)", [("\tswm_sync(x, SWM_O_RESP, SWM_L_RESP);\n\tfor (i = 0; i < rl && i < omax; i++) {", "\tfor (i = 0; i < rl && i < omax; i++) {")], None),
+    ("run F: completion command not compared (review F8)", [(" || swm_r32(c + 16) != SWM_C_GET_VAR || got) {", " || got) {")], None),
+    ("run F: version text not filtered (review F8)", [("\t\tif (ver[i] >= 0x20 && ver[i] < 0x7F) {", "\t\tif (1) {")], None),
+    # --- patch 0159 (run F, docs/research/51 rules R1..R9). The nine patterns re-pinned below changed only because 0159 changed their text (the run filter of the allowlist search, the SWT_DYN flag,
+    # the bus-master term of the precondition, one more indent level of the old-value read).
+    ("run F: tuples visible below level 8", [("int mr = x->level - SWW_LEVEL0 >= SWW_RUN_F ? x->level - SWW_LEVEL0 : SWW_RUN_F - 1;", "int mr = SWW_RUN_F;")], None),
+    ("run F: run filter of the allowlist search removed", [("if ((int)p->run > maxrun || p->space != space", "if (p->space != space")], None),
+    ("run F: download tuples keep judging chip RAM after the release", [(" ||\n\t    (swl_wt[t].space == SWW_BAR2 && swl_wt[t].run < SWW_RUN_F && !(swl_wt[t].flags & SWT_TW) && (x->flags & SWF_W15)))) {", ")) {")], None),
+    ("run F: take-over before the release", [("!(swl_wt[t].flags & SWT_TW) && (x->flags & SWF_W15)))) {", "!(swl_wt[t].flags & SWT_TW)))) {")], None),
+    ("run F: word not judged (R1/R4)", [("\t\tif (fk == SWM_K_NONE) {\n\t\t\treturn swl_stop(x, SWW_E_MSG);\n\t\t}\n", "")], None),
+    ("run F: index upper half not checked (R4)", [("if (fk == SWM_K_IDX && (old >> 16) != 0u) {", "if (0) {")], None),
+    ("run F: kind needs no W18", [("if (!(x->flags & SWF_W18) || x->shared == 0) {\n\t\treturn SWM_K_NONE;\n\t}\n", "")], None),
+    ("run F: host_cap any value", [("return val == SWM_HOST_CAP ? SWM_K_CAP : SWM_K_NONE;", "return SWM_K_CAP;")], None),
+    ("run F: host_cap2 any value", [("return val == 0u ? SWM_K_CAP : SWM_K_NONE;", "return SWM_K_CAP;")], None),
+    ("run F: scratch address any value (R1)", [("if (bp == x->shared + SWM_SH_SCRATCH_LO) {\n\t\treturn a != 0 && val == (uint32_t)a ? SWM_K_BUF : SWM_K_NONE;", "if (bp == x->shared + SWM_SH_SCRATCH_LO) {\n\t\treturn SWM_K_BUF;")], None),
+    ("run F: ring-update high word any value (R1)", [("if (bp == x->shared + SWM_SH_RINGUPD_HI) {\n\t\treturn a != 0 && val == (uint32_t)(a >> 32) ? SWM_K_BUF : SWM_K_NONE;", "if (bp == x->shared + SWM_SH_RINGUPD_HI) {\n\t\treturn SWM_K_BUF;")], None),
+    ("run F: ring base any value (R1)", [("if (bp == e + 0x8u) {\n\t\t\treturn a != 0 && val == (uint32_t)a ? SWM_K_RING : SWM_K_NONE;", "if (bp == e + 0x8u) {\n\t\t\treturn SWM_K_RING;")], None),
+    ("run F: ring high word any value (R1)", [("if (bp == e + 0xCu) {\n\t\t\treturn a != 0 && val == (uint32_t)(a >> 32) ? SWM_K_RING : SWM_K_NONE;", "if (bp == e + 0xCu) {\n\t\t\treturn SWM_K_RING;")], None),
+    ("run F: ring depth word any value", [("return val == (swm_ring[i].depth | swm_ring[i].item << 16) ? SWM_K_RING : SWM_K_NONE;", "return SWM_K_RING;")], None),
+    ("run F: H2D write index not bounded (R4)", [("if (bp == x->f_hw + 4u * i) {\n\t\t\treturn val < swm_ring[i].depth ? SWM_K_IDX : SWM_K_NONE;", "if (bp == x->f_hw + 4u * i) {\n\t\t\treturn SWM_K_IDX;")], None),
+    ("run F: D2H read index not bounded (R4)", [("if (bp == x->f_dr + 4u * i) {\n\t\t\treturn val < swm_ring[SWM_NH2D + i].depth ? SWM_K_IDX : SWM_K_NONE;", "if (bp == x->f_dr + 4u * i) {\n\t\t\treturn SWM_K_IDX;")], None),
+    ("run F: the firmware's read index writable", [("if (bp == x->f_hr + 4u * i) {\n\t\t\treturn val == 0u ? SWM_K_IDX : SWM_K_NONE;", "if (bp == x->f_hr + 4u * i) {\n\t\t\treturn SWM_K_IDX;")], None),
+    ("run F: the firmware's write index writable", [("if (bp == x->f_dw + 4u * i) {\n\t\t\treturn val == 0u ? SWM_K_IDX : SWM_K_NONE;", "if (bp == x->f_dw + 4u * i) {\n\t\t\treturn SWM_K_IDX;")], None),
+    ("run F: pool bound dropped (R1)", [("x->pool_len != SWM_POOL_LEN || off > x->pool_len || len > x->pool_len - off) {", "x->pool_len != SWM_POOL_LEN) {")], None),
+    ("run F: pool pointer not required (R1)", [("if (x->pool == NULL || x->pool_pa == 0 || ", "if (x->pool_pa == 0 || ")], None),
+    ("run F: short pool accepted (R1)", [("x->pool_pa == 0 || x->pool_len != SWM_POOL_LEN || ", "x->pool_pa == 0 || ")], "EQUIVALENT: a pool shorter than the layout is still refused by the bound that follows (off > pool_len || len > pool_len - off, its own mutant above); the exact-length clause only refuses a LONGER pool, which holds the layout too"),
+    ("W18: version not required", [("if ((fl & SWW_SH_VER_MASK) != SWM_SH_VERSION || !(fl", "if (!(fl")], None),
+    ("W18: host-ready flag not required", [("!(fl & SWM_SH_FLAGS_HOSTRDY) || ", "")], None),
+    ("W18: DAR firmware accepted", [("(fl & (SWM_SH_FLAGS_DAR | SWM_SH_FLAGS_2B_IDX))", "(fl & SWM_SH_FLAGS_2B_IDX)")], None),
+    ("W18: 2-byte indices accepted", [("(fl & (SWM_SH_FLAGS_DAR | SWM_SH_FLAGS_2B_IDX))", "(fl & SWM_SH_FLAGS_DAR)")], None),
+    ("W18: sync callback not required", [("if (x->b->sync == NULL || swm_pa(x, 0, SWM_POOL_LEN) == 0", "if (swm_pa(x, 0, SWM_POOL_LEN) == 0")], None),      # review 0159-1 F8: killed (the NULL callback is called and the test dies), not equivalent
+    ("W18: pool alignment not required", [(" || (x->pool_pa & (SWM_POOL_ALIGN - 1u)) != 0", "")], None),
+    ("W18: regions outside RAM accepted", [("\t\tif (!swl_f_inram(x, rg[i].a, rg[i].n)) {", "\t\tif (0) {")], None),
+    ("W18: overlapping regions accepted", [("if (rg[i].a < rg[j].a + rg[j].n && rg[j].a < rg[i].a + rg[i].n) {", "if (0) {")], None),
+    ("W18: ring counts not required", [("if (maxsub < SWM_NH2D || maxcpl < SWM_ND2H || maxsub > 1024u || maxcpl > 1024u) {", "if (0) {")], None),
+    ("W18: in-RAM check ignores alignment", [("return !(a & 3u) && n != 0u && a >= SWW_RAM_BASE", "return n != 0u && a >= SWW_RAM_BASE")], None),
+    ("W18: in-RAM check ignores the RAM base", [("n != 0u && a >= SWW_RAM_BASE && n <= x->ram_bytes", "n != 0u && n <= x->ram_bytes")], "EQUIVALENT: for a < SWW_RAM_BASE the unsigned a - SWW_RAM_BASE wraps to at least 0xFFE00000, which is above ram_bytes - n (ram_bytes <= 0x400000), so the last clause refuses it"),
+    ("run F: bus master tuple needs no W21", [(".omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = SWF_W21 },", ".omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = 0 },")], None),      # review 0159-1 F8: a direct call case kills it
+    ("run F: bus master on from any old Command", [(".vmask = 0xFFFFu,\n\t                     .omask = 0xFFFFu, .oval = SWW_CMD_MEM, .need = SWF_W21 },", ".vmask = 0xFFFFu,\n\t                     .need = SWF_W21 },")], "EQUIVALENT: swl_wpre() already requires the memory-only Command before the store (the old-value clause is the second check of the same word)"),
+    ("run F: bus master may be switched on twice", [("[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = SWT_ONCE,", "[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = 0,")], None),
+    ("run F: bus master restore not armed (R2)", [("[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM,", "[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG,")], None),
+    ("run F: bus master restore entry removed (R2)", [("\t{ SWW_RG_BM, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },", "\t{ 0, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM, 0xFFFFu },")], None),
+    ("run F: bus master left on at the end (R2)", [("\tSWW_TRY(swl_w84_zero(x));\n\tSWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM));\n", "\tSWW_TRY(swl_w84_zero(x));\n")], None),
+    ("run F: restore does not clear the bus-master flag", [("\t\t\tif (r->grp == SWW_RG_BM) {\n\t\t\t\tx->flags &= ~SWF_BM;", "\t\t\tif (0) {\n\t\t\t\tx->flags &= ~SWF_BM;")], None),
+    ("run F: bus-master flag never set", [("\tif (t == SWT_BM_ON) {", "\tif (0) {")], None),
+    ("run F: precondition accepts any Command with bus master", [("bad = swl_pre_ep((x->flags & SWF_BM) ? cmd ^ (SWW_CMD_MEM ^ SWW_CMD_MEM_BM) : cmd, b0, b1);", "bad = swl_pre_ep(cmd & ~0x4u, b0, b1);")], None),
+    ("run F: doorbell needs no bus master (R5)", [(".off = SWW_DB_H2D, .val = 1u, .need = SWF_BM | SWF_W23 },", ".off = SWW_DB_H2D, .val = 1u, .need = SWF_W23 },")], None),
+    ("run F: host-ready doorbell needs no bus master (R5)", [(".off = SWW_DB_HOSTRDY, .val = 1u, .need = SWF_BM },", ".off = SWW_DB_HOSTRDY, .val = 1u, .need = 0 },")], "EQUIVALENT: the predecessor SWT_BM_ON must be done and SWT_ONCE consumes the tuple in the same run; the glue gate (h->bm) is the second check"),
+    ("run F: doorbell is read first", [("\t\tif (!(p->flags & SWT_WO)) {     /* patch 0159: a doorbell register is never read (no source reads it) */", "\t\tif (1) {")], None),
+    ("run F: firmware read index not bounded (R6)", [("\tif (hr >= swm_ring[0].depth) {", "\tif (0) {")], None),
+    ("run F: firmware write index not bounded (R6)", [("\t\tif (w >= swm_ring[SWM_NH2D].depth) {", "\t\tif (0) {")], None),
+    ("run F: completion length not bounded (R6)", [("\t\t\t\tif (rl > SWM_L_RESP) {", "\t\t\t\tif (0) {")], None),
+    ("run F: transaction id not compared (R6)", [("if (swm_r16(c + 14) != trans || swm_r32(c + 4)", "if (swm_r32(c + 4)")], None),
+    ("run F: response buffer id not compared (R6)", [("swm_r32(c + 4) != SWM_RESP_ID || ", "")], None),
+    ("run F: completion status ignored", [("\tif (st != 0) {", "\tif (0) {")], None),
+    ("run F: no completion is not a stop (R3)", [("\tif (!got) {\n\t\tswm_sync(x, swm_ring[SWM_NH2D].off, swm_ring[SWM_NH2D].depth * SWM_ITEM_D2H);", "\tif (0) {\n\t\tswm_sync(x, swm_ring[SWM_NH2D].off, swm_ring[SWM_NH2D].depth * SWM_ITEM_D2H);")], None),
+    ("run F: link not checked while waiting", [("\t\tif (swl_lpre(x)) {\n\t\t\tprintf(\"SWEET WLAN: W%u link precondition lost while waiting", "\t\tif (0) {\n\t\t\tprintf(\"SWEET WLAN: W%u link precondition lost while waiting")], None),
+    ("run F: guard gaps not checked (R9)", [("\tbad = swm_guard(x, 0);\n\tif (bad) {", "\tbad = swm_guard(x, 0);\n\tif (0) {")], None),
+    ("run F: guard gaps not filled", [("\t\t\tif (fill) {\n\t\t\t\tx->pool[j] = SWM_GUARD;", "\t\t\tif (0) {\n\t\t\t\tx->pool[j] = SWM_GUARD;")], None),
+    ("run F: short MAC answer accepted", [("\tif (n < sizeof mac) {", "\tif (0) {")], None),      # review 0159-1 F8: killed by the fw_len = 3 case
+    ("run F: the whole MAC is printed", [("mac xx:xx:xx:xx:%02x:%02x\\n\", vt, mac[4], mac[5]);", "mac xx:xx:%02x:%02x:%02x:%02x\\n\", vt, mac[2], mac[3], mac[4], mac[5]);")], None),
+    ("run F: version text not cut at the first line", [(" && ver[i] != 0 && ver[i] != '\\n'; i++) {", " && ver[i] != 0; i++) {")], None),
+    ("run F: stage 3 runs F at level 7", [("\tif (x->level >= SWW_LEVEL0 + SWW_RUN_F) {       /* run F (patch 0159)", "\tif (x->level >= SWW_LEVEL0 + SWW_RUN_F - 1) {       /* run F (patch 0159)")], None),
     # --- the allowlist decision
-    ("no deny-by-default (unknown store matches tuple 0)", [("\t}\n\treturn -1;\n}\n\nstatic inline int\nswl_wr_ok(", "\t}\n\treturn 0;\n}\n\nstatic inline int\nswl_wr_ok(")], None),
+    ("no deny-by-default (unknown store matches tuple 0)", [("\t}\n\treturn -1;\n}\n\n/* the allowlist of the download runs", "\t}\n\treturn 0;\n}\n\n/* the allowlist of the download runs")], None),
     ("value not compared", [("} else if (p->val == val) {", "} else if (1) {")], None),
     ("bank index may be >= 0x80", [("if (val < SWW_BANK_ROM) {", "if (1) {")], None),
-    ("space not compared", [("if (p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if (p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {")], None),
-    ("window not compared", [("if (p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if (p->space != space || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {")], None),
-    ("offset not compared", [("if (p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if (p->space != space || p->win != win) {")], None),
+    ("space not compared", [("if ((int)p->run > maxrun || p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if ((int)p->run > maxrun || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {")], None),
+    ("window not compared", [("if ((int)p->run > maxrun || p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if ((int)p->run > maxrun || p->space != space || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {")], None),
+    ("offset not compared", [("if ((int)p->run > maxrun || p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if ((int)p->run > maxrun || p->space != space || p->win != win) {")], None),
     # --- the writer's gates
     ("stopped latch ignored", [("if (x->stopped) {\n\t\treturn -SWW_E_STOPPED;", "if (0) {\n\t\treturn -SWW_E_STOPPED;")], None),
     ("level gate of swl_wr removed", [("if ((int)p->run > x->level - SWW_LEVEL0) {\n\t\treturn swl_stop(x, SWW_E_LEVEL);", "if (0) {\n\t\treturn swl_stop(x, SWW_E_LEVEL);")], None),
@@ -276,13 +433,13 @@ MUTANTS = [
     ("read-back compares all 32 bits", [("((rb ^ val) & p->vmask)", "((rb ^ val) & 0xFFFFFFFFu)")], None),
     ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {"), ("if ((rb ^ val) & p->vmask) {", "if (0) {")], None),
     ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0) {")], None),
-    ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\t\treturn swl_stop(x, SWW_E_RD);")], None),
+    ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\t\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\t\t\treturn swl_stop(x, SWW_E_RD);")], None),
     ("done bit not recorded", [("\tx->done |= SWT_BIT(t);\n", "")], None),
     ("bank count not recorded", [("\t\tx->nbank++;\n", "")], None),
     # --- the 0124 preconditions inside swl_wpre
     ("link precondition dropped", [("\treturn swl_pre_link(iso, ltssm, a0, a1);", "\treturn 0;")], None),  # patch 0147: in swl_lpre
     ("swl_wpre without the link half", [("\tbad = swl_lpre(x);\n\tif (bad) {\n\t\treturn bad;\n\t}\n\tif (swl_rdx(x, SWW_CFG, 0, 0x04u", "\tif (swl_rdx(x, SWW_CFG, 0, 0x04u")], None),
-    ("endpoint precondition dropped", [("bad = swl_pre_ep(cmd, b0, b1);", "bad = 0;")], None),
+    ("endpoint precondition dropped", [("bad = swl_pre_ep((x->flags & SWF_BM) ? cmd ^ (SWW_CMD_MEM ^ SWW_CMD_MEM_BM) : cmd, b0, b1);", "bad = 0;")], None),
     ("region 2 not pinned once enabled", [("if (x->flags & SWF_W2) {", "if (0) {")], None),
     ("region 2 word compare dropped", [("if (r2 != w2[i]) {\n\t\t\t\treturn 7;", "if (0) {\n\t\t\t\treturn 7;")], None),
     ("precondition read failure ignored", [("if (swl_rdx(x, SWW_ISO, 0, 0, &iso) || swl_rdx(x, SWW_ELBI, 0, 0x2C8u, &ltssm)) {\n\t\treturn 8;", "if (0) {\n\t\treturn 8;")], None),
@@ -294,7 +451,7 @@ MUTANTS = [
     ("read table: alignment not compared", [("&& (off & 3u) == 0) {\n\t\t\treturn (int)i;", ") {\n\t\t\treturn (int)i;")], None),
     ("read of an unlisted register allowed", [("if (i < 0 || (int)swl_rt[i].run", "if ((int)swl_rt[i < 0 ? 0 : i].run")], None),
     # --- stop and restore
-    ("STOP does not run the restore", [("\t\tswl_restore(x);\n\t\tswl_left(x);\n\t}\n\treturn -code;", "\t\tswl_left(x);\n\t}\n\treturn -code;")], None),  # patch 0147: swl_left() follows the restore
+    ("STOP does not run the restore", [("\t\tswl_restore(x);\n\t\tswl_left(x);\n\t\tswl_left_f(x);\n\t}\n\treturn -code;", "\t\tswl_left(x);\n\t\tswl_left_f(x);\n\t}\n\treturn -code;")], None),  # patch 0147: swl_left() follows the restore
     ("restore group never armed", [("\tx->armed |= p->rgrp;\n", "")], None),
     ("restore of a finished step still armed", [("\tx->armed = 0;\n\tx->flags |= flag;", "\tx->flags |= flag;")], None),
     ("restore skipped check dropped", [("\t\t\tif (pre) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group", "\t\t\tif (0) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group")], None),
@@ -474,12 +631,12 @@ MUTANTS = [
     ("run C words: token is not the stored word", [("\tif (k == SWK_TOKEN) {\n\t\treturn x->tok;\n\t}", "\tif (k == SWK_TOKEN) {\n\t\treturn ~x->tok;\n\t}")], None),
     # --- run C: swl_wr / pick / table
     ("run C pick: tuple not replaced when consumed", [("(((swl_wt[t].flags & SWT_ONCE) && (x->done & SWT_BIT(t))) || ((swl_wt[t].flags & SWT_TW)", "((0) || ((swl_wt[t].flags & SWT_TW)")], None),
-    ("run C pick: tuple not replaced by kind", [("|| ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)))) {", "|| 0)) {")], None),
+    ("run C pick: tuple not replaced by kind", [("|| ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)) ||", "|| 0 ||")], None),
     ("run C pick: kind taken from the offset", [("swl_wt[t].kind != swl_tw_kind(x, win + off)", "swl_wt[t].kind != swl_tw_kind(x, off)")], None),
     ("run C pick: takeover at a level that does not allow it", [("if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {", "if (n <= t) {")], None),
     ("run C pick: no match reports DENIED", [("\t\t\treturn first;\n\t\t}\n\t\tt = n;", "\t\t\treturn -1;\n\t\t}\n\t\tt = n;")], None),
     ("run C pick: not used", [("t = swl_wr_pick(x, space, win, off, val);", "t = swl_wr_ok(space, win, off, val);")], None),
-    ("run C ok: tail tuples need the tuple's value", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV)) {", "} else if (p->flags & (SWT_BULK | SWT_RV)) {")], None),
+    ("run C ok: tail tuples need the tuple's value", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)) {", "} else if (p->flags & (SWT_BULK | SWT_RV | SWT_DYN | SWT_RC)) {")], None),
     ("run C wr: geometry not checked", [("\t\tgr = swl_geo_get(x, &g);\n\t\tif (gr) {\n\t\t\treturn swl_stop(x, gr);\n\t\t}\n", "\t\tgr = swl_geo_get(x, &g);\n")], None),
     ("run C wr: kind index not bounded", [("ti >= swl_tw_n(&g, p->kind) || ", "")], None),
     ("run C wr: address not the next word of the kind", [("win + off != swl_tw_base(&g, p->kind) + 4u * ti || ", "")], None),
@@ -569,23 +726,23 @@ MUTANTS = [
     ("run D tuple: not once", [(".flags = SWT_ONCE | SWT_RV,", ".flags = SWT_RV,")], None),
     ("run D tuple: the whole of window 0", [(".win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }", ".win = 0, .off = 0, .hi = SWW_TCM_BYTES - 4u, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }")], None),
     ("run D tuple: value from the table", [("SWT_ONCE | SWT_RV, .win = 0", "SWT_ONCE, .win = 0")], None),
-    ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV)", "(SWT_BULK | SWT_TW)")], None),
+    ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV | SWT_DYN | SWT_RC)", "(SWT_BULK | SWT_TW | SWT_DYN | SWT_RC)")], None),
     ("run D swl_wr: guard removed", [("if ((p->flags & SWT_RV) && (x->img == NULL", "if (0 && (x->img == NULL")], None),
     ("run D swl_wr: no image", [("(p->flags & SWT_RV) && (x->img == NULL || !swl_fw_known", "(p->flags & SWT_RV) && (!swl_fw_known")], None),
-    ("run D swl_wr: identity not checked", [("|| !swl_fw_known(x->img_len, x->img_crc) || val != swl_img_word(x, 0)", "|| val != swl_img_word(x, 0)")], None),
-    ("run D swl_wr: value not image word 0", [("|| !swl_fw_known(x->img_len, x->img_crc) || val != swl_img_word(x, 0)))", "|| !swl_fw_known(x->img_len, x->img_crc)))")], None),
-    ("run D pin: always passes", [("if (!swl_fw_known(x->img_len, x->img_crc)) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (0) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
+    ("run D swl_wr: identity not checked", [("|| !swl_fw_known(x->img_len, x->img_crc, x->board) || val != swl_img_word(x, 0)", "|| val != swl_img_word(x, 0)")], None),
+    ("run D swl_wr: value not image word 0", [("|| !swl_fw_known(x->img_len, x->img_crc, x->board) || val != swl_img_word(x, 0)))", "|| !swl_fw_known(x->img_len, x->img_crc, x->board)))")], None),
+    ("run D pin: always passes", [("if (!swl_fw_known(x->img_len, x->img_crc, x->board)) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (0) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
     # --- patch 0147: the identity table swl_fwids[] / swl_fw_known
-    ("fwid: rows mixed", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {", "if (len == swl_fwids[i].len || crc == swl_fwids[i].crc) {")], None),
-    ("fwid: length not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {", "if (crc == swl_fwids[i].crc) {")], None),
-    ("fwid: CRC not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc) {", "if (len == swl_fwids[i].len) {")], None),
+    ("fwid: rows mixed", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc && board", "if ((len == swl_fwids[i].len || crc == swl_fwids[i].crc) && board")], None),
+    ("fwid: length not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc && board", "if (crc == swl_fwids[i].crc && board")], None),
+    ("fwid: CRC not compared", [("if (len == swl_fwids[i].len && crc == swl_fwids[i].crc && board", "if (len == swl_fwids[i].len && board")], None),
     ("fwid: last row skipped", [("for (i = 0; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {", "for (i = 0; i + 1 < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {")], None),
     ("fwid: first row skipped", [("for (i = 0; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {", "for (i = 1; i < sizeof swl_fwids / sizeof swl_fwids[0]; i++) {")], None),
-    ("fwid: always known", [("\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 0;\n}\n\nenum { SWW_CFG = 1", "\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 1;\n}\n\nenum { SWW_CFG = 1")], None),
+    ("fwid: always known", [("\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 0;\n}\n\n/* patch 0154: the board id", "\t\t\treturn 1;\n\t\t}\n\t}\n\treturn 1;\n}\n\n/* patch 0154: the board id")], None),
     ("fwid: another bluejay CRC", [("#define SWW_FW_CRC_BJ   0x1153ccffu", "#define SWW_FW_CRC_BJ   0x1153ccfeu")], None),
     ("fwid: another oriole CRC", [("#define SWW_FW_CRC_OR   0x92567396u", "#define SWW_FW_CRC_OR   0x92567397u")], None),
-    ("fwid: another oriole length row", [("\t{ SWW_FW_LEN_OR, SWW_FW_CRC_OR },", "\t{ SWW_FW_LEN_OR - 1u, SWW_FW_CRC_OR },")], None),
-    ("fwid: another bluejay length row", [("\t{ SWW_FW_LEN_BJ, SWW_FW_CRC_BJ },", "\t{ SWW_FW_LEN_BJ + 4u, SWW_FW_CRC_BJ },")], None),
+    ("fwid: another oriole length row", [("\t{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE },", "\t{ SWW_FW_LEN_OR - 1u, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE },")], None),
+    ("fwid: another bluejay length row", [("\t{ SWW_FW_LEN_BJ, SWW_FW_CRC_BJ, SWW_BOARD_BLUEJAY },", "\t{ SWW_FW_LEN_BJ + 4u, SWW_FW_CRC_BJ, SWW_BOARD_BLUEJAY },")], None),
     # --- patch 0147, review 0129-0132 F1: a config restore only while the link half of the preconditions holds; F5: the state left
     ("F1: config restore without the link check", [("\t\t\tif (lpre) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group %u skipped, link", "\t\t\tif (0) {\n\t\t\t\tprintf(\"SWEET WLAN: restore of group %u skipped, link")], None),
     ("F1: gate on another space", [("if (r->space == SWW_CFG) {      /* patch 0147", "if (r->space == SWW_BAR2) {      /* patch 0147")], None),
@@ -642,6 +799,23 @@ MUTANTS = [
     ("run E W16: ends on the tail window", [("\tSWW_TRY(swl_w84_zero(x));        /* review 0150 F1", "\t(void)0;        /* review 0150 F1")], None),
     ("run E con_out: no line cap", [("if (ch == '\\n' || len == SWW_CON_LINE) {", "if (ch == '\\n') {")], None),   # review 0150 F6
     ("run E con_out: non-printables printed", [("\t\tif (ch >= 0x20 && ch < 0x7F) {", "\t\tif (ch != '\\n') {")], None),
+    # --- patch 0154: review 0150 G3 (the survivors of review 0150-1 F6, now covered), G4 (EQUIVALENT), review 0147 N3 (the identity table bound to the board)
+    ("run E W16: no token/RAM pre-check (X3)", [("\tif (x->tok == 0u || x->ram_bytes < SWW_RAM_MIN) {\n\t\treturn swl_stop(x, SWW_E_STATE);", "\tif (0) {\n\t\treturn swl_stop(x, SWW_E_STATE);")], None),
+    ("run E tuple: middle IOCTL from any IOCTL (X8)", [(".omask = SWW_IOCTL_MASK, .oval = 0x21u, .coff = SWL_AGENT_RESET_CTL", ".coff = SWL_AGENT_RESET_CTL")], None),
+    ("run E window tuple: back to 0 before the release (X9)", [(".oval = SWW_WIN_TAIL, .need = SWF_W15 },", ".oval = SWW_WIN_TAIL, .need = SWF_W14 },")], None),
+    ("run E W17: unaligned console pointer followed (X15)", [("\tif ((x->con & 3u) || x->con < SWW_RAM_BASE", "\tif (x->con < SWW_RAM_BASE")], None),
+    ("run E bp_rd: no disarm on window 0 (X2)", [("\t\tif (want == 0u) {\n\t\t\tx->armed &= ~SWW_RG_W84;\n\t\t}\n", "")], None),
+    ("run E w84_zero: no disarm (X2)", [("\t\tx->w84 = 0;\n\t\tx->armed &= ~SWW_RG_W84;\n", "\t\tx->w84 = 0;\n")], None),
+    ("run E W16 not up: window left for the restore (X11)", [("if (!swl_w84_zero(x) && !swl_win(x, SWW_WIN_CA7WRAP)", "if (!swl_win(x, SWW_WIN_CA7WRAP)")], None),
+    ("run E swl_left: the run E tail branch dropped (G4/Y5)", [('(x->flags & SWF_W15) && x->w84 ? "TAIL WINDOW (run E, restore not armed)" : "0"', '"0"')],
+     "swl_w84_zero runs before every swl_done of W16/W17 and every tail move goes through swl_wr, which arms SWW_RG_W84 first (review 0150-2 G4): at a stop, x->w84 != 0 implies the group is in armed_at_stop, so the branch is never taken"),
+    ("identity: board not compared (N3)", [("&& board == swl_fwids[i].board", "")], None),
+    ("identity: oriole row on the bluejay board (N3)", [("{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_ORIOLE }", "{ SWW_FW_LEN_OR, SWW_FW_CRC_OR, SWW_BOARD_BLUEJAY }")], None),
+    ("identity: W14 pin ignores the board (N3)", [("if (!swl_fw_known(x->img_len, x->img_crc, x->board)) {", "if (!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY)) {")], None),
+    ("identity: reset-vector tuple ignores the board (N3)", [("!swl_fw_known(x->img_len, x->img_crc, x->board) || val", "!swl_fw_known(x->img_len, x->img_crc, x->img_len == SWW_FW_LEN_OR ? SWW_BOARD_ORIOLE : SWW_BOARD_BLUEJAY) || val")], None),   # review 0154 F3: killed by the direct swl_wr case in rund()
+    ("board id: prefix accepted (N3)", [("if (n != b[i].len) {", "if (n > b[i].len) {")], None),
+    ("board id: length ignored (N3)", [("if (n != b[i].len) {\n\t\t\tcontinue;\n\t\t}\n", "")], None),
+    ("board id: NULL followed (N3)", [("\tif (s == NULL) {\n\t\treturn 0;\n\t}\n", "")], None),
 ]
 
 
@@ -671,7 +845,7 @@ def build_and_run(hdr, chip, work):
         cc = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-I" + d, "-o", exe, test], capture_output=True, text=True, timeout=120)
         if cc.returncode != 0:
             return "compile", cc.stderr[-400:]
-        r = run_bounded([exe], d, 120)
+        r = run_bounded([exe], d, 600)          # patch 0159: the run F fault sweep makes the full test about 45 s alone, several times that under 8 parallel mutants
         if r[0] != 0:
             return "fail", r[1]
         res.append(r[1])
@@ -752,7 +926,16 @@ struct sw_hw {
 	uint32_t rv;
 	int rv_ok;
 	int rv_done;
+	int released;
+	uint32_t board;
+	uint8_t *pool;
+	uint64_t pool_pa;
+	int bm;
+	unsigned f_stores;
+	volatile uint32_t *dbi;
 };
+#define SW_CPUHALT 0x20u        /* the glue's define (audit_store_path pins it there) */
+#define SW_F_STORES 96u         /* the glue's define (patch 0159; audit_store_path pins it there) */
 @GLUE@
 static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[0x400000 / 4];
 static uint32_t *const arr[] = { cfg, atu, elbi, iso, mem, tcm };
@@ -777,7 +960,9 @@ int main(void)
 	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
 	static const uint32_t vals[] = { 0xDEADBEEFu, 0u, 0x400000u };
 	static const uint32_t bwins[] = { 0u, 0x400000u, 0x200000u, 0x800000u, 0x18001000u };
-	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0 };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	static uint8_t fakepool[16];
+	static uint32_t dbiw[0x1000 / 4];
 	int bad = 0, acc = 0;
 
 	(void)sw3_rd;
@@ -866,6 +1051,232 @@ int main(void)
 		}
 	}
 	for (int i = 0; i < 4; i++) tcm[i] = 0x10000000u * 6 + (uint32_t)i;
+	/* patch 0154 (review 0150 G1): a CA7 IOCTL value without CPUHALT (0x20) only at stage 3 level 7 and after the reset-vector store (rv_done); such a store latches released;
+	 * after it no BAR2 store at all, while cfg 0x80/0x84, the CA7 RESET_CTL (the restore) and CPUHALT values stay allowed. The SYS_MEM wrapper IOCTL 0x1 neither needs the gate nor latches. */
+	{
+		static const uint32_t iv[] = { 0x1u, 0x3u, 0x0u, 0x21u, 0x23u, 0x20u, 0xFFFFFFDFu, 0x80000001u };
+
+		for (int l3 = 0; l3 < 9; l3++) {
+			for (int rd = 0; rd < 2; rd++) {
+				for (unsigned vi = 0; vi < 8; vi++) {
+					for (int wsel = 0; wsel < 2; wsel++) {
+						uint32_t w = wsel ? SWW_WIN_SMWRAP : SWW_WIN_CA7WRAP;
+						int ca = !wsel, halt = (iv[vi] & 0x20u) != 0;
+
+						hw.l3 = l3; hw.rv_done = rd; hw.released = 0;
+						cfg[0x80 / 4] = w;
+						mem[0x408 / 4] = 0x77777777u;
+						int r = sw3_wr(&hw, SWW_BAR0, w, 0x408, iv[vi]);
+						int want = !ca || halt || (l3 >= 7 && rd);
+						if ((r == 0) != want || (r == 0 ? mem[0x408 / 4] != iv[vi] : mem[0x408 / 4] != 0x77777777u) || hw.released != (r == 0 && ca && !halt)) {
+							if (bad++ < 20) printf("BAD release gate l3 %d rv_done %d win %#x val %#x: ret %d released %d, want accept %d\n", l3, rd, w, iv[vi], r, hw.released, want);
+						}
+						acc += r == 0;
+					}
+				}
+			}
+		}
+		/* the latch: released = 1 refuses every BAR2 store (window 0 from the RAM base, the tail window, the reset vector word) and nothing else changes */
+		for (int rel = 0; rel < 2; rel++) {
+			static const uint32_t bw[] = { 0u, 0x400000u, 0u };
+			static const uint32_t bo[] = { 0x200000u, 0x9FFFCu, 0u };
+
+			for (int i = 0; i < 3; i++) {
+				hw.l3 = 7; hw.rv_ok = 1; hw.rv_done = 0; hw.rv = 0xEA000010u; hw.released = rel;
+				cfg[0x84 / 4] = bw[i];
+				uint32_t keep = tcm[bo[i] / 4];
+				tcm[bo[i] / 4] = 0x77777777u;
+				int r = sw3_wr(&hw, SWW_BAR2, bw[i], bo[i], i == 2 ? 0xEA000010u : 0xDEADBEEFu);
+				if ((r == 0) != !rel || (rel && tcm[bo[i] / 4] != 0x77777777u)) {
+					if (bad++ < 20) printf("BAD latch released %d win %#x off %#x: ret %d\n", rel, bw[i], bo[i], r);
+				}
+				tcm[bo[i] / 4] = keep;
+				acc += r == 0;
+			}
+			hw.released = rel; hw.l3 = 7;
+			cfg[0x84 / 4] = 0x400000u;
+			int r1 = sw3_wr(&hw, SWW_CFG, 0, 0x84, 0u);
+			cfg[0x80 / 4] = SWW_WIN_PCIE;
+			int r2 = sw3_wr(&hw, SWW_CFG, 0, 0x80, SWW_WIN_CA7WRAP);
+			int r3 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_CA7WRAP, 0x800, 1u);
+			int r4 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_CA7WRAP, 0x408, 0x21u);
+			if (r1 || r2 || r3 || r4 || hw.released != rel) {
+				if (bad++ < 20) printf("BAD latch released %d: cfg84 %d cfg80 %d ca7 reset_ctl %d ca7 ioctl 0x21 %d released %d\n", rel, r1, r2, r3, r4, hw.released);
+			}
+			acc += !r1 + !r2 + !r3 + !r4;
+		}
+		hw.released = 0; hw.rv_done = 0; hw.rv_ok = 0; hw.l3 = 0;
+		for (int a = 0; a < 6; a++)
+			for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+	}
+	/* patch 0159 (review 0154 F1): CA7 RESET_CTL with bit 0 clear while the live IOCTL has no CPUHALT is the release by the other route: only at level 7 or above after the reset vector, and it
+	 * latches. With CPUHALT in the live IOCTL (the W6 halt sequence) or with bit 0 set (assert) there is no gate and no latch. The SYS_MEM wrapper is not gated here.
+	 * (review 0154 F2): once released, no store to SYS_MEM or its wrapper passes. */
+	{
+		static const uint32_t liv[] = { 0x21u, 0x23u, 0x20u, 0x1u, 0x3u, 0x0u, 0xFFFFFFDFu };
+		static const uint32_t rcv[] = { 0u, 1u, 2u, 3u };
+
+		for (int l3 = 0; l3 < 10; l3++) {
+			for (int rd = 0; rd < 2; rd++) {
+				for (unsigned li = 0; li < 7; li++) {
+					for (unsigned vi = 0; vi < 4; vi++) {
+						for (int wsel = 0; wsel < 2; wsel++) {
+							uint32_t w = wsel ? SWW_WIN_SMWRAP : SWW_WIN_CA7WRAP;
+							int ca = !wsel, halt = (liv[li] & 0x20u) != 0, out = !(rcv[vi] & 1u);
+
+							hw.l3 = l3; hw.rv_done = rd; hw.released = 0;
+							cfg[0x80 / 4] = w;
+							mem[0x408 / 4] = liv[li];
+							mem[0x800 / 4] = 0x77777777u;
+							int r = sw3_wr(&hw, SWW_BAR0, w, 0x800, rcv[vi]);
+							int want = !ca || !out || halt || (l3 >= 7 && rd);
+							if ((r == 0) != want || mem[0x800 / 4] != (r == 0 ? rcv[vi] : 0x77777777u) || mem[0x408 / 4] != liv[li] || hw.released != (r == 0 && ca && out && !halt)) {
+								if (bad++ < 20) printf("BAD reset_ctl release gate l3 %d rv_done %d win %#x live ioctl %#x val %#x: ret %d released %d, want accept %d\n", l3, rd, w, liv[li], rcv[vi], r, hw.released, want);
+							}
+							acc += r == 0;
+						}
+					}
+				}
+			}
+		}
+		for (int rel = 0; rel < 2; rel++) {
+			hw.l3 = 8; hw.rv_done = 1; hw.released = rel;
+			cfg[0x80 / 4] = SWW_WIN_SMWRAP;
+			mem[0x408 / 4] = 0x77777777u; mem[0x800 / 4] = 0x77777777u;
+			int s1 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_SMWRAP, 0x800, 1u), s2 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_SMWRAP, 0x408, 0x3u);
+			cfg[0x80 / 4] = SWW_WIN_SYSMEM;
+			mem[0x10 / 4] = 0x77777777u;
+			int s3 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_SYSMEM, 0x10, 9u);
+			cfg[0x80 / 4] = SWW_WIN_CA7WRAP;
+			int s4 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_CA7WRAP, 0x800, 1u);           /* the CA7 restore stays possible */
+			if ((s1 == 0) != !rel || (s2 == 0) != !rel || (s3 == 0) != !rel || s4 != 0 || (rel && (mem[0x408 / 4] != 0x77777777u || mem[0x10 / 4] != 0x77777777u))) {
+				if (bad++ < 20) printf("BAD SYS_MEM after release %d: wrapper reset_ctl %d ioctl %d bankidx %d ca7 reset_ctl %d\n", rel, s1, s2, s3, s4);
+			}
+			acc += !s1 + !s2 + !s3 + !s4;
+		}
+		hw.released = 0; hw.rv_done = 0; hw.rv_ok = 0; hw.l3 = 0;
+		for (int a = 0; a < 6; a++)
+			for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+	}
+	/* patch 0160: the root port's Command (space SWW_DBI, word 0x04): only at level 8 after the release, the Status half 0, no bit but memory (0x2) and master (0x4) different from the live
+	 * word, the master bit only with a host pool; no other word of the page; nothing without the page mapped */
+	{
+		static const uint32_t lv[] = { 0x00100000u, 0x00100101u, 0x00100006u, 0x00100002u };
+		static const uint32_t xv[] = { 0x0u, 0x2u, 0x4u, 0x6u, 0x1u, 0x100u, 0x106u, 0x10006u, 0x8u };
+
+		for (int l3 = 0; l3 < 10; l3++) {
+			for (int rel = 0; rel < 2; rel++) {
+				for (int pl = 0; pl < 2; pl++) {
+					for (int mp = 0; mp < 2; mp++) {
+						for (unsigned li = 0; li < 4; li++) {
+							for (unsigned vi = 0; vi < 9; vi++) {
+								for (uint32_t off = 0; off <= 8; off += 4) {
+									uint32_t live = lv[li], v = (live & 0xFFFFu) ^ xv[vi];
+
+									if (vi == 7) v = (live & 0xFFFFu) | 0x10006u;
+									hw.l3 = l3; hw.released = rel; hw.pool = pl ? fakepool : NULL; hw.dbi = mp ? dbiw : NULL; hw.bm = 0;
+									dbiw[0] = 0x11111111u; dbiw[1] = live; dbiw[2] = 0x22222222u;
+									int r = sw3_wr(&hw, SWW_DBI, 0, off, v);
+									int want = l3 >= 8 && rel && mp && off == 4 && (v >> 16) == 0 && ((v ^ live) & 0xFFFFu & ~0x6u) == 0 && (!(v & 4u) || pl);
+									if ((r == 0) != want || dbiw[0] != 0x11111111u || dbiw[2] != 0x22222222u || dbiw[1] != (r == 0 ? v : live) || hw.bm) {
+										if (bad++ < 20) printf("BAD root port l3 %d released %d pool %d mapped %d live %#x off %#x val %#x: ret %d word %#x, want accept %d\n", l3, rel, pl, mp, live, off, v, r, dbiw[1], want);
+									}
+									acc += r == 0;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		hw.released = 0; hw.l3 = 0; hw.pool = NULL; hw.dbi = NULL;
+	}
+	/* patch 0159 (run F): three gates that exist only at stage 3 level 8 after the release.
+	 * EP Command (cfg 0x04): only 0x2 (memory) or 0x6 (memory + master), the latter only with a host pool; the store records the master bit in bm.
+	 * The PCIe core doorbells 0x140 / 0x144: only value 1, only on the live PCIe core window, only while bm is set.
+	 * Chip RAM after the release: at most SW_F_STORES stores, none below level 8. */
+	{
+		static const uint32_t cv[] = { 0x2u, 0x6u, 0x7u, 0x4u, 0x0u, 0x00100006u, 0x00100002u, 0x406u };
+		static const uint32_t dof[] = { 0x140u, 0x144u, 0x148u, 0x13Cu, 0x40u };
+		static const uint32_t dwin[] = { SWW_WIN_PCIE, SWW_WIN_CA7WRAP, SWW_WIN_SYSMEM };
+
+		for (int l3 = 0; l3 < 10; l3++) {
+			for (int rel = 0; rel < 2; rel++) {
+				for (int pl = 0; pl < 2; pl++) {
+					for (unsigned vi = 0; vi < 8; vi++) {
+						for (int bm0 = 0; bm0 < 2; bm0++) {
+							hw.l3 = l3; hw.released = rel; hw.pool = pl ? fakepool : NULL; hw.bm = bm0;
+							cfg[0x04 / 4] = 0x00100002u;
+							int r = sw3_wr(&hw, SWW_CFG, 0, 0x04, cv[vi]);
+							int want = l3 >= 8 && rel && (cv[vi] == 0x2u || (cv[vi] == 0x6u && pl));
+							if ((r == 0) != want || cfg[0x04 / 4] != (r == 0 ? cv[vi] : 0x00100002u) || hw.bm != (r == 0 ? (cv[vi] & 4u) != 0 : bm0)) {
+								if (bad++ < 20) printf("BAD EP Command l3 %d released %d pool %d val %#x bm %d: ret %d cfg %#x bm %d, want accept %d\n", l3, rel, pl, cv[vi], bm0, r, cfg[0x04 / 4], hw.bm, want);
+							}
+							acc += r == 0;
+						}
+					}
+				}
+				for (int bm = 0; bm < 2; bm++) {
+					for (unsigned wi = 0; wi < 3; wi++) {
+						for (int eq = 0; eq < 2; eq++) {
+							for (unsigned oi = 0; oi < 5; oi++) {
+								for (uint32_t v = 0; v < 3; v++) {
+									hw.l3 = l3; hw.released = rel; hw.bm = bm; hw.pool = fakepool;
+									cfg[0x80 / 4] = eq ? dwin[wi] : dwin[wi] ^ 0x1000u;
+									mem[dof[oi] / 4] = 0x77777777u;
+									int r = sw3_wr(&hw, SWW_BAR0, dwin[wi], dof[oi], v);
+									int want = l3 >= 8 && rel && bm && eq && wi == 0 && oi < 2 && v == 1;
+									if ((r == 0) != want || mem[dof[oi] / 4] != (r == 0 ? v : 0x77777777u) || hw.bm != bm) {
+										if (bad++ < 20) printf("BAD doorbell l3 %d released %d bm %d win %#x live-equal %d off %#x val %u: ret %d, want accept %d\n", l3, rel, bm, dwin[wi], eq, dof[oi], v, r, want);
+									}
+									acc += r == 0;
+								}
+							}
+						}
+					}
+				}
+				/* the neighbours of EP Command in config space stay refused (0x00 ids, 0x08 class/revision, 0x0C, 0x10 BAR0), with the values that pass at 0x04 */
+				for (uint32_t co = 0; co <= 0x10; co += 4) {
+					for (uint32_t cvv = 2; cvv <= 6; cvv += 4) {
+						if (co == 0x04) continue;
+						hw.l3 = l3; hw.released = rel; hw.pool = fakepool; hw.bm = 0;
+						uint32_t keep = cfg[co / 4];
+						int r = sw3_wr(&hw, SWW_CFG, 0, co, cvv);
+						if (r == 0 || cfg[co / 4] != keep || hw.bm) {
+							if (bad++ < 20) printf("BAD cfg %#x writable at l3 %d released %d val %#x\n", co, l3, rel, cvv);
+						}
+						cfg[co / 4] = keep;
+					}
+				}
+				/* a Command store without the master bit closes the doorbells again */
+				hw.l3 = l3; hw.released = rel; hw.pool = fakepool; hw.bm = 0;
+				cfg[0x80 / 4] = SWW_WIN_PCIE;
+				int a1 = sw3_wr(&hw, SWW_CFG, 0, 0x04, 0x6u), a2 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_PCIE, 0x140, 1u);
+				int a3 = sw3_wr(&hw, SWW_CFG, 0, 0x04, 0x2u), a4 = sw3_wr(&hw, SWW_BAR0, SWW_WIN_PCIE, 0x140, 1u);
+				int on = l3 >= 8 && rel;
+				if ((a1 == 0) != on || (a2 == 0) != on || (a3 == 0) != on || a4 == 0 || hw.bm != 0) {
+					if (bad++ < 20) printf("BAD doorbell after master off l3 %d released %d: %d %d %d %d bm %d\n", l3, rel, a1, a2, a3, a4, hw.bm);
+				}
+				acc += !a1 + !a2 + !a3;
+				/* chip RAM after the release: exactly SW_F_STORES stores at level 8, none below; before the release the count does not move */
+				hw.l3 = l3; hw.released = rel; hw.f_stores = 0; hw.rv_ok = 0; hw.rv_done = 1;
+				cfg[0x84 / 4] = 0x400000u;
+				int okn = 0;
+				for (int i = 0; i < 100; i++) {
+					uint32_t keep = tcm[0x80054 / 4];
+					okn += sw3_wr(&hw, SWW_BAR2, 0x400000u, 0x80054u, 0x1407u) == 0;
+					tcm[0x80054 / 4] = keep;
+				}
+				if (okn != (rel ? (l3 >= 8 ? 96 : 0) : 100) || hw.f_stores != (unsigned)(rel ? okn : 0)) {
+					if (bad++ < 20) printf("BAD chip-RAM budget l3 %d released %d: %d stores accepted, counter %u\n", l3, rel, okn, hw.f_stores);
+				}
+				acc += okn;
+			}
+		}
+		hw.released = 0; hw.rv_done = 0; hw.rv_ok = 0; hw.l3 = 0; hw.bm = 0; hw.f_stores = 0; hw.pool = NULL;
+		for (int a = 0; a < 6; a++)
+			for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+	}
 	printf("%s accepted %d bad %d\n", bad ? "FAIL" : "PASS", acc, bad);
 	return bad != 0;
 }
@@ -920,7 +1331,7 @@ GLUE_MUTANTS = [
     ("cfg 0x84 only 0", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == 0)")]),
     ("cfg 0x84 only the tail window", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == SWW_WIN_TAIL)")]),
     ("cfg 0x88 writable too", [("(off == SWW_CFG_WIN2 &&", "(off >= SWW_CFG_WIN2 &&")]),
-    ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2) {", "space != SWW_BAR0) {")]),
+    ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2 && space != SWW_DBI) {", "space != SWW_BAR0 && space != SWW_DBI) {")]),      # patch 0160 re-pinned the text: one more space
     ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == 0 && off == 0 && h->l3 >= 6 && h->rv_ok && !h->rv_done && v == h->rv) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
     # patch 0132: the one word at backplane address 0
     ("reset vector: no level gate", [("off == 0 && h->l3 >= 6 && h->rv_ok", "off == 0 && h->rv_ok")]),
@@ -942,6 +1353,58 @@ GLUE_MUTANTS = [
     ("BAR2 compared against the BAR0 window", [("(space == SWW_BAR2 && h->cfg[SWW_CFG_WIN2 / 4] != win)", "(space == SWW_BAR2 && h->cfg[SWW_CFG_WIN / 4] != win)")]),
     ("store past the 4 MiB window", [("off < SWW_TCM_BYTES ? &h->tcm[off / 4]", "off <= SWW_TCM_BYTES ? &h->tcm[off / 4]")]),
     ("unaligned BAR2 store", [("if ((off & 3u) != 0) {\n\t\treturn NULL;", "if ((off & 1u) != 0) {\n\t\treturn NULL;")]),
+    # patch 0154 (review 0150 G1): the release gate and the BAR2 latch
+    ("release gate removed", [("!(v & SW_CPUHALT) && (h->l3 < 7 || !h->rv_done)) {", "0) {")]),
+    ("release allowed at level 6", [("(h->l3 < 7 || !h->rv_done)", "(h->l3 < 6 || !h->rv_done)")]),
+    ("release without the reset vector", [("(h->l3 < 7 || !h->rv_done)", "(h->l3 < 7)")]),
+    ("release gate on the CPUHALT values too", [("!(v & SW_CPUHALT) && (h->l3 < 7", "(h->l3 < 7")]),
+    ("release gate on any wrapper", [("if (space == SWW_BAR0 && win == SWW_WIN_CA7WRAP && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT) && (h->l3", "if (space == SWW_BAR0 && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT) && (h->l3")]),
+    ("latch never set", [("\t\th->released = 1;\n", "")]),
+    ("latch ignored", [("if (space == SWW_BAR2 && h->released && !(f && h->f_stores < SW_F_STORES)) {", "if (0) {")]),      # patch 0159 re-pinned the text: the level 8 exception was added
+    ("latch set by the SYS_MEM wrapper too", [("if (space == SWW_BAR0 && win == SWW_WIN_CA7WRAP && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT)) {", "if (space == SWW_BAR0 && off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT)) {")]),
+    ("latch set by the CPUHALT values too", [("off == SWL_AGENT_IOCTL && !(v & SW_CPUHALT)) {\n\t\th->released = 1;", "off == SWL_AGENT_IOCTL) {\n\t\th->released = 1;")]),
+    ("latch blocks every store", [("if (space == SWW_BAR2 && h->released && !(f && h->f_stores < SW_F_STORES)) {", "if (h->released && !(f && h->f_stores < SW_F_STORES)) {")]),
+    # patch 0159 (review 0154 F1/F2): the RESET_CTL release route and SYS_MEM after the release
+    ("reset_ctl release gate removed", [("\t\t\tif (h->l3 < 7 || !h->rv_done) {\n\t\t\t\treturn -1;\n\t\t\t}\n", "")]),
+    ("reset_ctl release at level 6", [("\t\t\tif (h->l3 < 7 || !h->rv_done) {", "\t\t\tif (h->l3 < 6 || !h->rv_done) {")]),
+    ("reset_ctl release without the reset vector", [("\t\t\tif (h->l3 < 7 || !h->rv_done) {", "\t\t\tif (h->l3 < 7) {")]),
+    ("reset_ctl release does not latch", [("\t\t\t\treturn -1;\n\t\t\t}\n\t\t\th->released = 1;\n", "\t\t\t\treturn -1;\n\t\t\t}\n")]),
+    ("reset_ctl gate ignores the live IOCTL", [("\t\tif (!(io & SW_CPUHALT)) {", "\t\tif (!(io | 1u)) {")]),
+    ("reset_ctl gate on the halted core too", [("\t\tif (!(io & SW_CPUHALT)) {", "\t\tif (!(io & 0u)) {")]),
+    ("reset_ctl gate on the assert too", [("off == SWL_AGENT_RESET_CTL && !(v & 1u)) {", "off == SWL_AGENT_RESET_CTL) {")]),
+    ("reset_ctl gate on the SYS_MEM wrapper too", [("if (space == SWW_BAR0 && win == SWW_WIN_CA7WRAP && off == SWL_AGENT_RESET_CTL && !(v & 1u)) {", "if (space == SWW_BAR0 && off == SWL_AGENT_RESET_CTL && !(v & 1u)) {")]),
+    ("SYS_MEM stores pass after the release", [("if (space == SWW_BAR0 && h->released && (win == SWW_WIN_SYSMEM || win == SWW_WIN_SMWRAP)) {", "if (0) {")]),
+    ("only the SYS_MEM wrapper refused after the release", [("h->released && (win == SWW_WIN_SYSMEM || win == SWW_WIN_SMWRAP)", "h->released && (win == SWW_WIN_SMWRAP)")]),
+    ("only SYS_MEM refused after the release", [("h->released && (win == SWW_WIN_SYSMEM || win == SWW_WIN_SMWRAP)", "h->released && (win == SWW_WIN_SYSMEM)")]),
+    ("every BAR0 store refused after the release", [("h->released && (win == SWW_WIN_SYSMEM || win == SWW_WIN_SMWRAP)", "h->released")]),
+    ("SYS_MEM refused before the release too", [("if (space == SWW_BAR0 && h->released && (win == SWW_WIN_SYSMEM", "if (space == SWW_BAR0 && (win == SWW_WIN_SYSMEM")]),
+    # patch 0160: the root port's Command
+    ("root port without the run F gate", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD", "if (space == SWW_DBI && !(off == SWW_CFG_CMD")]),
+    ("root port: any word of the page", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL", "if (space == SWW_DBI && !(f && h->dbi != NULL"), ("return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;", "return h->dbi != NULL && off < 0x1000 ? &h->dbi[off / 4] : NULL;")]),
+    ("root port: Status half written", [(" && (v >> 16) == 0 && ((v ^ h->dbi", " && ((v ^ h->dbi")]),
+    ("root port: any Command bit may change", [(" && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0", "")]),
+    ("root port: the IO bit may change too", [("& 0xFFFFu & ~SWW_CMD_MEM_BM) == 0", "& 0xFFFFu & ~(SWW_CMD_MEM_BM | 0x1u)) == 0")]),
+    ("root port: master without a pool", [(" && (!(v & 0x4u) || h->pool != NULL))) {", "))) {")]),
+    ("root port: space refused", [("space != SWW_BAR0 && space != SWW_BAR2 && space != SWW_DBI) {", "space != SWW_BAR0 && space != SWW_BAR2) {")]),
+    # patch 0159 (run F): the level 8 gates
+    ("run F gates open at level 7", [("f = h->l3 >= 8 && h->released;", "f = h->l3 >= 7 && h->released;")]),
+    ("run F gates open before the release", [("f = h->l3 >= 8 && h->released;", "f = h->l3 >= 8;")]),
+    ("EP Command without the run F gate", [("!(off == SWW_CFG_CMD && f && (v ==", "!(off == SWW_CFG_CMD && (v ==")]),
+    ("EP Command any value", [("(v == SWW_CMD_MEM || (v == SWW_CMD_MEM_BM && h->pool != NULL))", "1")]),
+    ("EP Command: bus master without a pool", [("(v == SWW_CMD_MEM_BM && h->pool != NULL)", "(v == SWW_CMD_MEM_BM)")]),
+    ("EP Command: memory-only refused (no way to switch bus master off)", [("(v == SWW_CMD_MEM || (v == SWW_CMD_MEM_BM", "((v == SWW_CMD_MEM_BM")]),
+    ("EP Command: any even value", [("(v == SWW_CMD_MEM || ", "((v & 1u) == 0 || ")]),
+    ("cfg 0x08 writable too", [("!(off == SWW_CFG_CMD && f", "!(off <= SWW_CFG_CMD + 4u && off >= SWW_CFG_CMD && f")]),
+    ("doorbell without bus master", [("!(f && h->bm && win == SWW_WIN_PCIE", "!(f && win == SWW_WIN_PCIE")]),
+    ("doorbell without the run F gate", [("!(f && h->bm && win == SWW_WIN_PCIE", "!(h->bm && win == SWW_WIN_PCIE")]),
+    ("doorbell any value", [("(off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) && v == 1u)", "(off == SWW_DB_H2D || off == SWW_DB_HOSTRDY))")]),
+    ("doorbell on any window", [("h->bm && win == SWW_WIN_PCIE && (off", "h->bm && (off"), ("(off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) ? win == SWW_WIN_PCIE :", "(off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) ? 1 :")]),
+    ("doorbell neighbours writable", [("(off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) && v == 1u)", "(off >= SWW_DB_H2D - 4u && off <= SWW_DB_HOSTRDY + 4u) && v == 1u)"), ("(off == SWW_DB_H2D || off == SWW_DB_HOSTRDY) ? win", "(off >= SWW_DB_H2D - 4u && off <= SWW_DB_HOSTRDY + 4u) ? win")]),
+    ("master bit never recorded", [("h->bm = (v & 0x4u) != 0;", "h->bm = 0;")]),
+    ("master bit never cleared", [("h->bm = (v & 0x4u) != 0;", "h->bm = 1;")]),
+    ("chip-RAM budget removed", [("!(f && h->f_stores < SW_F_STORES)", "!(f)")]),
+    ("chip-RAM budget never counted", [("\tif (space == SWW_BAR2 && h->released) {\n\t\th->f_stores++;\n\t}\n", "")]),
+    ("chip-RAM budget one more", [("h->f_stores < SW_F_STORES", "h->f_stores <= SW_F_STORES")]),
 ]
 
 
@@ -976,6 +1439,21 @@ class WlanWrMutants(unittest.TestCase):
     def test_store_path_audit_is_clean_on_the_patch(self):
         self.assertEqual(audit_store_path(final_header(), glue_added_lines()), [])
 
+    def test_board_glue_is_pinned(self):
+        g = glue_after()
+        self.assertEqual(audit_board_glue(g), [])
+        for old, new, why in (
+            ('SecureDTLookupEntry(NULL, "/", &root)', 'SecureDTLookupEntry(NULL, "/sweet-wlan", &root)', "root model-number"),
+            ('"model-number"', '"model"', "root model-number"),
+            ("? swl_board_id(mn, mnsz) : 0;", "? SWW_BOARD_ORIOLE : 0;", "root model-number"),
+            ("if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {", "if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, SWW_BOARD_ORIOLE)) {", "withheld"),
+            ("if (level >= 4 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {", "if (level >= 6 && x.img != NULL && !swl_fw_known(sw_fw.len, sw_fw.crc, hw->board)) {", "withheld"),
+            ("\tx.board = hw->board;\n", "\n", "x.board"),
+        ):
+            self.assertIn(old, g)
+            got = audit_board_glue(g.replace(old, new, 1))
+            self.assertTrue(any(why in m for m in got), "%s -> %s not caught: %s" % (old, new, got))
+
     def test_store_path_audit_fails_on_a_hostile_corpus(self):
         hdr = final_header()
         glue = glue_added_lines()
@@ -991,7 +1469,15 @@ class WlanWrMutants(unittest.TestCase):
             (hdr, glue.replace("*p = v;", "*p = v;\n\th->cfg[1] = 6;"), "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_x(struct sw_hw *h) { h->atu[0x101] = 0; }\n", "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_q(volatile uint32_t *q) { q[0] = 1; }\n", "assignment outside the allowlist"),
-            (hdr, glue.replace("(space == SWW_CFG && off != SWW_CFG_WIN && !(off == SWW_CFG_WIN2 && (v == 0 || v == SWW_WIN_TAIL))) || ", ""), "sw3_wr does not limit the offsets to the table's"),
+            (hdr, glue.replace("(space == SWW_CFG && off != SWW_CFG_WIN && !(off == SWW_CFG_WIN2", "(space == SWW_CFG && !(off == SWW_CFG_WIN2"), "sw3_wr does not limit the offsets to the table's"),     # patch 0159 re-pinned: the clause got the EP Command term
+            # patch 0159 (run F): the level 8 gates of sw3_wr
+            (hdr, glue.replace("f = h->l3 >= 8 && h->released;", "f = h->l3 >= 7 && h->released;"), "sw3_wr does not limit EP Command"),
+            (hdr, glue.replace("(v == SWW_CMD_MEM_BM && h->pool != NULL)", "(v == SWW_CMD_MEM_BM)"), "sw3_wr does not limit EP Command"),
+            (hdr, glue.replace("!(f && h->bm && win == SWW_WIN_PCIE", "!(f && win == SWW_WIN_PCIE"), "sw3_wr does not limit the doorbells"),
+            (hdr, glue.replace("h->bm = (v & 0x4u) != 0;", "h->bm = 1;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("#define SW_F_STORES 96u", "#define SW_F_STORES 4096u"), "sw3_wr does not bound the chip-RAM stores"),
+            (hdr, glue.replace("if (space == SWW_BAR2 && h->released && !(f && h->f_stores < SW_F_STORES)) {", "if (space == SWW_BAR2 && h->released && !f) {"), "sw3_wr has no release gate"),
+            (hdr, glue.replace("\tflush_dcache64((addr64_t)(h->pool_pa + off), len, TRUE);", "\tflush_dcache64((addr64_t)(h->pool_pa + off), len, TRUE);\n\th->cfg[1] = 6;"), "assignment outside the allowlist"),
             (hdr, glue.replace("SWW_LAST_HI_MAX", "SWW_TCM_BYTES"), "sw3_wr does not limit BAR2 and cfg 0x84 to the table's"),
             (hdr, glue.replace("(win == 0 && off >= SWW_RAM_BASE)", "(win == 0)"), "sw3_wr does not limit BAR2 and cfg 0x84 to the table's"),
             (hdr, glue.replace('"FW  "', '"NVRM"'), "sw_fw_note does not pick the FW entry by its tag"),

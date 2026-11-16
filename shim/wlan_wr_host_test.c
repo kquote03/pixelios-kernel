@@ -62,6 +62,19 @@ struct fake {
 	const char *con_txt, *con_more;
 	unsigned bar2_stores_after_rel;                 /* BAR2 stores that reached the bus after the release (must stay 0) */
 	unsigned cfg04_writes;
+	/* patch 0159 (run F): a fake msgbuf firmware. With mb set, fw_place() also writes ring_info, the ring memory table and zeroed index arrays; a store of 1 to the H2D doorbell (bus master on)
+	 * makes it consume the control-submit items from the host pool and write ACK + completion + answer back into the pool. Host addresses outside the pool are counted in oob and not followed. */
+	int mb, fw_mute, fw_extra, fw_guard, bm_stuck, idx_dirty;
+	uint32_t rc_cmd; unsigned rc_writes; int rc_stuck, rc_dead;   /* patch 0160: the root port's Command/Status word (DBI 0x04) */
+	int fw_late, ri_host;                           /* review 0159-1: the completion items arrive one delay after the index; a non-zero host index-buffer word in ring_info */
+	uint32_t fw_cmd_xor;
+	struct { uint8_t *at; uint8_t b[24]; } late[8]; unsigned nlate;
+	uint8_t *pool;
+	uint64_t pool_pa;
+	uint32_t ri, ringmem, hw, hr, dw, dr, maxsub, maxcpl;
+	uint32_t fw_bad_w, fw_len, fw_trans_xor, fw_status, fw_id_xor, fw_hr_bad;
+	unsigned ndb0, nrdy, oob, nsync, db_nobm, fw_items, bm_on_at_db;
+	uint64_t resp_pa; uint32_t resp_len, resp_id; int have_resp;
 };
 
 static uint32_t *f_wrap(struct fake *f, uint32_t win)
@@ -94,6 +107,9 @@ static int f_rd(void *c, int space, uint32_t win, uint32_t off, uint32_t *v)
 	case SWW_ELBI:
 		*v = f->ltssm;
 		return off == 0x2C8 ? 0 : -1;
+	case SWW_DBI:                                   /* patch 0160: only the Command/Status word exists */
+		*v = f->rc_dead ? 0xFFFFFFFFu : f->rc_cmd;
+		return off == 0x04 ? 0 : -1;
 	case SWW_ISO:
 		*v = f->iso;
 		return off == 0 ? 0 : -1;
@@ -133,6 +149,93 @@ static int f_rd(void *c, int space, uint32_t win, uint32_t off, uint32_t *v)
 	return -1;
 }
 
+/* ---- patch 0159: the fake msgbuf firmware (synthetic; layouts as docs/research/51 s.3) ---- */
+static uint8_t *fw_hp(struct fake *f, uint64_t pa, uint32_t len)        /* a host address the firmware would DMA to: only inside the pool, else counted */
+{
+	if (f->pool == 0 || pa < f->pool_pa || pa - f->pool_pa > SWM_POOL_LEN || len > SWM_POOL_LEN - (pa - f->pool_pa)) {
+		f->oob++;
+		return 0;
+	}
+	return f->pool + (pa - f->pool_pa);
+}
+
+static uint32_t g16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
+static uint32_t g32(const uint8_t *p) { return g16(p) | g16(p + 2) << 16; }
+static void p16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void p32(uint8_t *p, uint32_t v) { p16(p, v); p16(p + 2, v >> 16); }
+
+static uint64_t fw_ringbase(struct fake *f, unsigned i, uint32_t *depth, uint32_t *item)
+{
+	uint32_t e = f->ringmem + 16u * i;
+
+	*depth = f->ram[(e + 4) / 4] & 0xFFFFu;
+	*item = f->ram[(e + 4) / 4] >> 16;
+	return (uint64_t)f->ram[(e + 8) / 4] | (uint64_t)f->ram[(e + 12) / 4] << 32;
+}
+
+static void fw_cpl(struct fake *f, uint32_t typ, uint32_t id, uint32_t status, uint32_t rlen, uint32_t trans, uint32_t cmd)     /* one 24-byte item into the D2H control-complete ring */
+{
+	uint32_t depth, item, w = f->ram[f->dw / 4] & 0xFFFFu;
+	uint64_t base = fw_ringbase(f, 2, &depth, &item);
+	uint8_t *c;
+
+	if (depth == 0 || item != 24 || w >= depth || (c = fw_hp(f, base + (uint64_t)w * item, item)) == 0)
+		return;
+	if (f->fw_late && f->nlate < 8) {              /* the index moves now, the item bytes reach host memory at the next delay */
+		f->late[f->nlate].at = c;
+		c = f->late[f->nlate++].b;
+	}
+	memset(c, 0, 24);
+	c[0] = (uint8_t)typ;
+	p32(c + 4, id); p16(c + 8, status); p16(c + 12, rlen); p16(c + 14, trans); p32(c + 16, cmd);
+	f->ram[f->dw / 4] = f->fw_bad_w ? f->fw_bad_w : (w + 1) % depth;
+}
+
+static void fw_msgbuf(struct fake *f)
+{
+	static const uint8_t mac[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+	static const char ver[] = "wl0:\x01 Jan  1 2026 00:00:00 version 99.9.9\x7f (synthetic) FWID 01-abcdef\n second line";      /* two bytes that must not reach the log */
+	uint32_t depth, item, r, w, rl;
+	uint64_t base, qpa;
+	uint8_t *it, *q, *a;
+
+	if (!f->mb || !f->ram || !(f->cmd & 4u) || !(f->rc_cmd & 4u))   /* no bus master on the endpoint or on the root port above it: the chip cannot read or write host memory */
+		return;
+	f->bm_on_at_db++;
+	base = fw_ringbase(f, 0, &depth, &item);
+	if (depth == 0 || item != 40)
+		return;
+	r = f->ram[f->hr / 4] & 0xFFFFu;
+	w = f->ram[f->hw / 4] & 0xFFFFu;
+	while (r != w && r < depth && w < depth) {
+		it = fw_hp(f, base + (uint64_t)r * item, item);
+		if (it == 0)
+			break;
+		f->fw_items++;
+		if (it[0] == 0x0B) {
+			f->resp_id = g32(it + 4); f->resp_len = g16(it + 8); f->resp_pa = (uint64_t)g32(it + 16) | (uint64_t)g32(it + 20) << 32; f->have_resp = 1;
+		} else if (it[0] == 0x09 && !f->fw_mute) {
+			qpa = (uint64_t)g32(it + 24) | (uint64_t)g32(it + 28) << 32;
+			q = fw_hp(f, qpa, g16(it + 14));
+			a = f->have_resp ? fw_hp(f, f->resp_pa, f->resp_len) : 0;
+			rl = 0;
+			if (q && a && g32(it + 8) == 262) {
+				if (strcmp((const char *)q, "cur_etheraddr") == 0) { memcpy(a, mac, 6); rl = 6; }
+				else if (strcmp((const char *)q, "ver") == 0) { memcpy(a, ver, sizeof ver); rl = sizeof ver; }
+			}
+			if (f->fw_extra)
+				fw_cpl(f, 0x01, 0, 0, 0, 0, 0);                                         /* a general status item first */
+			fw_cpl(f, 0x0A, g32(it + 4), 0, 0, g16(it + 12), g32(it + 8));
+			fw_cpl(f, 0x0C, f->resp_id ^ f->fw_id_xor, q && a && rl ? f->fw_status : 1, f->fw_len ? f->fw_len : rl, g16(it + 12) ^ f->fw_trans_xor, g32(it + 8) ^ f->fw_cmd_xor);
+			f->have_resp = 0;
+			if (f->fw_guard)
+				f->pool[0x0A00] = 0x11;                                                /* a stray write into the gap after the control-submit ring */
+		}
+		r = (r + 1) % depth;
+	}
+	f->ram[f->hr / 4] = f->fw_hr_bad ? f->fw_hr_bad : r;
+}
+
 static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 {
 	struct fake *f = c;
@@ -157,6 +260,13 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 		return 0;
 	if (f->corrupt_at == f->nw)
 		v ^= 1u;
+	if (space == SWW_DBI) { f->rc_writes++; if (off != 0x04) return -1; if (!f->rc_stuck) f->rc_cmd = (f->rc_cmd & 0xFFFF0000u) | (v & 0xFFFFu); return 0; }
+	if (space == SWW_CFG && off == 0x04) { if (!f->bm_stuck) f->cmd = (f->cmd & 0xFFFF0000u) | (v & 0xFFFFu); return 0; }
+	if (space == SWW_BAR0 && f->win0 == SWW_WIN_PCIE && (off == 0x140 || off == 0x144)) {
+		if (!(f->cmd & 4u)) f->db_nobm++;
+		if (off == 0x144) f->nrdy++; else { f->ndb0++; fw_msgbuf(f); }
+		return 0;
+	}
 	if (space == SWW_CFG && off == SWW_CFG_WIN) { if (!f->win_stuck) f->win0 = v; return 0; }
 	if (space == SWW_CFG && off == SWW_CFG_WIN2) { if (!f->win2_stuck || f->nw < f->win2_stuck) f->win2 = v; return 0; }
 	if (space == SWW_BAR2 && f->ram) {
@@ -247,6 +357,20 @@ static void fw_place(struct fake *f)
 		if (f->con_txt && f->fw_size && f->fw_buf >= SWW_RAM_BASE && f->fw_buf + f->fw_size <= 0x600000u)
 			fw_ring(f, 0, f->con_txt);
 	}
+	if (f->mb) {                                    /* patch 0159: ring_info, the ring memory table, zeroed index arrays (synthetic addresses in the tail window and window 0) */
+		uint32_t k;
+
+		f->ram[f->fw_shared / 4 + 12] = f->ri;
+		for (k = 0; k < 15; k++) f->ram[f->ri / 4 + k] = 0;
+		f->ram[f->ri / 4 + 0] = f->ringmem; f->ram[f->ri / 4 + 1] = f->hw; f->ram[f->ri / 4 + 2] = f->hr; f->ram[f->ri / 4 + 3] = f->dw; f->ram[f->ri / 4 + 4] = f->dr;
+		f->ram[f->ri / 4 + 13] = 40u | f->maxsub << 16; f->ram[f->ri / 4 + 14] = f->maxcpl;
+		for (k = 0; k < 20; k++) f->ram[f->ringmem / 4 + k] = 0;
+		for (k = 0; k < f->maxsub && k < 64; k++) { f->ram[f->hw / 4 + k] = 0; f->ram[f->hr / 4 + k] = 0; }
+		for (k = 0; k < f->maxcpl && k < 64; k++) { f->ram[f->dw / 4 + k] = 0; f->ram[f->dr / 4 + k] = 0; }
+		if (f->ri_host) f->ram[f->ri / 4 + f->ri_host] = 0x8u;       /* a host index-buffer address word the firmware left set */
+		if (f->idx_dirty) f->ram[f->hw / 4] = 0x00010000u;      /* an index slot whose upper half is not 0 */
+		f->ram[(f->fw_shared + 0x54) / 4] = 0; f->ram[(f->fw_shared + 0x70) / 4] = 0;
+	}
 	f->ram[f->fw_last / 4] = f->fw_ptr;
 }
 
@@ -256,6 +380,7 @@ static void f_delay(void *c, unsigned us)
 	uint32_t *wp = f_wrap(f, f->win0);
 
 	f->clock_us += us;
+	while (f->nlate) { f->nlate--; memcpy(f->late[f->nlate].at, f->late[f->nlate].b, 24); }
 	if (f->released && f->fw_up && !f->fw_placed && f->clock_us - f->rel_t >= f->fw_up)
 		fw_place(f);
 	if (f->released && f->down_after && f->clock_us - f->rel_t >= f->down_after)
@@ -279,6 +404,7 @@ static void obs(struct fake *f)
 	unsigned i;
 
 	memset(f, 0, sizeof *f);
+	f->rc_cmd = 0x00100000u;                       /* synthetic: capabilities bit in Status, Command 0 (the shim never writes it) */
 	f->cmd = 0x00100002; f->bar0lo = 0x60000004; f->bar2lo = SWW_BAR2_CFG; f->win0 = 0x18123000; f->c88 = 0x00080080;
 	f->iso = 1; f->ltssm = 0x0300a911;
 	memcpy(f->a0, a0, sizeof a0);
@@ -296,11 +422,14 @@ static void bus(struct swl_wbus *b, struct fake *f)
 	b->rd = f_rd; b->wr = f_wr; b->map2 = f_map2; b->delay_us = f_delay; b->ctx = f;
 }
 
+static uint32_t tboard = SWW_BOARD_BLUEJAY;             /* patch 0154 (review 0147 N3): the board every run is made for (the glue takes it from the ADT model-number) */
+
 static void mkx(struct swl_wx *x, struct swl_wbus *b, int level)
 {
 	memset(x, 0, sizeof *x);
 	x->b = b;
 	x->level = level;
+	x->board = tboard;
 }
 
 static int run(struct fake *f, struct swl_wx *x, int level)
@@ -1724,7 +1853,7 @@ static void runc_deny_sweep(void)
 			CHECK(((swl_wt[v].flags & SWT_TW) != 0) == (v >= SWT_NV_VARS && v <= SWT_NV_RTLV) && (!(swl_wt[v].flags & SWT_TW) || (swl_wt[v].kind >= SWK_VARS && swl_wt[v].kind <= SWK_RTLV)) &&
 			      (!!(swl_wt[v].flags & SWT_TW) || swl_wt[v].kind == 0));
 	}
-	CHECK(SWT_N == 34 && SWT_N_D == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
+	CHECK(SWT_N == 42 && SWT_N_D == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
 }
 
 /* the stores that reached the bus other than the restore of cfg 0x84 (a refused store with the window moved runs that restore) */
@@ -2040,7 +2169,7 @@ static void rund(void)
 	mkimg(len);
 	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
 	forge(imgbuf, len, pin);
-	CHECK(tcrc(imgbuf, len) == pin && swl_fw_known(len, pin) && SWW_FW_LEN_BJ == 1764018u && SWW_FW_CRC_BJ == 0x1153ccffu && SWW_FW_LEN_OR == SWW_IMG_MAX && SWW_IMG_MAX == 1764091u);
+	CHECK(tcrc(imgbuf, len) == pin && swl_fw_known(len, pin, SWW_BOARD_BLUEJAY) && SWW_FW_LEN_BJ == 1764018u && SWW_FW_CRC_BJ == 0x1153ccffu && SWW_FW_LEN_OR == SWW_IMG_MAX && SWW_IMG_MAX == 1764091u);
 	w0 = iw(0);
 	CHECK(w0 == 0xEA000010u && w0 != PAT);
 	cx_hand(336);
@@ -2049,6 +2178,11 @@ static void rund(void)
 	CHECK(runc(&g, &x, 5, len, pin) == 0 && x.flags == CLEVEL5 && ramarr[0] == PAT && x.w14_old == 0 && strstr(logbuf, "w14") == 0 && strstr(logbuf, "W14") == 0 && strstr(logbuf, "level 5 done vars=12") != 0);
 	n5 = g.nw;
 	sf = g; sx = x; memcpy(sram, ramarr, sizeof ramarr);
+	/* review 0154 F3: the SWT_RV clause itself is board-bound: a direct store of image word 0 at backplane 0 with the other board in x.board is refused and stores nothing
+	 * (the step functions would stop earlier at swl_fw_pin; this pins the board term of swl_wr's own check) */
+	x.board = SWW_BOARD_ORIOLE;
+	x.level = 6;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && g.nw == n5 && ramarr[0] == PAT && x.stopped);
 	/* level 6, the whole run: one more store than level 5, the first dword of the image at address 0 */
 	obsb(&f, 336);
 	CHECK(runc(&f, &x, 6, len, pin) == 0);
@@ -2168,7 +2302,7 @@ static void rund(void)
 	rd_put(&f, &x);
 	imgbuf[100] ^= 1;
 	x.img_crc = tcrc(imgbuf, len);
-	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764018 bytes crc") != 0 && strstr(logbuf, "is not a pinned identity (1764018 B 0x1153ccff or 1764091 B 0x92567396)") != 0);
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764018 bytes crc") != 0 && strstr(logbuf, "is not a pinned identity (1764018 B 0x1153ccff bluejay or 1764091 B 0x92567396 oriole)") != 0);
 	/* the pin before the first store of the run: a consistent image of another length or content stops at the early check, no read, no store, nothing armed (review 0130 finding 8) */
 	obsb(&f, 336);
 	CHECK(runc(&f, &x, 6, len, tcrc(imgbuf, len)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && x.row == 14 && x.restore == SWW_RS_NONE && x.armed == 0 && x.rb == 0);
@@ -2185,11 +2319,11 @@ static void rund(void)
 	forge(imgbuf, len - 4u, pin);
 	CHECK(tcrc(imgbuf, len - 4u) == pin);
 	obsb(&f, 336);
-	CHECK(runc(&f, &x, 6, len - 4u, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not a pinned identity") != 0);
+	CHECK(runc(&f, &x, 6, len - 4u, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff board 1 is not a pinned identity") != 0);
 	rd_put(&f, &x);
 	x.img_len = len - 4u;
 	x.img_crc = pin;
-	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not a pinned identity") != 0);
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff board 1 is not a pinned identity") != 0);
 	keep = imglen;
 	mkimg(66);
 	obsb(&f, 336);
@@ -2216,10 +2350,20 @@ static void fwid(void)
 	const uint32_t len = 1764091u, pin = 0x92567396u;
 	uint32_t w0, n5;
 
-	CHECK(swl_fw_known(1764018u, 0x1153ccffu) && swl_fw_known(1764091u, 0x92567396u));
-	CHECK(!swl_fw_known(1764018u, 0x92567396u) && !swl_fw_known(1764091u, 0x1153ccffu));         /* rows are not mixed */
-	CHECK(!swl_fw_known(1764090u, pin) && !swl_fw_known(1764092u, pin) && !swl_fw_known(1764017u, 0x1153ccffu) && !swl_fw_known(1764019u, 0x1153ccffu));
-	CHECK(!swl_fw_known(len, pin ^ 1u) && !swl_fw_known(len, pin ^ 0x80000000u) && !swl_fw_known(0, 0) && !swl_fw_known(len, 0) && !swl_fw_known(0, pin));
+	const uint32_t BJ = SWW_BOARD_BLUEJAY, OR = SWW_BOARD_ORIOLE;
+
+	CHECK(swl_fw_known(1764018u, 0x1153ccffu, BJ) && swl_fw_known(1764091u, 0x92567396u, OR));
+	CHECK(!swl_fw_known(1764018u, 0x92567396u, BJ) && !swl_fw_known(1764091u, 0x1153ccffu, OR) && !swl_fw_known(1764018u, 0x92567396u, OR) && !swl_fw_known(1764091u, 0x1153ccffu, BJ));  /* rows are not mixed */
+	CHECK(!swl_fw_known(1764090u, pin, OR) && !swl_fw_known(1764092u, pin, OR) && !swl_fw_known(1764017u, 0x1153ccffu, BJ) && !swl_fw_known(1764019u, 0x1153ccffu, BJ));
+	CHECK(!swl_fw_known(len, pin ^ 1u, OR) && !swl_fw_known(len, pin ^ 0x80000000u, OR) && !swl_fw_known(0, 0, 0) && !swl_fw_known(len, 0, OR) && !swl_fw_known(0, pin, OR));
+	/* patch 0154 (review 0147 N3): an identity counts only on its own board; board 0 (unknown) and any other id pin nothing */
+	CHECK(!swl_fw_known(1764018u, 0x1153ccffu, OR) && !swl_fw_known(1764091u, 0x92567396u, BJ) && !swl_fw_known(1764018u, 0x1153ccffu, 0) && !swl_fw_known(1764091u, 0x92567396u, 0));
+	CHECK(!swl_fw_known(1764091u, 0x92567396u, 3u) && !swl_fw_known(1764091u, 0x92567396u, 0xFFFFFFFFu) && BJ != OR && BJ != 0 && OR != 0);
+	/* swl_board_id: the exact model-number strings with their NUL, nothing else */
+	CHECK(swl_board_id("bluejay", 8) == BJ && swl_board_id("oriole", 7) == OR);
+	CHECK(swl_board_id("oriole", 6) == 0 && swl_board_id("bluejay", 7) == 0 && swl_board_id("oriolex", 8) == 0 && swl_board_id("orio", 5) == 0 && swl_board_id("raven", 6) == 0);
+	CHECK(swl_board_id("Oriole", 7) == 0 && swl_board_id("", 1) == 0 && swl_board_id(0, 7) == 0 && swl_board_id("oriole", 0) == 0 && swl_board_id("bluejay\0\0", 9) == 0);
+	tboard = OR;
 	CHECK(SWW_IMG_MAX == len && SWW_IMG_MAXW == 441023u && SWW_IMG_END == 0x3AEAFCu && SWW_IMG_END <= SWW_WIN_TAIL && SWW_RAM_MIN == 1791299u && SWW_RAM_MIN <= 0x2A0000u);
 	/* the oriole-sized image with the oriole CRC (synthetic bytes, forged CRC, no firmware byte) runs level 6 to the end on the observed RAM (336 x 8 KiB, ram_end 0x4a0000) */
 	cx_init_rng();
@@ -2238,15 +2382,39 @@ static void fwid(void)
 	/* the same bytes with a CRC one bit off the pin: consistent container (forged), not an identity -> no store at level 6 */
 	forge(imgbuf, len, pin ^ 1u);
 	obsb(&f, 336);
-	CHECK(runc(&f, &x, 6, len, pin ^ 1u) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764091 bytes crc 0x92567397 is not a pinned identity") != 0);
+	CHECK(runc(&f, &x, 6, len, pin ^ 1u) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764091 bytes crc 0x92567397 board 2 is not a pinned identity") != 0);
 	/* the oriole length with the bluejay CRC (a mixed row) -> no store */
 	forge(imgbuf, len, 0x1153ccffu);
 	obsb(&f, 336);
-	CHECK(runc(&f, &x, 6, len, 0x1153ccffu) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764091 bytes crc 0x1153ccff is not a pinned identity") != 0);
+	CHECK(runc(&f, &x, 6, len, 0x1153ccffu) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764091 bytes crc 0x1153ccff board 2 is not a pinned identity") != 0);
+	/* patch 0154 (review 0147 N3): the oriole identity on a bluejay board, on board 0 (no model-number) and on an unknown id: no store and no read at level 6 and level 7 */
+	forge(imgbuf, len, pin);
+	{
+		static const uint32_t bad[] = { SWW_BOARD_BLUEJAY, 0u, 3u };
+		static const int lv[] = { 6, 7 };
+		unsigned bi, li;
+
+		for (bi = 0; bi < 3; bi++) {
+			for (li = 0; li < 2; li++) {
+				tboard = bad[bi];
+				obsb(&f, 336);
+				CHECK(runc(&f, &x, lv[li], len, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && x.row == 14 && f.released == 0 && strstr(logbuf, "is not a pinned identity") != 0);
+			}
+		}
+		tboard = OR;
+	}
+	/* and the bluejay identity on an oriole board */
+	tboard = SWW_BOARD_ORIOLE;
+	mkimg(1764018u);
+	forge(imgbuf, 1764018u, 0x1153ccffu);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, 1764018u, 0x1153ccffu) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764018 bytes crc 0x1153ccff board 2 is not a pinned identity") != 0);
+	mkimg(len);
 	/* one byte over the new bound: refused at W8 before any store, whatever the CRC */
 	mkimg(len + 1u);
 	obsb(&f, 336);
 	CHECK(runb(&f, &x, 4, len + 1u, tcrc(imgbuf, len + 1u)) == -SWW_E_IMG && f.nw == 0 && x.row == 8 && strstr(logbuf, "W8 no usable image (1764092 bytes, at most 1764091)") != 0);
+	tboard = SWW_BOARD_BLUEJAY;
 }
 
 /* patch 0147, review 0129-0132 F1: a stop while cfg 0x84 is armed and the link has left L0 does NOT send the config restore TLP; restore=skipped; the state left is printed (F5) */
@@ -2380,6 +2548,7 @@ static void rune(void)
 	fw_default(&f);
 	f.fw_up = 0;
 	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_FWUP && x.stop_code == SWW_E_FWUP && x.row == 16 && f.win2 == 0 && f.bar2_stores_after_rel == 0 && f.cfg04_writes == 0 && all_allowed(&f));
+	CHECK(x.restore == SWW_RS_NONE && x.armed_at_stop == 0);    /* patch 0154 (review 0150 G3, X11): W16 itself put cfg 0x84 back before the stop, nothing was left for the restore */
 	CHECK(x.fwup_polls == 100 && strstr(logbuf, "after 100 polls") != 0 && strstr(logbuf, "W16 firmware not up: ca7 ioctl 0x1 reset_ctl 0") != 0 && strstr(logbuf, "ca7=RELEASED (firmware running)") != 0);
 	CHECK(f.clock_us - f.rel_t >= 4950000ul && f.clock_us - f.rel_t < 5100000ul);
 	/* it writes 0 back, or all ones, or a pointer outside RAM / unaligned / too close to the end: a stop before anything is read through it */
@@ -2422,6 +2591,8 @@ static void rune(void)
 	CHECK(strstr(logbuf, "skipped, link precondition") != 0 && x.restore == SWW_RS_SKIPPED);
 	obsb(&f, 336); fw_default(&f); f.down_after = 1000000;            /* down before the second console look */
 	CHECK(rune_run(&f, &x, len, pin) == -SWW_E_PRE && x.row == 17 && strstr(logbuf, "before the second console look") != 0);
+	/* patch 0154 (review 0150 G6): with the console in the tail window the link loss leaves cfg 0x84 there: the restore is skipped (no TLP to a dead link) and the report says so */
+	CHECK(x.restore == SWW_RS_SKIPPED && (x.armed_at_stop & SWW_RG_W84) && strstr(logbuf, "cfg84=TAIL WINDOW (restore not done)") != 0 && f.win2 == SWW_WIN_TAIL);
 	/* the CA7 is not in the halted state W6 leaves: no release store at all */
 	obsb(&f, 336); fw_default(&f);
 	CHECK(runc(&f, &x, 6, len, pin) == 0);
@@ -2476,6 +2647,56 @@ static void rune(void)
 		x.stopped = 0;
 		CHECK(swl_bp_rd(&x, 0x49FFFCu, &v) == 0 && v == 0x480000u && f.win2 == SWW_WIN_TAIL && x.w84 == SWW_WIN_TAIL);
 		CHECK(swl_bp_rd(&x, 0x200000u, &v) == 0 && f.win2 == 0 && x.w84 == 0);
+		/* patch 0154 (review 0150 G3, X2): back on window 0 the cfg 0x84 restore group is disarmed, by swl_bp_rd and by swl_w84_zero */
+		CHECK(x.armed == 0);
+		CHECK(swl_bp_rd(&x, 0x49FFFCu, &v) == 0 && (x.armed & SWW_RG_W84) && swl_w84_zero(&x) == 0 && f.win2 == 0 && x.w84 == 0 && x.armed == 0);
+	}
+	/* patch 0154 (review 0150 G3): the guards review 0150-1 found uncovered (X3, X8, X9, X15), each alone */
+	obsb(&f, 336); fw_default(&f);                                  /* X3: W16 needs the length token and a RAM that holds the image + tail; no read otherwise */
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	x.level = 7;
+	CHECK(swl_w15(&x) == 0);
+	{
+		unsigned r0 = f.nrd;
+		uint32_t keep = x.tok;
+
+		x.tok = 0;
+		CHECK(swl_w16(&x) == -SWW_E_STATE && f.nrd == r0 && x.row == 16);
+		x.stopped = 0; x.tok = keep; x.ram_bytes = SWW_RAM_MIN - 4u; r0 = f.nrd;
+		CHECK(swl_w16(&x) == -SWW_E_STATE && f.nrd == r0);
+	}
+	obsb(&f, 336); fw_default(&f);                                  /* X8: the middle release IOCTL only over the halted 0x21 */
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && f.win0 == SWW_WIN_CA7WRAP);
+	x.level = 7;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u) == 0);
+	f.ca.ioctl = 0x1u;
+	n6 = f.nw;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_IOCTL, 0x3u) == -SWW_E_OLD && f.nw == n6 + 1 && f.released == 0);   /* the only store is the restore RESET_CTL := 1 */
+	obsb(&f, 336); fw_default(&f);                                  /* X9: cfg 0x84 back to 0 through the run E tuple only after W15 */
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	n6 = f.nw; x.level = 7; f.win2 = SWW_WIN_TAIL;
+	CHECK(swl_wr(&x, SWW_CFG, 0, SWW_CFG_WIN2, 0u) == -SWW_E_PHASE && f.nw == n6);
+	obsb(&f, 336); fw_default(&f); f.fw_con = 0x3FFFF2u;            /* X15: an unaligned console pointer is recorded, not followed, and not a stop */
+	CHECK(rune_run(&f, &x, len, pin) == 0 && x.con_bytes == 0 && strstr(logbuf, "console pointer 0x3ffff2 outside RAM") != 0 && left_ok(&f, n6));
+	/* patch 0154 (review 0150 G6): a read refused at every read of W17, with the shared area, the console header and its buffer above 0x400000: a stop, cfg 0x84 restored to 0
+	 * (stored and read back), no BAR2 store, the report never says 0 while the window is on the tail */
+	{
+		unsigned k, r16, stops = 0;
+
+		for (k = 1; k <= 60; k++) {
+			obsb(&f, 336); fw_default(&f); f.fw_con = 0x470000u; f.fw_buf = 0x440000u;
+			CHECK(runc(&f, &x, 6, len, pin) == 0);
+			x.level = 7;
+			CHECK(swl_w15(&x) == 0 && swl_w16(&x) == 0 && f.win2 == 0);
+			r16 = f.nrd;
+			f.fail_rd_at = r16 + k;
+			if (swl_w17(&x) < 0) {
+				stops++;
+				CHECK(x.row == 17 && f.win2 == 0 && f.bar2_stores_after_rel == 0 && f.cfg04_writes == 0 && all_allowed(&f));
+				CHECK(((x.armed_at_stop & SWW_RG_W84) == 0 || (x.restore == SWW_RS_OK && strstr(logbuf, "cfg84=0 (restored)") != 0)) && strstr(logbuf, "TAIL WINDOW") == 0);
+			}
+		}
+		CHECK(stops > 20);
 	}
 	/* a store fault at every store of W15: a stop, the CA7 put back in reset (the restore), never a running firmware */
 	{
@@ -2517,6 +2738,290 @@ static void rune(void)
 	CHECK(rune_run(&f, &x, len, pin) == 0 && strstr(logbuf, "fwcon: wl0: Broadcom BCM4389 802.11 Wireless Controller 99.9.9 (synthetic)\n") != 0 && left_ok(&f, n6));
 }
 
+/* ---- patch 0159, run F (sweetwlan=8): msgbuf setup in a host pool, bus master, one ioctl round trip, bus master off (docs/research/51) ---- */
+#define FPA 0x8A1234000ull              /* a synthetic pool address above 4 GiB (the high word matters) */
+#define FLEVEL8 (ELEVEL7 | SWF_W18 | SWF_W19 | SWF_W20 | SWF_W21 | SWF_W23)
+static uint8_t fpool[SWM_POOL_LEN];
+static uint32_t f_rc0;                         /* patch 0160: the root port Command (low half) the current case started with */
+static const uint32_t flen = 1764018u, fpin = 0x1153ccffu;
+
+static void f_sync(void *c, uint32_t off, uint32_t len)
+{
+	struct fake *f = c;
+
+	if (off > SWM_POOL_LEN || len > SWM_POOL_LEN - off)
+		f->oob++;
+	f->nsync++;
+}
+
+static void fwf(struct fake *f)
+{
+	obsb(f, 336);
+	fw_default(f);
+	f->fw_flags = 0x70050107u;          /* the flags observed in run o3-w5-l7 */
+	f->mb = 1; f->pool = fpool; f->pool_pa = FPA;
+	f->ri = 0x47E000u; f->ringmem = 0x47E100u;
+	f->hw = 0x3F0000u; f->hr = 0x3F0400u;       /* the H2D index arrays in window 0, the D2H ones in the tail window: the window moves */
+	f->dw = 0x47E800u; f->dr = 0x47EC00u;
+	f->maxsub = 42; f->maxcpl = 5;
+	f_rc0 = f->rc_cmd & 0xFFFFu;
+}
+
+/* what = 0 normal; 1 no pool; 2 misaligned pool; 3 no sync callback; 4 short pool; 5 pool ends above 2^36; 6 pool ends exactly at 2^36 */
+static int runf_x(struct fake *f, struct swl_wx *x, int level, int what)
+{
+	mkc(x, f, level, flen, fpin);
+	cbus.sync = what == 3 ? 0 : f_sync;
+	memset(fpool, 0xEE, sizeof fpool);
+	x->pool = what == 1 ? 0 : fpool;
+	x->pool_pa = what == 2 ? FPA + 0x1000u : what == 5 ? (1ull << 36) - SWM_POOL_LEN + SWM_POOL_ALIGN : what == 6 ? (1ull << 36) - SWM_POOL_LEN : FPA;
+	f->pool_pa = x->pool_pa;
+	x->pool_len = what == 4 ? SWM_POOL_LEN - 4u : SWM_POOL_LEN;
+	return swl_stage3(x);
+}
+
+static int runf(struct fake *f, struct swl_wx *x)
+{
+	return runf_x(f, x, 8, 0);
+}
+
+
+static int bm_off(const struct fake *f)         /* rule R2: however the run ended, EP Command is memory-only, no doorbell was rung without bus master, the firmware was told no address outside the pool */
+{
+	return (f->cmd & 0xFFFFu) == 0x0002u && f->db_nobm == 0 && f->oob == 0 && f->win2 == 0 && (f->rc_stuck || f->rc_dead || (f->rc_cmd & 0xFFFFu) == f_rc0);   /* patch 0160: and the root port's Command is the word it was */
+}
+
+static int nothing_f(const struct fake *f)      /* a refusal before the first run F store: nothing after the release reached chip RAM, EP Command and the doorbells untouched */
+{
+	return f->bar2_stores_after_rel == 0 && f->cfg04_writes == 0 && f->ndb0 == 0 && f->nrdy == 0 && f->oob == 0 && (f->cmd & 0xFFFFu) == 0x0002u && f->rc_writes == 0;
+}
+
+static void runf_tests(void)
+{
+	static struct fake f;
+	struct swl_wx x;
+	unsigned n7, n8, n, k;
+	uint32_t i;
+	uint64_t a;
+
+	cx_init_rng();
+	mkimg(flen);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, flen, fpin);
+	cx_hand(336);
+
+	/* level 7 with the same firmware: nothing of run F (rule R8) */
+	fwf(&f);
+	CHECK(runf_x(&f, &x, 7, 0) == 0 && x.flags == ELEVEL7 && nothing_f(&f) && f.nsync == 0 && strstr(logbuf, "W18") == 0 && strstr(logbuf, "level 7 done fw ready") != 0);
+	n7 = f.nw;
+
+	/* level 8, the whole run */
+	fwf(&f);
+	CHECK(runf(&f, &x) == 0);
+	n8 = f.nw;
+	CHECK(x.stopped == 0 && x.flags == FLEVEL8 && x.armed == 0 && x.restore == SWW_RS_NONE && bm_off(&f));
+	CHECK(f.rc_writes == 2 && (f.rc_cmd & 0xFFFFu) == 0 && strstr(logbuf, "W22 root port Command/Status 0x100000 (memory off, bus master off)") != 0 && strstr(logbuf, "W25 root port Command back at 0") != 0);
+	CHECK(f.cfg04_writes == 2 && f.nrdy == 1 && f.ndb0 == 4 && f.fw_items == 4 && f.bm_on_at_db == 4 && x.f_ndb == 5 && x.f_other == 0);
+	CHECK(f.lastw.space == SWW_DBI && f.lastw.off == 0x04 && f.lastw.val == 0x0000u);                      /* the last store of the run: bus master off */
+	CHECK(x.f_nstore == 2 + 25 + 6 + 6 && f.bar2_stores_after_rel == x.f_nstore);
+	CHECK(f.ram[0x480054 / 4] == 0x1407u && f.ram[0x480070 / 4] == 0);
+	a = FPA + SWM_O_SCRATCH;
+	CHECK(f.ram[0x480034 / 4] == 8 && f.ram[0x480038 / 4] == (uint32_t)a && f.ram[0x48003C / 4] == 8u);
+	a = FPA + SWM_O_RINGUPD;
+	CHECK(f.ram[0x480040 / 4] == 1024 && f.ram[0x480044 / 4] == (uint32_t)a && f.ram[0x480048 / 4] == 8u);
+	for (i = 0; i < SWM_NRING; i++) {
+		a = FPA + swm_ring[i].off;
+		CHECK(f.ram[(0x47E100 + 16 * i + 4) / 4] == (swm_ring[i].depth | swm_ring[i].item << 16) && f.ram[(0x47E100 + 16 * i + 8) / 4] == (uint32_t)a && f.ram[(0x47E100 + 16 * i + 12) / 4] == 8u);
+		CHECK(f.ram[(0x47E100 + 16 * i) / 4] == 0);                                                     /* word +0 of an entry is never written */
+	}
+	CHECK(swm_ring[0].depth == 64 && swm_ring[0].item == 40 && swm_ring[2].depth == 64 && swm_ring[2].item == 24 && swm_ring[1].item == 32 && swm_ring[3].item == 24 && swm_ring[4].item == 40);
+	CHECK(f.ram[0x3F0000 / 4] == 4 && f.ram[0x47EC00 / 4] == 4 && f.ram[0x3F0400 / 4] == 4 && f.ram[0x47E800 / 4] == 4);      /* 4 items each way; the host wrote only its own two */
+	CHECK(strstr(logbuf, "SWEET WLAN: fw version wl0: Jan  1 2026 00:00:00 version 99.9.9 (synthetic) FWID 01-abcdef mac xx:xx:xx:xx:44:55\n") != 0);
+	CHECK(strstr(logbuf, "second line") == 0 && strstr(logbuf, "11:22") == 0 && strstr(logbuf, "02:11") == 0 && strstr(logbuf, "33:44") == 0);       /* one line of text, only the last two MAC bytes */
+	CHECK(strstr(logbuf, "W22 bus master ON") != 0 && strstr(logbuf, "W25 bus master off, guards intact") != 0 && strstr(logbuf, "level 8 done msgbuf round trip ok") != 0 && strstr(logbuf, "STOP") == 0);
+	CHECK(f.nsync == 16 && n8 == n7 + 4 + x.f_nstore + x.f_ndb + 15);        /* + 2 root port Command stores (patch 0160), + 2 EP Command stores, + 1 cfg 0x80 select (PCIe core), + 14 cfg 0x84 moves between window 0 and the tail window */
+	for (i = 0; i < SWM_POOL_LEN; i++)                                              /* the guard gaps hold the pattern, also after the run */
+		if (fpool[i] != SWM_GUARD && !((i < 0xA00) || (i >= 0x1000 && i < 0x1600) || (i >= 0x2000 && i < 0x2008) || (i >= 0x2400 && i < 0x2800) || (i >= 0x3000 && i < 0x3800) ||
+		    (i >= 0x4000 && i < 0x6000) || (i >= 0x8000 && i < 0x22000)))
+			break;
+	CHECK(i == SWM_POOL_LEN);
+
+	/* an extra completion item of another type is skipped and counted */
+	fwf(&f); f.fw_extra = 1;
+	CHECK(runf(&f, &x) == 0 && x.f_other == 2 && bm_off(&f) && strstr(logbuf, "completion item type 0x1 ignored") != 0);
+
+	/* W18 refusals: no store of run F, EP Command untouched */
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 1) < 0 && x.stop_code == SWW_E_POOL && x.row == 18 && nothing_f(&f));
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 2) < 0 && x.stop_code == SWW_E_POOL && nothing_f(&f));
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 3) < 0 && x.stop_code == SWW_E_POOL && nothing_f(&f));
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 4) < 0 && x.stop_code == SWW_E_POOL && nothing_f(&f));
+	fwf(&f); f.fw_flags = 0x70050106u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && x.row == 18 && nothing_f(&f));       /* shared version 6 */
+	fwf(&f); f.fw_flags = 0x60050107u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));                      /* no host-ready doorbell */
+	fwf(&f); f.fw_flags = 0xF0050107u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));                      /* DAR doorbells */
+	fwf(&f); f.fw_flags = 0x70150107u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));                      /* 2-byte indices */
+	fwf(&f); f.ri = 0x49FFF0u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_SHARED && nothing_f(&f));                           /* ring_info runs past the RAM end */
+	fwf(&f); f.ringmem = 0x4A0000u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_SHARED && nothing_f(&f));
+	fwf(&f); f.hw = 0x1FFFFCu; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_SHARED && nothing_f(&f));                           /* below the RAM base */
+	fwf(&f); f.dr = 0x47EC02u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_SHARED && nothing_f(&f));                           /* not word aligned */
+	fwf(&f); f.hr = f.hw + 4; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_SHARED && nothing_f(&f) && strstr(logbuf, "overlap") != 0);
+	fwf(&f); f.dw = 0x480050u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_SHARED && nothing_f(&f));                           /* an index array on top of host_cap */
+	fwf(&f); f.maxcpl = 2; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));
+	fwf(&f); f.maxsub = 1; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && nothing_f(&f));
+
+	/* review 0159-1 F1: a non-zero host index-buffer word in ring_info (each of words 5..12): no store, no bus master */
+	for (i = 5; i <= 12; i++) {
+		fwf(&f); f.ri_host = (int)i;
+		CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && x.row == 18 && nothing_f(&f) && strstr(logbuf, "host index buffers") != 0);
+	}
+	/* review 0159-1 F2: the bus address is 36 bits wide: a pool that ends above 2^36 is refused, one that ends exactly there is used */
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 5) < 0 && x.stop_code == SWW_E_POOL && x.row == 18 && nothing_f(&f));
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 6) == 0 && bm_off(&f) && f.ram[(0x47E100 + 12) / 4] == 0xFu);
+	/* review 0159-1 F3: the index moves one poll before the item bytes arrive: the item is not consumed as type 0, the run passes */
+	fwf(&f); f.fw_late = 1;
+	CHECK(runf(&f, &x) == 0 && bm_off(&f) && x.f_other == 0 && strstr(logbuf, "completion item type") == 0 && strstr(logbuf, "mac xx:xx:xx:xx:44:55") != 0);
+	/* review 0159-1 F4: a stop with bus master on reports the guard bytes (here one changed, then none) */
+	fwf(&f); f.fw_guard = 1; f.fw_status = 5;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && bm_off(&f) && strstr(logbuf, "host pool guard bytes changed 1 (DMA suspect)") != 0);
+	fwf(&f); f.fw_mute = 1;
+	CHECK(runf(&f, &x) < 0 && strstr(logbuf, "host pool guard bytes changed 0\n") != 0);
+	fwf(&f); CHECK(runf_x(&f, &x, 8, 1) < 0 && strstr(logbuf, "guard bytes") == 0);      /* a stop before bus master prints no such line */
+	/* review 0159-1 F8: a short MAC answer, a completion for another command, control bytes in the version text */
+	fwf(&f); f.fw_len = 3; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && x.row == 24 && bm_off(&f) && strstr(logbuf, "cur_etheraddr answer is 3 bytes") != 0);
+	fwf(&f); f.fw_cmd_xor = 1; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f));
+	fwf(&f); CHECK(runf(&f, &x) == 0 && strchr(logbuf, 0x01) == 0 && strchr(logbuf, 0x7f) == 0);
+	/* review 0159-1 F8: the bus-master tuple itself needs W21 (a direct call on a state that lacks it stores nothing) */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_BM_ON); x.flags &= ~SWF_W21;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x04u, 0x0006u) == -SWW_E_PHASE && f.nw == n && (f.cmd & 0xFFFFu) == 2);
+	/* ---- patch 0160: the root port's Command (the root port forwards the endpoint's memory requests only with its own Bus Master Enable) ---- */
+	/* a root port that already has other bits set keeps them: only memory and master are added, and the word comes back exactly */
+	fwf(&f); f.rc_cmd = 0x00100101u; f_rc0 = 0x0101u;
+	CHECK(runf(&f, &x) == 0 && bm_off(&f) && x.rc_cmd_old == 0x0101u && strstr(logbuf, "W25 root port Command back at 0x101") != 0);
+	/* a root port that already is a master: the same word is stored, the run passes, the word stays */
+	fwf(&f); f.rc_cmd = 0x00100006u; f_rc0 = 0x0006u;
+	CHECK(runf(&f, &x) == 0 && (f.rc_cmd & 0xFFFFu) == 0x0006u && bm_off(&f) && strstr(logbuf, "(memory on, bus master on)") != 0);
+	/* the word reads all-ones (the DBI page is not there): stop before any Command store, endpoint never a master */
+	fwf(&f); f.rc_dead = 1;
+	CHECK(runf(&f, &x) < 0 && x.row == 22 && f.rc_writes == 0 && f.cfg04_writes == 0 && f.nrdy == 0 && (f.cmd & 0xFFFFu) == 2);
+	/* the root port does not take the bits: stop at the read-back, the endpoint never becomes a master, the restore writes the old word */
+	fwf(&f); f.rc_stuck = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.cfg04_writes == 0 && f.nrdy == 0 && f.rc_writes == 2 && f.lastw.space == SWW_DBI && f.lastw.val == 0);
+	/* a stop with both master bits on puts the endpoint back first, then the root port */
+	fwf(&f); f.fw_mute = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_TMO && bm_off(&f) && (x.rs_ok & (SWW_RG_BM | SWW_RG_RCBM)) == (SWW_RG_BM | SWW_RG_RCBM) && f.lastw.space == SWW_DBI && f.lastw.val == 0);
+	CHECK(strstr(logbuf, "restore space 1 win 0 off 0x4 := 0x2 ok") != 0 && strstr(logbuf, "restore space 7 win 0 off 0x4 := 0 ok") != 0 &&
+	    strstr(logbuf, "restore space 1 win 0 off 0x4") < strstr(logbuf, "restore space 7 win 0 off 0x4"));
+	/* the writer's rules for that word, on finished runs (a refusal latches STOPPED) */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BM_ON) | SWT_BIT(SWT_RC_BM_OFF));
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0007u) == -SWW_E_OLD && f.nw == n);                                  /* on: more than memory + master */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BM_ON) | SWT_BIT(SWT_RC_BM_OFF));
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0004u) == -SWW_E_OLD && f.nw == n);                                  /* on: master without memory */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_RC_BM_OFF); x.rc_cmd_old = 0;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0100u) == -SWW_E_ORDER && f.nw == n);                                /* off: not the recorded word */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_RC_BM_OFF); x.flags |= SWF_BM; f.cmd |= 4u;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0000u) == -SWW_E_ORDER && f.nw == n);                                /* off: never while the endpoint is a master */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_RC_BM_OFF); x.rc_have = 0;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0000u) == -SWW_E_ORDER && f.nw == n);                                /* off: without a recorded word */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_BM_ON) | SWT_BIT(SWT_RC_BM_ON));
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x04u, 0x0006u) == -SWW_E_ORDER && f.nw == n && (f.cmd & 0xFFFFu) == 2);      /* the endpoint only after the root port */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x08u, 0x0006u) == -SWW_E_DENIED && f.nw == n);                               /* no other word of the root port */
+	fwf(&f); CHECK(runf_x(&f, &x, 7, 0) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0006u) == -SWW_E_DENIED && f.nw == n && f.rc_writes == 0);             /* level 7 has no such tuple */
+	CHECK(swl_wr_ok(SWW_DBI, 0, 0x04, 6) < 0 && swl_wr_ok_run(0, SWW_RUN_F, SWW_DBI, 0, 0x04, 6) == SWT_RC_BM_ON && swl_rd_find(SWW_DBI, 0, 0x04) >= 0 && swl_rd_find(SWW_DBI, 0, 0x00) < 0);
+	/* rule R4: an index slot whose upper half is not 0 is not stored; bus master never comes on */
+	fwf(&f); f.idx_dirty = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_OLD && x.row == 20 && f.cfg04_writes == 0 && f.nrdy == 0 && f.ram[0x3F0000 / 4] == 0x00010000u && bm_off(&f));
+
+	/* W22: EP Command does not take the bit: stop, the restore writes memory-only, no doorbell */
+	fwf(&f); f.bm_stuck = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.cfg04_writes == 2 && f.lastw.space == SWW_DBI && f.lastw.off == 0x04 && f.lastw.val == 0 && f.rc_writes == 2 && f.nrdy == 0 && f.ndb0 == 0 && bm_off(&f));
+
+	/* rule R3/R2: the firmware never answers: 200 polls, then stop with bus master off */
+	fwf(&f); f.fw_mute = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_TMO && x.row == 24 && x.restore == SWW_RS_OK && bm_off(&f) && (x.rs_ok & SWW_RG_BM) && !(x.flags & SWF_BM));
+	CHECK(strstr(logbuf, "no completion for 'cur_etheraddr' in 2000 ms: h2d w 2 fw r 2") != 0 && strstr(logbuf, "is untouched") != 0 && strstr(logbuf, "bus_master=off") != 0);
+	CHECK(f.clock_us >= 200u * 10000u);
+
+	/* rule R6: firmware-written data out of bounds */
+	fwf(&f); f.fw_bad_w = 64; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f) && strstr(logbuf, "firmware write index 64 outside the ring") != 0);
+	fwf(&f); f.fw_len = 0x2001u; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f) && strstr(logbuf, "completion length 8193 above the buffer") != 0);
+	fwf(&f); f.fw_len = 0x2000u; CHECK(runf(&f, &x) == 0 && bm_off(&f));                                                         /* exactly the buffer: accepted */
+	fwf(&f); f.fw_trans_xor = 1; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f) && strstr(logbuf, "completion does not match") != 0);
+	fwf(&f); f.fw_id_xor = 0x100; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f));
+	fwf(&f); f.fw_hr_bad = 99; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && bm_off(&f) && strstr(logbuf, "firmware read index 99 outside the ring") != 0);
+	fwf(&f); f.fw_status = 5; CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_MSG && bm_off(&f) && strstr(logbuf, "completed with status 5") != 0);
+
+	/* rule R9: a byte of a guard gap changed */
+	fwf(&f); f.fw_guard = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_DMA && x.row == 25 && bm_off(&f) && strstr(logbuf, "DMA suspect: 1 guard bytes") != 0 && strstr(logbuf, "fw version") == 0);
+
+	/* the link leaves L0 while bus master is on: no TLP is sent to it (the restore is skipped and says so) */
+	fwf(&f); f.fw_mute = 1; f.down_after = 2350000;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_PRE && x.restore == SWW_RS_SKIPPED && (f.cmd & 0xFFFFu) == 0x0006u && f.cfg04_writes == 1);
+	CHECK(strstr(logbuf, "restore of group 16 skipped, link precondition 2") != 0 && strstr(logbuf, "bus_master=ON (restore not done)") != 0);
+	CHECK(strstr(logbuf, "link precondition lost while waiting for 'cur_etheraddr'") != 0 && strstr(logbuf, "no completion") == 0 && f.clock_us < f.rel_t + 2500000ul);    /* stopped by the wait loop itself, within one poll of the drop */
+
+	/* rule R2 by fault injection: whichever single store of run F fails or is silently dropped, the run ends with bus master off and nothing told outside the pool */
+	for (n = n7 + 1; n <= n8; n++) {
+		for (k = 0; k < 2; k++) {
+			fwf(&f);
+			if (k) f.drop_at = n; else f.fail_wr_at = n;
+			(void)runf(&f, &x);
+			if (!bm_off(&f) || (x.flags & SWF_BM) || (x.stopped && x.restore == SWW_RS_FAILED)) {
+				fprintf(stderr, "FAIL run F fault sweep: store %u (of %u..%u) %s: cmd %#x db_nobm %u oob %u win2 %#x restore %d\n", n, n7 + 1, n8, k ? "dropped" : "failed", f.cmd, f.db_nobm, f.oob, f.win2, x.restore);
+				fails++;
+			}
+		}
+	}
+
+	/* the allowlist function itself, on the state of a finished run */
+	fwf(&f);
+	CHECK(runf(&f, &x) == 0);
+	CHECK(swl_f_kind(&x, 0x480054u, 0x1407u) == SWM_K_CAP && swl_f_kind(&x, 0x480054u, 0x1406u) == SWM_K_NONE && swl_f_kind(&x, 0x480054u, 0x11407u) == SWM_K_NONE);
+	CHECK(swl_f_kind(&x, 0x480070u, 0) == SWM_K_CAP && swl_f_kind(&x, 0x480070u, 1) == SWM_K_NONE && swl_f_kind(&x, 0x480058u, 0) == SWM_K_NONE && swl_f_kind(&x, 0x480000u, 0x70050107u) == SWM_K_NONE);
+	CHECK(swl_f_kind(&x, 0x480038u, (uint32_t)(FPA + SWM_O_SCRATCH)) == SWM_K_BUF && swl_f_kind(&x, 0x480038u, (uint32_t)(FPA + SWM_O_SCRATCH) + 4u) == SWM_K_NONE && swl_f_kind(&x, 0x48003Cu, 9u) == SWM_K_NONE);
+	CHECK(swl_f_kind(&x, 0x480034u, 8u) == SWM_K_BUF && swl_f_kind(&x, 0x480034u, 16u) == SWM_K_NONE && swl_f_kind(&x, 0x480040u, 1024u) == SWM_K_BUF && swl_f_kind(&x, 0x480040u, 2048u) == SWM_K_NONE);
+	CHECK(swl_f_kind(&x, 0x480044u, (uint32_t)(FPA + SWM_O_RINGUPD)) == SWM_K_BUF && swl_f_kind(&x, 0x480048u, 8u) == SWM_K_BUF && swl_f_kind(&x, 0x480048u, 0u) == SWM_K_NONE);
+	for (i = 0; i < SWM_NRING; i++) {
+		a = FPA + swm_ring[i].off;
+		CHECK(swl_f_kind(&x, 0x47E100u + 16 * i + 8, (uint32_t)a) == SWM_K_RING && swl_f_kind(&x, 0x47E100u + 16 * i + 8, (uint32_t)a + 0x40000u) == SWM_K_NONE);
+		CHECK(swl_f_kind(&x, 0x47E100u + 16 * i + 12, 8u) == SWM_K_RING && swl_f_kind(&x, 0x47E100u + 16 * i + 12, 0u) == SWM_K_NONE && swl_f_kind(&x, 0x47E100u + 16 * i, 0u) == SWM_K_NONE);
+		CHECK(swl_f_kind(&x, 0x47E100u + 16 * i + 4, swm_ring[i].depth | swm_ring[i].item << 16) == SWM_K_RING && swl_f_kind(&x, 0x47E100u + 16 * i + 4, (swm_ring[i].depth + 1) | swm_ring[i].item << 16) == SWM_K_NONE);
+	}
+	CHECK(swl_f_kind(&x, 0x47E100u + 16 * 5 + 8, (uint32_t)FPA) == SWM_K_NONE);                                                  /* no sixth ring */
+	CHECK(swl_f_kind(&x, 0x3F0000u, 63) == SWM_K_IDX && swl_f_kind(&x, 0x3F0000u, 64) == SWM_K_NONE && swl_f_kind(&x, 0x3F0004u, 1023) == SWM_K_IDX && swl_f_kind(&x, 0x3F0004u, 1024) == SWM_K_NONE);
+	CHECK(swl_f_kind(&x, 0x3F0008u, 0) == SWM_K_NONE && swl_f_kind(&x, 0x3F0400u, 0) == SWM_K_IDX && swl_f_kind(&x, 0x3F0400u, 1) == SWM_K_NONE);       /* no third H2D ring; the firmware's read index only as 0 */
+	CHECK(swl_f_kind(&x, 0x47EC00u, 63) == SWM_K_IDX && swl_f_kind(&x, 0x47EC00u, 64) == SWM_K_NONE && swl_f_kind(&x, 0x47EC08u, 1023) == SWM_K_IDX && swl_f_kind(&x, 0x47EC0Cu, 0) == SWM_K_NONE);
+	CHECK(swl_f_kind(&x, 0x47E800u, 0) == SWM_K_IDX && swl_f_kind(&x, 0x47E800u, 1) == SWM_K_NONE);
+	x.pool = 0;
+	CHECK(swl_f_kind(&x, 0x480038u, (uint32_t)(FPA + SWM_O_SCRATCH)) == SWM_K_NONE && swl_f_kind(&x, 0x47E108u, (uint32_t)FPA) == SWM_K_NONE && swm_pa(&x, 0, 4) == 0);
+	x.pool = fpool;
+	CHECK(swm_pa(&x, SWM_POOL_LEN - 4u, 4u) == FPA + SWM_POOL_LEN - 4u && swm_pa(&x, SWM_POOL_LEN - 4u, 8u) == 0 && swm_pa(&x, SWM_POOL_LEN + 4u, 0u) == 0 && swm_pa(&x, 0xFFFFFFFCu, 8u) == 0);
+	x.flags &= ~SWF_W18;
+	CHECK(swl_f_kind(&x, 0x480054u, 0x1407u) == SWM_K_NONE);
+	x.flags |= SWF_W18;
+
+	/* the writer refuses what is not a run F word, a doorbell without bus master, and any other Command value (each on a fresh finished run: a refusal latches STOPPED) */
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000u, 0x80058u, 0) == -SWW_E_MSG);
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_PCIE, 0x140u, 1) == -SWW_E_PHASE && f.nw == n && f.ndb0 == 4);                              /* bus master is off again */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_PCIE, 0x140u, 2) == -SWW_E_DENIED && f.nw == n);
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_BAR0, SWW_WIN_PCIE, 0x148u, 1) == -SWW_E_DENIED && f.nw == n);
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x04u, 0x0007u) == -SWW_E_DENIED && f.nw == n);
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x04u, 0x0006u) == -SWW_E_REPEAT && f.nw == n && (f.cmd & 0xFFFFu) == 2);                        /* bus master on a second time */
+	fwf(&f); CHECK(runf_x(&f, &x, 7, 0) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x04u, 0x0006u) == -SWW_E_DENIED && f.nw == n);                                                    /* level 7 has no such tuple */
+	fwf(&f); CHECK(runf_x(&f, &x, 7, 0) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000u, 0x80054u, 0x1407u) == -SWW_E_NV + 0 * (int)n || x.stop_code != 0);                            /* level 7: judged as before (a tail tuple), never stored */
+	CHECK(f.nw == n && f.bar2_stores_after_rel == 0);
+	CHECK(SWT_N == 42 && SWT_F_LO == 34 && SWT_RC_BM_ON == 38 && SWT_DB_H2D == 41 && swl_wr_ok(SWW_BAR2, 0, 0x3F0000u, 5) < 0 && swl_wr_ok(SWW_CFG, 0, 0x04, 6) < 0 && swl_wr_ok(SWW_BAR0, SWW_WIN_PCIE, 0x140, 1) < 0);
+	CHECK(swl_wr_ok_run(0, SWW_RUN_F, SWW_BAR2, 0, 0x3F0000u, 5) == SWT_F_LO && swl_wr_ok_run(0, SWW_RUN_F, SWW_CFG, 0, 0x04, 6) == SWT_BM_ON && swl_wr_ok_run(0, SWW_RUN_F, SWW_BAR0, SWW_WIN_PCIE, 0x144, 1) == SWT_DB_RDY);
+}
+
 int main(void)
 {
 	rev_gate();
@@ -2539,6 +3044,7 @@ int main(void)
 	fwid();
 	f1_cfg_restore();
 	rune();
+	runf_tests();
 	if (fails) {
 		fprintf(stderr, "RESULT: FAIL wlan_wr_host_test (%u checks)\n", fails);
 		return 1;
