@@ -1,11 +1,11 @@
 SWEET AMP (patch 0158, plan 2026-11-14 oneshot-2 step A7), boot-arg sweetamp=1: the two CS35L41 speaker amps of oriole (USI13 / SPI13). Inert unless
 sweetamp=1 AND the ADT root model-number is "oriole". One synchronous run from sweet_ufs_init, before the touch / battery threads: the A1 identify
-(the port of the shim --amp-id, pk-amp shim/ampid.c with review F1-F3 fixed, review round 2 pending) and, on each amp that identified as CS35L41 B2 with OTP_BOOT_DONE, the
-stock probe-time writes: IRQ1_MASK1 = INT1_MASK_DEFAULT, the B2 errata patch, DSP1_CCM_CORE_CTRL = 0 (cs35l41.c:4300-4302, :3675-3686, :4351-4362,
+(the port of the shim --amp-id, pk-amp shim/ampid.c 4c7be85, review SAFE round 2) and, on each amp that identified as CS35L41 B2 with OTP_BOOT_DONE, the
+stock probe-time writes: IRQ1_MASK1 = INT1_MASK_DEFAULT, the B2 errata patch, DSP1_CCM_CORE_CTRL = 0 (cs35l41.c:4306-4308, :3675-3686, :4351-4362,
 :4401). cs35l41_otp_unpack is NOT done (its bit maps are GPL data tables, cs35l41-tables.c: not copied; blocked). The write allowlist is exactly those
 12 (register, value) pairs; PWR_CTRL1 / GLOBAL_EN is never written (refused by name). Afterwards IRQ1_STATUS1 error bits must be 0, then both resets go
 low and every pad / controller / sysreg / mux word is restored and read back. Lines "SWEET AMP: ..."; pass "SWEET AMP: init ok l,r devid 35a40 rev b2,
-errors=0". Host test shim/amp_xnu_host_test.c (header extracted from this patch). BUILT, UNRUN; needs A1 PASS and an independent review first.
+errors=0" (A7 PARTIAL: no OTP unpack). Host test shim/amp_xnu_host_test.c (header extracted from this patch). BUILT, UNRUN; needs A1 PASS and an independent review first.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -29,8 +29,8 @@ new file mode 100644
 + * nothing is read. With them: seven pinned windows mapped (SPI13, the PERIC1 sysreg page, CMU_PERIC1, the PERIC1 / PERIC0 pad pages, and the ALIVE /
 + * FAR_ALIVE pad pages for the IRQ pads, read only), then ONE run of amp_init_run() synchronously, from sweet_ufs_init BEFORE the touch and battery
 + * threads start (gpp23 is shared with the touch chip select and the I2C12 pads; no other read-modify-write of those words can interleave).
-+ * The run takes about 0.3 s (two 4 ms reset releases, up to 2 x 100 ms OTP polls, a few hundred SPI transfers at 6 MHz) and always ends with both resets
-+ * low and every word back (the header's restore). The only stores of this file are in sa_wr32(), called only through the header's w32().
++ * The run takes about 0.3 s when both amps answer, about 9.3 s in the worst case (every wait at its bound, review F8), and always ends with both
++ * resets low and every word back (the header's restore). The only stores of this file are in sa_wr32(), called only through the header's w32().
 + * Difference to the shim: XNU has no fault-guarded read; a read of an unclocked block is guarded only by the header's sysreg / CMU gate reads, which
 + * come first (the same order as the shim, whose run must pass before this one runs: plan A7 needs A1 PASS).
 + */
@@ -166,35 +166,41 @@ new file mode 100644
 +	}
 +	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sa_freq);
 +	printf("SWEET AMP: init run (sweetamp=1), timebase %llu Hz\n", sa_freq);
-+	(void)amp_init_run();
++	printf("SWEET AMP: verdict %s\n", amp_init_run() == 0 ? "PASS (A7 partial: no otp unpack)" : "FAIL (see the AMP lines)");	/* review F1: the return value */
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_amp.h
-@@ -0,0 +1,994 @@
+@@ -0,0 +1,1004 @@
 +/*
 + * bsd/dev/sweet_amp.h - xnu patch 0158 (plan oneshot-2 step A7, boot-arg sweetamp=1): the two CS35L41 speaker amps of oriole on USI13 / SPI13.
 + * Pure logic, included by bsd/dev/sweet_amp.c (MMIO glue) and by the host test shim/amp_xnu_host_test.c. Every hardware access goes through the
 + * includer's try_read32 / try_write32 (physical addresses; the glue maps them), every store through w32() behind w32_allowed().
 + *
-+ * Part 1 is the port of the shim --amp-id identify (pk-amp wip/shim-amp-id, shim/ampid.c with the F1-F3 fixes of docs/reviews/ampid-review-fable-1.md, round 2 pending):
++ * Part 1 is the port of the shim --amp-id identify (pk-amp wip/shim-amp-id, shim/ampid.c at 4c7be85, SAFE: docs/reviews/ampid-review-fable-2.md):
 + * the same SPI13 master (Google soc-gs spi-s3c64xx.c polling path), the same pad / sysreg / mux allowlist, the same reset release and restore.
 + * Part 2 (A7) adds the probe-time register WRITES of the stock cs35l41_probe for revision B2, after the identify passed on that amp:
-+ *   IRQ1_MASK1 0x10110 := CS35L41_INT1_MASK_DEFAULT 0x7FFCFE3F (AMP cs35l41.c:4300-4302; cs35l41.h:132, :702);
++ *   IRQ1_MASK1 0x10110 := CS35L41_INT1_MASK_DEFAULT 0x7FFCFE3F (AMP cs35l41.c:4306-4308; cs35l41.h:132, :702);
 + *   cs35l41_revb2_errata_patch (AMP cs35l41.c:3675-3686, applied at :4351-4362): TEST_KEY_CTL 0x40 := 0x5555, 0xAAAA; VIMON_SPKMON_RESYNC 0x4100 := 0;
 + *     0x4310 := 0; VPVBST_FS_SEL 0x4400 := 0; BSTCVRT_DCM_CTRL 0x381C := 0x51; DSP1_YM_ACCEL_PL0_PRI 0x2BC20E0 := 0; DSP1_XM_ACCEL_PL0_PRI 0x2BC2020 := 0;
 + *     TEST_KEY_CTL := 0xCCCC, 0x3333 (cs35l41.h:30, :76, :80, :84, :324, :330);
 + *   DSP1_CCM_CORE_CTRL 0x2BC1000 := 0 (AMP cs35l41.c:4401, cs35l41.h:318).
 + *   NOT done: cs35l41_otp_unpack (:4385, :1856-1975): it needs the OTP bit maps of cs35l41-tables.c:726-966 (GPL-2.0 data tables; copying them into an APSL
 + *   patch is not decided): recorded as blocked. Its trims matter for the output stage, which this patch never enables.
-+ * The write allowlist is exactly those 13 (register, value) pairs; PWR_CTRL1 0x2014 (GLOBAL_EN, cs35l41.h:42, :667) is not in it and is refused by name.
++ * The write allowlist is exactly those 12 (register, value) pairs; PWR_CTRL1 0x2014 (GLOBAL_EN, cs35l41.h:42, :667) is not in it and is refused by name.
 + * A write frame (AMP cs35l41-spi.c:32-45, GKI regmap-spi.c write = one transfer): the 32-bit address with bit 31 CLEAR, 2 pad bytes 0, the 32-bit value,
 + * big endian, 10 bytes. Its bytes are accepted by the TX allowlist only while an allowed pair is armed (amp_write), at their exact frame position.
 + * After the writes: IRQ1_STATUS1 0x10010 read; error bits AMP_SHORT_ERR 0x80000000, TEMP_ERR 0x20000, TEMP_WARN 0x8000, BST_SHORT_ERR 0x100,
 + * BST_DCM_UVP_ERR 0x80, BST_OVP_ERR 0x40 (cs35l41.h:124, :684-689) must be 0. Then the usual restore: both resets low (the amps lose the writes), every
-+ * pad / controller / sysreg / mux word back. Pass line: "SWEET AMP: init ok l,r devid 35a40 rev b2, errors=0".
++ * pad / controller / sysreg / mux word back. Pass line (A7 PARTIAL: no OTP unpack, review F3): "SWEET AMP: init ok (no otp unpack) l,r devid 35a40 rev b2,
++ * errors=0". Any later step that sets GLOBAL_EN must first add the OTP unpack. Worst-case run time about 9.3 s (review F8).
++ * The read check is per byte position, so about 90 addresses are readable, all with the read flag (0x80 / 0x82 first byte); no write (review F8).
++ * Known and accepted (review F5, F7, F9): the TX check does not track which bytes are queued, so a caller that changed the arm state inside one frame
++ * could mix frames; the only caller arms for exactly one transfer (pinned by the host test). What 0x4100 / 0x4310 / 0x4400 / BSTCVRT_DCM_CTRL do bit by
++ * bit is not in the pinned sources; stock writes exactly these values at every boot before GLOBAL_EN is ever set (cs35l41.c:4357-4359, :2292-2294).
++ * IRQ1_MASK1 unmasks six sources; the INT pads gpa6-3 / gpa9-6 are never written here and the amps go back into reset ~0.15 s later.
 + * Concurrency: the reset of the R amp (gpp23-7) shares the gpp23 pad words with the touch chip select (gpp23-3) and the I2C12 pads (gpp23-4/5): the glue runs
 + * this synchronously in sweet_ufs_init BEFORE the touch and battery threads start, so no other read-modify-write of those words can interleave.
 + */
@@ -355,14 +361,14 @@ new file mode 100644
 +#define AMP_REG_CCM_CORE	0x2BC1000u
 +#define AMP_REG_PWR_CTRL1	0x2014u		/* GLOBAL_EN lives here: never written (refused by name below) */
 +#define AMP_INT1_MASK_DEFAULT	0x7FFCFE3Fu
-+#define AMP_ERR_BITS		(0x80000000u | 0x20000u | 0x8000u | 0x100u | 0x80u | 0x40u)
++#define AMP_ERR_BITS		(0x80000000u | 0x20000u | 0x10000u | 0x8000u | 0x100u | 0x80u | 0x40u)	/* + bit 16: unmasked by INT1_MASK_DEFAULT, unnamed (review F6) */
 +#define AMP_WTX_BYTES		(AMP_ADDR_BYTES + AMP_PAD_BYTES + AMP_VAL_BYTES)
 +/* the init sequence, in stock order: X(register, value) */
 +#define AMP_INIT_SEQ(X) X(AMP_REG_IRQ1_MASK1, AMP_INT1_MASK_DEFAULT) \
 +	X(AMP_REG_TEST_KEY, 0x5555u) X(AMP_REG_TEST_KEY, 0xAAAAu) X(0x4100u, 0u) X(0x4310u, 0u) X(0x4400u, 0u) X(0x381Cu, 0x51u) X(0x2BC20E0u, 0u) \
 +	X(0x2BC2020u, 0u) X(AMP_REG_TEST_KEY, 0xCCCCu) X(AMP_REG_TEST_KEY, 0x3333u) X(AMP_REG_CCM_CORE, 0u)
 +
-+/* a (register, value) pair the init may write: exactly the 13 of AMP_INIT_SEQ; never PWR_CTRL1 */
++/* a (register, value) pair the init may write: exactly the 12 of AMP_INIT_SEQ; never PWR_CTRL1 */
 +static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint32_t val)
 +{
 +	int ok = 0;
@@ -839,15 +845,23 @@ new file mode 100644
 +	return e;
 +}
 +
++/* identified as the stock probe requires before any write: the reads worked, OTP_BOOT_DONE seen, OTP_BOOT_ERR clear, DEVID / REVID = CS35L41 B2 */
++#define AMP_ID_OK(ee, rr)	((ee) == AMP_OK && (rr).otp && !((rr).st3 & AMP_OTP_BOOT_ERR) && (rr).devid == AMP_DEVID && (rr).revid == AMP_REVID)
++
 +/* A7: the B2 probe writes in stock order, then IRQ1_STATUS1 / IRQ1_MASK1 / DSP1_CCM_CORE_CTRL read back. 0 = all written, read back, no error bit */
 +static int amp_init(const struct amp_snap *s, int cs, const char *name)
 +{
-+	uint32_t st1 = 0, mask = 0, ccm = 0;
++	uint32_t st1 = 0, mask = 0, ccm = 0, st0 = 0;
 +	unsigned n = 0;
 +	int e = AMP_OK;
 +	char line[RAMLOG_LINE_MAX];
 +	unsigned p;
 +
++	e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &st0);	/* review F6: the error bits once before the first write; any set = no write */
++	if (e == AMP_OK && (st0 & AMP_ERR_BITS)) {
++		say(name, " !!! amp error bit in IRQ1_STATUS1 before the init: no write (H8)");
++		e = AMP_ERROR;
++	}
 +#define AMP_W_DO(r, v) if (e == AMP_OK) { e = amp_write(s, cs, (r), (v)); n++; }
 +	AMP_INIT_SEQ(AMP_W_DO)
 +#undef AMP_W_DO
@@ -1079,7 +1093,7 @@ new file mode 100644
 +	uint32_t div = 0, ip = 0, pc = 0, q = 0, st = 0;
 +	enum peri_gate g;
 +	const char *why;
-+	int e = AMP_OK, el = AMP_ERROR, er = AMP_ERROR, il = AMP_ERROR, ir = AMP_ERROR, stage = 1, restored;
++	int e = AMP_OK, el = AMP_ERROR, er = AMP_ERROR, il = AMP_ERROR, ir = AMP_ERROR, stage = 1, restored, pass;
 +	char gl[48];
 +	unsigned gp;
 +
@@ -1140,13 +1154,13 @@ new file mode 100644
 +		if (el == AMP_OK)
 +			el = amp_probe(&s, 0, &l);
 +		amp_line("L", &l, el);
-+		if (el == AMP_OK && l.otp && l.devid == AMP_DEVID && l.revid == AMP_REVID)
++		if (AMP_ID_OK(el, l))	/* review F1: identified, OTP_BOOT_DONE seen, OTP_BOOT_ERR clear */
 +			il = amp_init(&s, 0, "L");
 +		er = reset_release(&s, P23, AMP_PIN_RST_R_NR);
 +		if (er == AMP_OK)
 +			er = amp_probe(&s, 1, &r);
 +		amp_line("R", &r, er);
-+		if (er == AMP_OK && r.otp && r.devid == AMP_DEVID && r.revid == AMP_REVID)
++		if (il == AMP_OK && AMP_ID_OK(er, r))	/* review F4: no R write after a failed L init */
 +			ir = amp_init(&s, 1, "R");
 +	}
 +
@@ -1157,13 +1171,9 @@ new file mode 100644
 +		say("!!! RESTORE FAILED: ", "a phone reset clears it (guess)");
 +	}
 +	result(&l, &r, restored ? "ok" : "FAILED");
-+	if (il == AMP_OK && ir == AMP_OK && restored)
-+		con_str("SWEET", "AMP: init ok l,r devid 35a40 rev b2, errors=0");
-+	else
-+		con_str("SWEET", "AMP: init FAILED (see the AMP lines)");
-+	return il == AMP_OK && ir == AMP_OK && e == AMP_OK && el == AMP_OK && er == AMP_OK && l.otp && r.otp && !(l.st3 & AMP_OTP_BOOT_ERR) && !(r.st3 & AMP_OTP_BOOT_ERR) &&
-+	       l.devid == AMP_DEVID && l.revid == AMP_REVID && r.devid == AMP_DEVID &&
-+	       r.revid == AMP_REVID && restored ? 0 : 1;
++	pass = e == AMP_OK && il == AMP_OK && ir == AMP_OK && AMP_ID_OK(el, l) && AMP_ID_OK(er, r) && restored;	/* review F1: ONE condition */
++	con_str("SWEET", pass ? "AMP: init ok (no otp unpack) l,r devid 35a40 rev b2, errors=0" : "AMP: init FAILED (see the AMP lines)");
++	return pass ? 0 : 1;
 +}
 +
 +
