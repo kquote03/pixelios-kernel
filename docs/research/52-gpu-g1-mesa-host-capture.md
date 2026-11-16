@@ -326,3 +326,25 @@ index; the clone's HEAD stays pristine 26.2.5).
 8. The host (Linux) build was not rebuilt with 0005+0006 (`pan_kmod.c` now calls `sweet_kmod_import_size`, defined in `sweet_kmod.c`, which the host
    build also compiles [src]; not built [guess that it links]).
 9. `check-sdk-symbols.py` cannot see API availability (11.2 limitation).
+
+### 11.7 GLI slot map (2026-11-16, host only; closes 11.6 item 2 in part)
+
+Output `$A/gpu/gli-slots.txt` (not in git; sha256 a27da00dc330aabeeab600757b9d1c7f5bfd5af7c7c1450ca547430c7dac4a37), 393 `<slot> <glName>` lines,
+slots 0..1032; tools `gpu/tools/hfs_extract.py` + `gpu/tools/gli_slots.py` (stdlib Python, run with `python3 -I`).
+* Cache: `$A/ios-root-oriole-v2.img` (HFSX; SystemVersion 20H392), `/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/`
+  `dyld_shared_cache_arm64{,.01-.42,.symbols}`, all hard links into `[HFS+ Private Data]`; 7-Zip 17 gives "Data Error" on them, `hfs_extract.py`
+  resolves the links and extents overflow. Extracted to `$A/gpu/dsc/cache/` [obs]. The IPSW dmgs were not needed.
+* GLEngine's local symbols are `<redacted>` in this cache (1876 locals, no names) [obs], so `_gliInitDispatchTable` cannot be found by name.
+* Method used instead: every exported `_gl*` of `OpenGLES.framework/OpenGLES` is a thunk `mrs TPIDRRO_EL0; ldr ctx,[tls,#240]; ldr fn,[ctx,#off];`
+  `ldr x0,[ctx,#32]; br fn` [obs-RE]. So ctx = {+32 rctx, +40 disp[0]} and slot = (off-40)/8; 440 thunks give 393 slots [obs-RE]. The name is
+  Apple's export name; where several names share a slot the core name is listed first and the others as a `# alias` comment (ignored by the
+  shim parser, which reads `%u %127s`) [src 0006 sweetgl_gli_fill].
+* Check against docs 33/36: 98 glGenTextures, 104 glGetIntegerv, 117 glGetString, 779 glFenceSync, 781 glDeleteSync match [obs-RE];
+  **1024 mismatch**: Apple's export at 1024 is `glFramebufferParameteriAPPLE` (1025 `glGetFramebufferParameteriAPPLE`); doc 33 and the shim
+  special say `glFramebufferParameterivAPPLE`. Not adjusted. Whether CA passes a value or a pointer must be re-read at 0x18840771c [guess: value].
+* Cross-check with GLEngine [obs-RE, partial]: one function at 0x1f6e9ae20 stores 411 GLEngine text pointers with `ldr x9,[x10,#off]; cmp; csel
+  x9,x11,x10,eq; adrp/add; str [x9,#off]`, offsets on the same ctx layout (slots 0..1028). 155 thunk slots (incl. 104, 117) are not stored there and
+  171 stored slots have no exported thunk; no pointer template table exists in GLEngine `__DATA_CONST` [obs]. So the init is split or partly
+  conditional; the full 1036-slot coverage is still unknown.
+* Not in the map [obs]: desktop/ARB names the shim special-cases and CA uses (`glAttachObjectARB`, `glGetInfoLogARB`, `glGetHandleARB`,
+  `glBindFramebufferEXT`, `glGetIntegerIndexedv`, ...): OpenGLES does not export them, so their slots are not named by this method.
