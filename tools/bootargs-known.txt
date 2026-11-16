@@ -453,6 +453,7 @@ swd_waketimeout	xnu
 sweet_amfi_debug	patch:0035
 sweetaccel	patch:0084
 sweetamp	patch:0158
+sweetaoc	patch:0161
 sweetbatt	patch:0148
 sweetbattery	patch:0061
 sweetbusy	patch:0098

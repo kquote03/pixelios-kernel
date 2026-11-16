@@ -1,0 +1,287 @@
+SWEET AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4), boot-arg sweetaoc=1. READS ONLY: aoc_req 0x175D0000
+(+0x00, +0x40), the GSA mailbox 0x17C90000 mask/status/shared registers, the ACPM channel 13 descriptor and queue pointers in APM SRAM
+0x02039000, the AOC SysMMU 0x1A090000 CTRL/CFG/STATUS/VERSION/CAPA. Every block is one the stock kernel claims (ref iomem.txt); the AOC
+S2MPU 0x1A0B0000 is not read (no stock claim, XNU has no fault-safe read). Cites in bsd/dev/sweet_aoc.h (host test shim/aoc_pre_host_test.c).
+Hooked at the top of sweet_trusty_init (patch 0156), before any secure-world call. Lines "SWEET AOC PRE: ...", last
+"SWEET AOC PRE: verdict PASS|FAIL reads=N". Without the boot-arg nothing changes.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_trusty.c		standard
++bsd/dev/sweet_aoc.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_aoc.c
+@@ -0,0 +1,75 @@
++/*
++ * AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4). Boot-arg sweetaoc=1; without it nothing runs.
++ * READS ONLY (cites in sweet_aoc.h): aoc_req, the GSA mailbox status/shared registers, the ACPM channel 13 descriptor and
++ * queue pointers, the AOC SysMMU id/status registers. No write of any kind. Called from sweet_trusty_init (patch 0156),
++ * before any secure-world call. Lines: "SWEET AOC PRE: ..." then "SWEET AOC PRE: verdict PASS|FAIL ...".
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++
++#include "sweet_aoc.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++void sweet_aoc_init(void);
++
++static const struct {
++	uint64_t pa;
++	uint32_t len;
++} swa_win[SWA_NWIN] = {
++	[SWA_W_REQ] = { SWA_REQ_PA, SWA_REQ_LEN },
++	[SWA_W_GSA] = { SWA_GSA_PA, SWA_GSA_LEN },
++	[SWA_W_MMU] = { SWA_MMU_PA, SWA_MMU_LEN },
++	[SWA_W_ACPM] = { SWA_ACPM_PA, SWA_ACPM_LEN },
++};
++static vm_offset_t swa_va[SWA_NWIN];
++
++static int
++swa_r32(__unused void *ctx, int w, uint32_t off, uint32_t *out)
++{
++	if (w < 0 || w >= SWA_NWIN || swa_va[w] == 0 || (off & 3u) || off > swa_win[w].len - 4u) {
++		return 0;
++	}
++	*out = *(volatile uint32_t *)(swa_va[w] + off);
++	return 1;
++}
++
++void
++sweet_aoc_init(void)
++{
++	static struct swa_res r;
++	static const struct swa_bus b = { swa_r32, NULL };
++	uint32_t on = 0, i;
++	int ok;
++
++	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (on != 1) {
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1), not touched\n", on);
++		return;
++	}
++	for (i = 0; i < SWA_NWIN; i++) {
++		swa_va[i] = ml_io_map((vm_offset_t)swa_win[i].pa, (vm_size_t)swa_win[i].len);
++		if (swa_va[i] == 0) {
++			printf("SWEET AOC PRE: ml_io_map(%#llx) failed, that block is not read\n", swa_win[i].pa);
++		}
++	}
++	printf("SWEET AOC PRE: start, reads only (aoc_req, gsa, acpm ch13, sysmmu; s2mpu 0x1a0b0000 not read: no stock claim)\n");
++	ok = swa_probe(&b, &r);
++	printf("SWEET AOC PRE: aoc_req ok=%u req=%08x status(+0x40)=%08x\n", r.ok_req, r.req, r.req_st);
++	printf("SWEET AOC PRE: gsa ok=%u mcuctlr=%08x intmr0=%08x intsr0=%08x intmsr0=%08x intmr1=%08x intsr1=%08x intmsr1=%08x\n",
++	    r.ok_gsa, r.gsa[0], r.gsa[1], r.gsa[2], r.gsa[3], r.gsa[4], r.gsa[5], r.gsa[6]);
++	printf("SWEET AOC PRE: gsa sr0=%08x sr1=%08x sr2=%08x\n", r.gsa[7], r.gsa[8], r.gsa[9]);
++	printf("SWEET AOC PRE: acpm ch13 ok=%u why=%s n=%u tab=%#x idx=%u q=%08x/%08x %08x/%08x\n", r.ok_acpm,
++	    swa_acpm_why(r.acpm_why), r.acpm_n, r.acpm_tab, r.acpm_idx, r.acpm_q[0], r.acpm_q[1], r.acpm_q[2], r.acpm_q[3]);
++	printf("SWEET AOC PRE: acpm ch13 d0-8 %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.acpm_d[0], r.acpm_d[1],
++	    r.acpm_d[2], r.acpm_d[3], r.acpm_d[4], r.acpm_d[5], r.acpm_d[6], r.acpm_d[7], r.acpm_d[8]);
++	printf("SWEET AOC PRE: acpm ch13 d9-17 %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.acpm_d[9], r.acpm_d[10],
++	    r.acpm_d[11], r.acpm_d[12], r.acpm_d[13], r.acpm_d[14], r.acpm_d[15], r.acpm_d[16], r.acpm_d[17]);
++	printf("SWEET AOC PRE: sysmmu ok=%u ctrl=%08x cfg=%08x status=%08x version=%08x (%u.%u.%u) capa0=%08x capa1=%08x\n",
++	    r.ok_mmu, r.mmu[0], r.mmu[1], r.mmu[2], r.mmu[3], r.mmu_maj, r.mmu_min, r.mmu_rev, r.mmu[4], r.mmu[5]);
++	printf("SWEET AOC PRE: verdict %s reads=%u\n", ok ? "PASS" : "FAIL", r.nread);
++}
+diff --git a/bsd/dev/sweet_aoc.h b/bsd/dev/sweet_aoc.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_aoc.h
+@@ -0,0 +1,164 @@
++/*
++ * AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4), boot-arg sweetaoc=1. READS ONLY. Pure logic, no kernel
++ * headers: the host test (shim/aoc_pre_host_test.c) drives it with a fake SoC. Every block read here is one the stock
++ * Linux kernel maps and reads on this phone (observed, recovery capture ref/oriole/20261114T072643Z iomem.txt lines given):
++ *   aoc_req   0x175D0000 (iomem:54 "19000000.aoc aoc_req"; dts gs101-aoc.dtsi:31-36): +0x00 the request word written by
++ *             request_aoc_on() (aoc_v1.c:87-91), +0x40 its status word, polled by the stock reset path (aoc_v1.c:93-106).
++ *   gsa-ns    0x17C90000 (iomem:58; gs101-gsa.dtsi:3-12): MCUCTLR 0x00, INTMR0 0x28, INTSR0 0x2C, INTMSR0 0x30, INTMR1 0x48,
++ *             INTSR1 0x4C, INTMSR1 0x50, SR0..SR3 0x80..0x8C (gsa_mbox.c:22-57). No doorbell, no clear, no shared write.
++ *   sysmmu    0x1A090000 (iomem:61; samsung-sysmmu, dmesg:907 "Ver 8.1.0, no gate clock"): CTRL 0x000, CFG 0x004,
++ *             STATUS 0x008, VERSION 0x034, CAPA0 0x870, CAPA1 0x874 (google soc/gs 2040787 drivers/iommu/samsung-iommu.h:
++ *             191-197); the stock probe reads VERSION/CAPA without any clock (samsung-iommu.c:88-118, :1576-1627).
++ *             Version decode MMU_RAW_VER/MAJ/MIN/REV (samsung-iommu.h:207-211).
++ *   acpm SRAM 0x02039000 (iomem:2 "17610000.acpm_ipc"; soc/google/gs101/soc.json acpm, layout_verified 1 on hardware,
++ *             run acpm3): framework at +0xA000 (ipc_channels +0x08, ipc_ap_max +0x18), descriptor stride 0x48, fields as
++ *             shim/acpm.c D_*; the AOC channel is 13 (gs101-aoc.dtsi acpm-ipc-channel = <13>, docs/research/46:34).
++ * Not read: the AOC S2MPU 0x1A0B0000. The stock kernel has no node and no iomem claim for it (ref dt/base has no
++ * s2mpu@1A0B0000; docs/research/50 6.5) and XNU has no fault-safe MMIO read, so an access that the bus refuses would panic.
++ */
++#ifndef SWEET_AOC_H
++#define SWEET_AOC_H
++
++#include <stdint.h>
++
++#define SWA_REQ_PA        0x175D0000ull
++#define SWA_REQ_LEN       0x1000u
++#define SWA_REQ_REQ       0x00u
++#define SWA_REQ_STATUS    0x40u
++#define SWA_GSA_PA        0x17C90000ull
++#define SWA_GSA_LEN       0x1000u
++#define SWA_MMU_PA        0x1A090000ull
++#define SWA_MMU_LEN       0x10000u
++#define SWA_ACPM_PA       0x02039000ull
++#define SWA_ACPM_LEN      0x40000u
++#define SWA_ACPM_INIT     0xA000u
++#define SWA_ACPM_TAB      0x08u
++#define SWA_ACPM_APMAX    0x18u
++#define SWA_ACPM_STRIDE   0x48u
++#define SWA_ACPM_WORDS    18u
++#define SWA_ACPM_CH       13u
++#define SWA_ACPM_MAXCH    32u
++
++enum { SWA_W_REQ = 0, SWA_W_GSA, SWA_W_MMU, SWA_W_ACPM, SWA_NWIN };
++
++struct swa_bus {
++	/* one aligned 32-bit read at offset off of window w; returns 0 when the window is not mapped or off is outside it */
++	int (*r32)(void *ctx, int w, uint32_t off, uint32_t *out);
++	void *ctx;
++};
++
++static const uint32_t swa_gsa_off[10] = { 0x00, 0x28, 0x2C, 0x30, 0x48, 0x4C, 0x50, 0x80, 0x84, 0x88 };
++static const uint32_t swa_mmu_off[6] = { 0x000, 0x004, 0x008, 0x034, 0x870, 0x874 };
++
++struct swa_res {
++	uint32_t ok_req, ok_gsa, ok_mmu, ok_acpm;       /* 1 = the block was read in full */
++	uint32_t req, req_st;
++	uint32_t gsa[10];
++	uint32_t mmu[6];
++	uint32_t mmu_maj, mmu_min, mmu_rev;
++	uint32_t acpm_n, acpm_tab, acpm_idx, acpm_why;  /* why: 0 ok, 1 read fault, 2 ap_max, 3 table, 4 no ch13, 5 index, 6 ptr */
++	uint32_t acpm_d[SWA_ACPM_WORDS];
++	uint32_t acpm_q[4];                             /* AP->APM rear, front; APM->AP rear, front (shim/acpm.c D_RX_ and D_TX_ fields) */
++	uint32_t nread;
++};
++
++static inline const char *
++swa_acpm_why(uint32_t w)
++{
++	static const char *const n[] = { "ok", "read-fault", "bad-ap-max", "bad-table", "no-ch13", "ch13-not-at-index-13", "bad-ptr" };
++
++	return w < 7u ? n[w] : "?";
++}
++
++static inline int
++swa_rd(const struct swa_bus *b, struct swa_res *r, int w, uint32_t off, uint32_t *out)
++{
++	r->nread++;
++	return b->r32(b->ctx, w, off, out);
++}
++
++static inline void
++swa_acpm(const struct swa_bus *b, struct swa_res *r)
++{
++	uint32_t i, id = 0, off, desc;
++
++	if (!swa_rd(b, r, SWA_W_ACPM, SWA_ACPM_INIT + SWA_ACPM_APMAX, &r->acpm_n) ||
++	    !swa_rd(b, r, SWA_W_ACPM, SWA_ACPM_INIT + SWA_ACPM_TAB, &r->acpm_tab)) {
++		r->acpm_why = 1;
++		return;
++	}
++	if (r->acpm_n < 1u || r->acpm_n > SWA_ACPM_MAXCH) {
++		r->acpm_why = 2;
++		return;
++	}
++	if ((r->acpm_tab & 3u) || (uint64_t)r->acpm_tab + (uint64_t)r->acpm_n * SWA_ACPM_STRIDE > SWA_ACPM_LEN) {
++		r->acpm_why = 3;
++		return;
++	}
++	for (r->acpm_idx = 0; r->acpm_idx < r->acpm_n; r->acpm_idx++) {
++		if (!swa_rd(b, r, SWA_W_ACPM, r->acpm_tab + r->acpm_idx * SWA_ACPM_STRIDE, &id)) {
++			r->acpm_why = 1;
++			return;
++		}
++		if (id == SWA_ACPM_CH) {
++			break;
++		}
++	}
++	if (r->acpm_idx == r->acpm_n) {
++		r->acpm_why = 4;
++		return;
++	}
++	desc = r->acpm_tab + r->acpm_idx * SWA_ACPM_STRIDE;
++	for (i = 0; i < SWA_ACPM_WORDS; i++) {
++		if (!swa_rd(b, r, SWA_W_ACPM, desc + 4u * i, &r->acpm_d[i])) {
++			r->acpm_why = 1;
++			return;
++		}
++	}
++	if (r->acpm_idx != SWA_ACPM_CH) {
++		r->acpm_why = 5;
++		return;
++	}
++	for (i = 0; i < 4; i++) {       /* D_RX_REAR 4, D_RX_FRONT 5, D_TX_REAR 10, D_TX_FRONT 11 (shim/acpm.c) */
++		off = r->acpm_d[i < 2 ? 4u + i : 10u + i - 2u];
++		if ((off & 3u) || off > SWA_ACPM_LEN - 4u) {
++			r->acpm_why = 6;
++			return;
++		}
++		if (!swa_rd(b, r, SWA_W_ACPM, off, &r->acpm_q[i])) {
++			r->acpm_why = 1;
++			return;
++		}
++	}
++	r->acpm_why = 0;
++	r->ok_acpm = 1;
++}
++
++/* Reads only, in a fixed order (aoc_req, gsa, acpm, sysmmu). Returns 1 when every block was read and decoded. */
++static inline int
++swa_probe(const struct swa_bus *b, struct swa_res *r)
++{
++	uint32_t i, raw;
++
++	if (b == 0 || b->r32 == 0 || r == 0) {
++		return 0;
++	}
++	*r = (struct swa_res){ 0 };
++	r->ok_req = swa_rd(b, r, SWA_W_REQ, SWA_REQ_REQ, &r->req) && swa_rd(b, r, SWA_W_REQ, SWA_REQ_STATUS, &r->req_st);
++	r->ok_gsa = 1;
++	for (i = 0; i < 10u; i++) {
++		r->ok_gsa &= (uint32_t)swa_rd(b, r, SWA_W_GSA, swa_gsa_off[i], &r->gsa[i]);
++	}
++	swa_acpm(b, r);
++	r->ok_mmu = 1;
++	for (i = 0; i < 6u; i++) {
++		r->ok_mmu &= (uint32_t)swa_rd(b, r, SWA_W_MMU, swa_mmu_off[i], &r->mmu[i]);
++	}
++	raw = (r->mmu[3] >> 17) & 0x7FFFu;
++	r->mmu_maj = raw >> 11;
++	r->mmu_min = (raw >> 4) & 0x7Fu;
++	r->mmu_rev = raw & 0xFu;
++	return r->ok_req && r->ok_gsa && r->ok_acpm && r->ok_mmu && r->mmu_maj == 8u;
++}
++
++#endif /* SWEET_AOC_H */
+diff --git a/bsd/dev/sweet_trusty.c b/bsd/dev/sweet_trusty.c
+--- a/bsd/dev/sweet_trusty.c
++++ b/bsd/dev/sweet_trusty.c
+@@ -16,6 +16,7 @@
+ #include "sweet_trusty.h"
+ 
+ void sweet_trusty_init(void);
++extern void sweet_aoc_init(void);  /* bsd/dev/sweet_aoc.c (patch 0161), reads only, needs boot-arg sweetaoc=1 */
+ 
+ static uint64_t
+ sweet_trusty_smc(__unused void *ctx, uint64_t fid, uint64_t a1)
+@@ -38,6 +39,8 @@
+ 	static const struct swt_bus b = { sweet_trusty_smc, NULL };
+ 	uint32_t on = 0;
+ 
++	sweet_aoc_init();              /* no-op without boot-arg sweetaoc=1; before any secure-world call */
++
+ 	if (!PE_parse_boot_argn("sweettrusty", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}

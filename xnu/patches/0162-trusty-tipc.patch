@@ -1,0 +1,939 @@
+SWEET Trusty TIPC GET_STATE (patch 0162, plan 2026-11-14 oneshot-2 step A5), boot-arg sweettrusty=2. Replays the stock Linux Trusty
+driver path (kernel/google-modules/trusty 2494a3e, docs/research/50 sections 1-4): API version, FF-A init and RXTX_MAP, FF-A shares
+(descriptor, 2 vrings, 4 rx buffers RW, 3 tx buffers RO), VIRTIO_GET_DESCR, VDEV_RESET, status ACK|DRIVER|DRIVER_OK, VIRTIO_START,
+GO_ONLINE, one connect to com.android.trusty.gsa.hwmgr.aoc, HWMGR_CMD_STATE_CMD with GSA_AOC_GET_STATE (0) only, disconnect, then
+VDEV_RESET, reclaims, VIRTIO_STOP, RXTX_UNMAP. Plan rule A-1 allowlist enforced per call (function id and arguments) in
+bsd/dev/sweet_tipc.h; no call is retried with other arguments; every std-call <= 2 s, the run <= 10 s. Shared memory is one
+KMA_PERMANENT contiguous allocation, never freed. Host test shim/tipc_host_test.c (fake Trusty). Lines "SWEET TRUSTY: hwmgr.aoc state=N"
+(pass) or "SWEET TRUSTY: tipc stop ...", last "SWEET TRUSTY: tipc done ...". Without sweettrusty=2 nothing changes.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -124,6 +124,7 @@
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_trusty.c		standard
+ bsd/dev/sweet_aoc.c		standard
++bsd/dev/sweet_tipc.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_tipc.c b/bsd/dev/sweet_tipc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_tipc.c
+@@ -0,0 +1,115 @@
++/*
++ * Trusty TIPC GET_STATE (patch 0162, plan 2026-11-14 oneshot-2 step A5), boot-arg sweettrusty=2, called from
++ * sweet_trusty_init (patch 0156). The logic, its allowlist (plan rule A-1) and the cites are in sweet_tipc.h (host test
++ * shim/tipc_host_test.c). This file only provides the monitor call (interrupts masked around each smc, as
++ * tru:trusty.c:140-176 does), the clock, and the shared memory: one wired, zeroed, physically contiguous allocation that
++ * is never freed (KMA_PERMANENT, the pattern of patch 0159), so a late access by the secure side can only reach memory
++ * nothing else owns, even if a reclaim is refused. Lines: "SWEET TRUSTY: hwmgr.aoc state=N" (pass) or
++ * "SWEET TRUSTY: tipc stop ...", then "SWEET TRUSTY: tipc done ...".
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <mach/vm_param.h>
++#include <stdint.h>
++
++#include "sweet_tipc.h"
++
++extern vm_offset_t kvtophys(vm_offset_t);
++void sweet_tipc_run(void);
++
++static void
++swtp_smc_hw(__unused void *ctx, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3, struct swtp_ret *out)
++{
++	register uint64_t x0 __asm__("x0") = fid;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	register uint64_t x4 __asm__("x4") = 0;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
++	register uint64_t x7 __asm__("x7") = 0;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7) : :
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	(void)ml_set_interrupts_enabled(istate);
++	out->r0 = x0;
++	out->r1 = x1;
++	out->r2 = x2;
++	out->r3 = x3;
++}
++
++static uint64_t
++swtp_now_hw(__unused void *ctx)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000u;
++}
++
++static void
++swtp_delay_hw(__unused void *ctx, uint32_t us)
++{
++	delay((int)us);
++}
++
++void
++sweet_tipc_run(void)
++{
++	static struct swtp_res r;
++	static struct swtp_bus b;
++	vm_offset_t va = 0;
++	vm_size_t len = round_page(SWTP_ARENA);
++	uint64_t pa;
++	vm_size_t i;
++	int rc;
++
++	printf("SWEET TRUSTY: tipc starts (FF-A shares, virtio, one TIPC port com.android.trusty.gsa.hwmgr.aoc, GET_STATE only)\n");
++	if (kmem_alloc_contig(kernel_map, &va, len, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || va == 0) {
++		printf("SWEET TRUSTY: tipc stop no-memory (nothing sent to the secure world)\n");
++		return;
++	}
++	pa = (uint64_t)kvtophys(va);
++	for (i = 0; i < len && pa != 0; i += PAGE_SIZE) {
++		if ((uint64_t)kvtophys(va + i) != pa + i) {
++			pa = 0;
++		}
++	}
++	if (pa == 0 || (pa & (SWTP_PG - 1u))) {
++		printf("SWEET TRUSTY: tipc stop memory-not-contiguous (nothing sent to the secure world)\n");
++		return;
++	}
++	b.smc = swtp_smc_hw;
++	b.now_us = swtp_now_hw;
++	b.delay_us = swtp_delay_hw;
++	b.ctx = NULL;
++	b.arena = (uint8_t *)va;
++	b.arena_pa = pa;
++	printf("SWEET TRUSTY: tipc arena %u bytes at pa %#llx\n", (unsigned)SWTP_ARENA, (unsigned long long)pa);
++	rc = swtp_run(&b, &r);
++	printf("SWEET TRUSTY: tipc api=%u ffa=%#x id=%#x descr=%u vdev nid=%u dfeat=%#x gfeat=%#x cfg=%u msgmax=%u\n",
++	    r.api, r.ffa_ver, r.ffa_id, r.descr_sz, r.vdev_nid, r.dfeat, r.gfeat, r.cfg_len, r.msg_max);
++	printf("SWEET TRUSTY: tipc vring0 num=%u align=%u nid=%u size=%u vring1 num=%u align=%u nid=%u size=%u\n",
++	    r.vr_num[0], r.vr_align[0], r.vr_nid[0], r.vr_size[0], r.vr_num[1], r.vr_align[1], r.vr_nid[1], r.vr_size[1]);
++	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.descr_w[0],
++	    r.descr_w[1], r.descr_w[2], r.descr_w[3], r.descr_w[4], r.descr_w[5], r.descr_w[6], r.descr_w[7], r.descr_w[8],
++	    r.descr_w[9], r.descr_w[10], r.descr_w[11]);
++	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.descr_w[12],
++	    r.descr_w[13], r.descr_w[14], r.descr_w[15], r.descr_w[16], r.descr_w[17], r.descr_w[18], r.descr_w[19],
++	    r.descr_w[20], r.descr_w[21], r.descr_w[22], r.descr_w[23]);
++	printf("SWEET TRUSTY: tipc online=%u connected=%u remote=%u max_msg=%u\n", r.online, r.connected, r.remote, r.max_msg);
++	if (rc == SWTP_OK) {
++		printf("SWEET TRUSTY: hwmgr.aoc state=%u\n", r.state);
++	} else {
++		printf("SWEET TRUSTY: tipc stop %s at stage %d r0=0x%x r2=0x%x (hwmgr err=%u state=%u)\n", swtp_ename(rc), r.stage,
++		    r.raw, r.raw2, r.herr, r.state);
++	}
++	printf("SWEET TRUSTY: tipc done smc=%u shares=%u reclaimed=%u teardown_bad=%u td_r0=0x%x t=%llu us\n", r.nsmc, r.nshare,
++	    r.nreclaim, r.td_bad, r.td_raw, (unsigned long long)r.t_us);
++}
+diff --git a/bsd/dev/sweet_tipc.h b/bsd/dev/sweet_tipc.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_tipc.h
+@@ -0,0 +1,769 @@
++/*
++ * Trusty TIPC GET_STATE (patch 0162, plan 2026-11-14 oneshot-2 step A5, boot-arg sweettrusty=2). Pure logic, no kernel
++ * headers: the host test (shim/tipc_host_test.c) drives it with a fake Trusty. It replays the stock Linux driver's path
++ * (kernel/google-modules/trusty 2494a3e = "tru", docs/research/50 sections 1-4) with ONE connection to
++ * "com.android.trusty.gsa.hwmgr.aoc" and ONE request, HWMGR_CMD_STATE_CMD (1) with sub GSA_AOC_GET_STATE (0)
++ * (gsa hwmgr-ipc.h:12-38, gsa_core.c:97-131, gsa_aoc.h:80-86), then tears everything down. Plan rule A-1 allowlist only.
++ *
++ * Secure-world calls, in order (each issued at most once with the arguments shown; the std-call engine may repeat the SAME
++ * call on SM_ERR_BUSY up to 5 times and issues SMC_SC_RESTART_FIQ / SMC_SC_RESTART_LAST as tru:trusty.c:115-291 does):
++ *   SMC_FC_API_VERSION 0xBC00000B (5)                                   tru:trusty.c:773-791, smcall.h:143
++ *   FFA_VERSION 0x84000063 (0x10000)                                    tru:trusty.c:616-623
++ *   FFA_FEATURES 0x84000064 (FFA_MEM_SHARE 0x84000073)                  tru:trusty.c:627-640
++ *   FFA_ID_GET 0x84000069                                               tru:trusty.c:643-653
++ *   FFA_RXTX_MAP (SMC64) 0xC4000066 (tx pa, rx pa, 1)                   tru:trusty.c:685-693
++ *   FFA_MEM_SHARE 0x84000073 (80, 80) x up to 10 (descr, 2 vrings, 4 rx bufs RW; 3 tx bufs RO)  tru:trusty.c:303-479
++ *   SMC_SC_VIRTIO_GET_DESCR 0x32000014 (h lo, h hi, 4096)               tru:trusty-virtio.c:162-176
++ *   SMC_SC_VDEV_RESET 0x32000017 (vdev notifyid, 0, 0)                  tru:trusty-virtio.c:210-219 (virtio.c:448 + remove)
++ *   SMC_SC_VIRTIO_START 0x32000015 (h lo, h hi, descr size)             tru:trusty-virtio.c:192-207
++ *   SMC_SC_NOP 0x3C000003 (0,0,0) or (SMC_NC_VDEV_KICK_VQ 0x32000019, vdev notifyid, vq notifyid)  tru:trusty.c:925-958,
++ *     trusty-virtio.c:144-157
++ *   SMC_SC_VIRTIO_STOP 0x32000016 (h lo, h hi, 4096)                    tru:trusty-virtio.c:178-190, :793-794
++ *   FFA_MEM_RECLAIM 0x84000077 (h lo, h hi, 0) once per share           tru:trusty.c:529-545
++ *   FFA_RXTX_UNMAP 0x84000067 (0)                                       tru:trusty.c:715
++ * Waits: every std-call <= 2 s (SWTP_CALL_US), whole run <= 10 s (SWTP_RUN_US), NOP polls 1 ms apart.
++ */
++#ifndef SWEET_TIPC_H
++#define SWEET_TIPC_H
++
++#include <stdint.h>
++
++/* smcall.h (tru include/linux/trusty/smcall.h, values docs/research/50 1) */
++#define SWTP_FC_API_VERSION     0xBC00000Bu
++#define SWTP_SC_RESTART_LAST    0x3C000000u
++#define SWTP_SC_RESTART_FIQ     0x3C000002u
++#define SWTP_SC_NOP             0x3C000003u
++#define SWTP_SC_GET_DESCR       0x32000014u
++#define SWTP_SC_START           0x32000015u
++#define SWTP_SC_STOP            0x32000016u
++#define SWTP_SC_VDEV_RESET      0x32000017u
++#define SWTP_NC_KICK_VQ         0x32000019u
++/* sm_err.h:8-26 */
++#define SWTP_E_INTERRUPTED      ((uint32_t)-3)
++#define SWTP_E_BUSY             ((uint32_t)-5)
++#define SWTP_E_FIQ_INTERRUPTED  ((uint32_t)-12)
++#define SWTP_E_CPU_IDLE         ((uint32_t)-13)
++#define SWTP_E_NOP_INTERRUPTED  ((uint32_t)-14)
++#define SWTP_E_NOP_DONE         ((uint32_t)-15)
++/* arm_ffa.h:22-29, 113-137, 315-595 */
++#define SWTP_FFA_SUCCESS        0x84000061u
++#define SWTP_FFA_VERSION        0x84000063u
++#define SWTP_FFA_FEATURES       0x84000064u
++#define SWTP_FFA_RXTX_MAP64     0xC4000066u
++#define SWTP_FFA_RXTX_UNMAP     0x84000067u
++#define SWTP_FFA_ID_GET         0x84000069u
++#define SWTP_FFA_MEM_SHARE      0x84000073u
++#define SWTP_FFA_MEM_RECLAIM    0x84000077u
++#define SWTP_FFA_V10            0x00010000u
++#define SWTP_FFA_REMOTE         0x8000u         /* tru:trusty.c ffa_remote_id */
++#define SWTP_FFA_ATTR           0x2Fu           /* NORMAL_MEMORY_CACHED_WB | INNER_SHAREABLE (PAGE_KERNEL) */
++#define SWTP_FFA_RO             1u
++#define SWTP_FFA_RW             2u
++#define SWTP_MTD_LEN            80u             /* ffa_mtd 32 + emad 16 + comp 16 + one constituent 16 */
++/* virtio (kc virtio_config.h:36-40, virtio_ring.h) and the trusty descriptor (remoteproc.h, trusty-virtio.c:513-596) */
++#define SWTP_S_ACK              1u
++#define SWTP_S_DRIVER           2u
++#define SWTP_S_DRIVER_OK        4u
++#define SWTP_DESC_F_WRITE       2u
++#define SWTP_RSC_VDEV           3u
++#define SWTP_VIRTIO_ID_TIPC     13u             /* trusty-ipc.c:2243 */
++/* TIPC (trusty-ipc.c:41-102) and hwmgr (gsa hwmgr-ipc.h, gsa_aoc.h) */
++#define SWTP_CTRL_ADDR          53u
++#define SWTP_LOCAL_ADDR         1024u
++#define SWTP_CTRL_GO_ONLINE     1u
++#define SWTP_CTRL_CONN_REQ      3u
++#define SWTP_CTRL_CONN_RSP      4u
++#define SWTP_CTRL_DISC_REQ      5u
++#define SWTP_HDR                16u
++#define SWTP_NAME_LEN           256u
++#define SWTP_HWMGR_STATE_CMD    1u
++#define SWTP_HWMGR_RESP         0x80000000u
++#define SWTP_AOC_GET_STATE      0u
++static const char swtp_port[] = "com.android.trusty.gsa.hwmgr.aoc";
++
++/* bounds of ours */
++#define SWTP_PG                 4096u
++#define SWTP_BUF                4096u           /* msg_buf_max_size default PAGE_SIZE (trusty-ipc.c:41-42); others refused */
++#define SWTP_NRX                4u              /* rx buffers posted (Linux posts the ring size; fewer is legal virtio) */
++#define SWTP_NTX                3u              /* connect, GET_STATE, disconnect */
++#define SWTP_VRING_MAX          (4u * SWTP_PG)
++#define SWTP_QSZ_MAX            64u
++#define SWTP_CALL_US            2000000u
++#define SWTP_RUN_US             10000000u
++#define SWTP_POLL_US            1000u
++#define SWTP_SMC_MAX            6000u
++#define SWTP_MAXSH              (3u + SWTP_NRX + SWTP_NTX)
++/* arena layout (4 KiB pages, physically contiguous, zeroed by swtp_run) */
++#define SWTP_OFF_FTX            (0u * SWTP_PG)
++#define SWTP_OFF_FRX            (1u * SWTP_PG)
++#define SWTP_OFF_DESCR          (2u * SWTP_PG)
++#define SWTP_OFF_VR0            (3u * SWTP_PG)
++#define SWTP_OFF_VR1            (SWTP_OFF_VR0 + SWTP_VRING_MAX)
++#define SWTP_OFF_RXB            (SWTP_OFF_VR1 + SWTP_VRING_MAX)
++#define SWTP_OFF_TXB            (SWTP_OFF_RXB + SWTP_NRX * SWTP_BUF)
++#define SWTP_ARENA              (SWTP_OFF_TXB + SWTP_NTX * SWTP_BUF)
++
++struct swtp_ret {
++	uint64_t r0, r1, r2, r3;
++};
++
++struct swtp_bus {
++	/* one smc #0: x0 = fid, x1..x3 = a1..a3, x4..x7 = 0; out = x0..x3 (the glue masks interrupts around it) */
++	void (*smc)(void *ctx, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3, struct swtp_ret *out);
++	uint64_t (*now_us)(void *ctx);
++	void (*delay_us)(void *ctx, uint32_t us);
++	void *ctx;
++	uint8_t *arena;         /* SWTP_ARENA bytes, 4 KiB aligned, physically contiguous (checked by the glue) */
++	uint64_t arena_pa;
++};
++
++enum {
++	SWTP_OK = 0, SWTP_E_ARG, SWTP_E_ALLOW, SWTP_E_TIME, SWTP_E_SMC, SWTP_E_API, SWTP_E_FFA, SWTP_E_SHARE,
++	SWTP_E_DESCR, SWTP_E_VIRTIO, SWTP_E_ONLINE, SWTP_E_CONN, SWTP_E_REPLY, SWTP_E_HWMGR, SWTP_E_RX, SWTP_E_N
++};
++
++struct swtp_res {
++	int rc, stage;                  /* first failure (SWTP_*), the step it happened in (1..12) */
++	uint32_t raw, raw2;             /* r0 (and r2) of the call that failed */
++	uint32_t api, ffa_ver, ffa_id;
++	uint32_t descr_sz, descr_w[24]; /* the descriptor as Trusty wrote it (first 96 bytes, before our writes) */
++	uint32_t vdev_nid, dfeat, gfeat, cfg_len, msg_max, vr_num[2], vr_align[2], vr_nid[2], vr_size[2];
++	uint32_t remote, max_msg, state, herr, online, connected;
++	uint32_t nsmc, nshare, nreclaim, td_bad, td_raw;   /* teardown: failed calls, first r0 */
++	uint64_t h[SWTP_MAXSH];
++	uint64_t t_us;
++	/* private */
++	uint32_t vstat_off, rx_last, tx_next, tx_avail, rx_avail;
++	uint64_t t0, hdescr;
++	int mapped, started, reset_done, descr_loaded;
++};
++
++static inline const char *
++swtp_ename(int rc)
++{
++	static const char *const n[] = { "ok", "bad-arg", "not-allowlisted", "timeout", "smc-error", "bad-api",
++		"ffa", "share", "descriptor", "virtio", "not-online", "connect", "no-reply", "hwmgr-error", "bad-rx" };
++
++	return (rc >= 0 && rc < SWTP_E_N) ? n[rc] : "?";
++}
++
++static inline void
++swtp_w32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++
++static inline void
++swtp_w16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++}
++
++static inline void
++swtp_w64(uint8_t *p, uint64_t v)
++{
++	swtp_w32(p, (uint32_t)v);
++	swtp_w32(p + 4, (uint32_t)(v >> 32));
++}
++
++static inline uint32_t
++swtp_r32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static inline uint16_t
++swtp_r16(const volatile uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static inline int
++swtp_fail(struct swtp_res *r, int rc, uint32_t raw, uint32_t raw2)
++{
++	if (r->rc == SWTP_OK) {
++		r->rc = rc;
++		r->raw = raw;
++		r->raw2 = raw2;
++	}
++	return rc;
++}
++
++/* The allowlist (plan rule A-1). Arguments are checked as well as the function id. */
++static inline int
++swtp_allowed(const struct swtp_res *r, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	switch (fid) {
++	case SWTP_FC_API_VERSION: return a1 == 5u && !a2 && !a3;
++	case SWTP_FFA_VERSION: return a1 == SWTP_FFA_V10 && !a2 && !a3;
++	case SWTP_FFA_FEATURES: return a1 == SWTP_FFA_MEM_SHARE && !a2 && !a3;
++	case SWTP_FFA_ID_GET: case SWTP_FFA_RXTX_UNMAP: return !a1 && !a2 && !a3;
++	case SWTP_FFA_RXTX_MAP64: return a3 == 1u && !r->mapped;
++	case SWTP_FFA_MEM_SHARE: return a1 == SWTP_MTD_LEN && a2 == SWTP_MTD_LEN && !a3 && r->nshare < SWTP_MAXSH;
++	case SWTP_FFA_MEM_RECLAIM: return a1 <= 0xFFFFFFFFu && a2 <= 0xFFFFFFFFu && !a3;
++	case SWTP_SC_GET_DESCR: case SWTP_SC_STOP: return a1 == (uint32_t)r->hdescr && a2 == (uint32_t)(r->hdescr >> 32) && a3 == SWTP_PG;
++	case SWTP_SC_START: return a1 == (uint32_t)r->hdescr && a2 == (uint32_t)(r->hdescr >> 32) && a3 == r->descr_sz;
++	case SWTP_SC_VDEV_RESET: return a1 == r->vdev_nid && !a2 && !a3;
++	case SWTP_SC_RESTART_LAST: case SWTP_SC_RESTART_FIQ: return !a1 && !a2 && !a3;
++	case SWTP_SC_NOP:
++		return (!a1 && !a2 && !a3) ||
++		       (a1 == SWTP_NC_KICK_VQ && a2 == r->vdev_nid && (a3 == r->vr_nid[0] || a3 == r->vr_nid[1]));
++	default: return 0;
++	}
++}
++
++static inline int
++swtp_late(const struct swtp_bus *b, const struct swtp_res *r)
++{
++	return b->now_us(b->ctx) - r->t0 > SWTP_RUN_US;
++}
++
++static inline int
++swtp_smc(const struct swtp_bus *b, struct swtp_res *r, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3, struct swtp_ret *o)
++{
++	if (!swtp_allowed(r, fid, a1, a2, a3)) {
++		return swtp_fail(r, SWTP_E_ALLOW, (uint32_t)fid, (uint32_t)a1);
++	}
++	if (r->nsmc >= SWTP_SMC_MAX) {
++		return swtp_fail(r, SWTP_E_TIME, (uint32_t)fid, r->nsmc);
++	}
++	r->nsmc++;
++	o->r0 = o->r1 = o->r2 = o->r3 = 0;
++	b->smc(b->ctx, fid, a1, a2, a3, o);
++	return SWTP_OK;
++}
++
++/* A fastcall: returns 0 and the result in *o, or an SWTP_E_* already recorded. */
++static inline int
++swtp_fast(const struct swtp_bus *b, struct swtp_res *r, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3, struct swtp_ret *o)
++{
++	return swtp_smc(b, r, fid, a1, a2, a3, o);
++}
++
++/* trusty_std_call_inner: FIQ restart, BUSY retry of the SAME call (<= 5, 1..16 ms apart). */
++static inline int
++swtp_inner(const struct swtp_bus *b, struct swtp_res *r, uint32_t fid, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *ret,
++    uint64_t dl)
++{
++	struct swtp_ret o;
++	uint32_t busy = 0;
++
++	for (;;) {
++		if (swtp_smc(b, r, fid, a1, a2, a3, &o)) {
++			return r->rc;
++		}
++		*ret = (uint32_t)o.r0;
++		while (*ret == SWTP_E_FIQ_INTERRUPTED) {
++			if (b->now_us(b->ctx) > dl || swtp_smc(b, r, SWTP_SC_RESTART_FIQ, 0, 0, 0, &o)) {
++				return swtp_fail(r, SWTP_E_TIME, fid, *ret);
++			}
++			*ret = (uint32_t)o.r0;
++		}
++		if (*ret != SWTP_E_BUSY || busy >= 5u) {
++			return SWTP_OK;
++		}
++		b->delay_us(b->ctx, 1000u << busy);
++		busy++;
++		if (b->now_us(b->ctx) > dl) {
++			return swtp_fail(r, SWTP_E_TIME, fid, *ret);
++		}
++	}
++}
++
++/* trusty_std_call32: restart while INTERRUPTED / CPU_IDLE, bounded by SWTP_CALL_US. Result in *ret (r0, 32 bits). */
++static inline int
++swtp_std(const struct swtp_bus *b, struct swtp_res *r, uint32_t fid, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *ret)
++{
++	uint64_t dl = b->now_us(b->ctx) + SWTP_CALL_US;
++
++	if (swtp_inner(b, r, fid, a1, a2, a3, ret, dl)) {
++		return r->rc;
++	}
++	while (*ret == SWTP_E_INTERRUPTED || *ret == SWTP_E_CPU_IDLE) {
++		if (b->now_us(b->ctx) > dl || swtp_late(b, r)) {
++			return swtp_fail(r, SWTP_E_TIME, fid, *ret);
++		}
++		if (*ret == SWTP_E_CPU_IDLE) {
++			b->delay_us(b->ctx, SWTP_POLL_US);      /* trusty.c:222-232 waits for a NOP elsewhere; we only pause */
++		}
++		if (swtp_inner(b, r, SWTP_SC_RESTART_LAST, 0, 0, 0, ret, dl)) {
++			return r->rc;
++		}
++	}
++	return SWTP_OK;
++}
++
++/* nop_work_func (trusty.c:925-958): NOP(args) then NOP(0) while NOP_INTERRUPTED (also after an error of a kick NOP). */
++static inline int
++swtp_nop(const struct swtp_bus *b, struct swtp_res *r, uint32_t a1, uint32_t a2, uint32_t a3)
++{
++	uint32_t ret = 0;
++	uint64_t dl = b->now_us(b->ctx) + SWTP_CALL_US;
++
++	if (swtp_std(b, r, SWTP_SC_NOP, a1, a2, a3, &ret)) {
++		return r->rc;
++	}
++	while (ret == SWTP_E_NOP_INTERRUPTED || (a1 != 0 && ret != SWTP_E_NOP_DONE)) {
++		a1 = 0;
++		if (b->now_us(b->ctx) > dl || swtp_std(b, r, SWTP_SC_NOP, 0, 0, 0, &ret)) {
++			return swtp_fail(r, SWTP_E_TIME, SWTP_SC_NOP, ret);
++		}
++	}
++	if (ret != SWTP_E_NOP_DONE) {
++		return swtp_fail(r, SWTP_E_SMC, SWTP_SC_NOP, ret);
++	}
++	return SWTP_OK;
++}
++
++/* FF-A MEM_SHARE of one contiguous range of the arena (trusty.c:303-479; layout docs/research/50 2). */
++static inline int
++swtp_share(const struct swtp_bus *b, struct swtp_res *r, uint32_t off, uint32_t len, uint32_t perm, uint64_t *h)
++{
++	uint8_t *t = b->arena + SWTP_OFF_FTX;
++	struct swtp_ret o;
++	uint32_t i;
++
++	for (i = 0; i < SWTP_MTD_LEN; i++) {
++		t[i] = 0;
++	}
++	swtp_w16(t + 0, (uint16_t)r->ffa_id);
++	t[2] = SWTP_FFA_ATTR;
++	swtp_w32(t + 28, 1u);                   /* emad_count */
++	swtp_w16(t + 32, SWTP_FFA_REMOTE);
++	t[34] = (uint8_t)perm;
++	swtp_w32(t + 36, 48u);                  /* comp_mrd_offset */
++	swtp_w32(t + 48, len / SWTP_PG);        /* total_page_count */
++	swtp_w32(t + 52, 1u);                   /* address_range_count */
++	swtp_w64(t + 64, b->arena_pa + off);
++	swtp_w32(t + 72, len / SWTP_PG);
++	__sync_synchronize();
++	if (swtp_fast(b, r, SWTP_FFA_MEM_SHARE, SWTP_MTD_LEN, SWTP_MTD_LEN, 0, &o)) {
++		return r->rc;
++	}
++	if ((uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
++		return swtp_fail(r, SWTP_E_SHARE, (uint32_t)o.r0, (uint32_t)o.r2);
++	}
++	*h = (uint64_t)(uint32_t)o.r2 | (uint64_t)(uint32_t)o.r3 << 32;
++	r->h[r->nshare++] = *h;
++	return SWTP_OK;
++}
++
++/* legacy split vring inside the arena (kc virtio_ring.h:107-112, 199-214) */
++static inline uint32_t
++swtp_vring_size(uint32_t num, uint32_t align)
++{
++	return ((16u * num + 2u * (3u + num) + align - 1u) & ~(align - 1u)) + 6u + 8u * num;
++}
++
++static inline uint8_t *
++swtp_vr(const struct swtp_bus *b, int q)
++{
++	return b->arena + (q ? SWTP_OFF_VR1 : SWTP_OFF_VR0);
++}
++
++static inline uint32_t
++swtp_used_off(const struct swtp_res *r, int q)
++{
++	uint32_t n = r->vr_num[q], a = r->vr_align[q];
++
++	return (16u * n + 2u * (3u + n) + a - 1u) & ~(a - 1u);
++}
++
++/* put descriptor d (buffer handle h, len, flags) in the avail ring of q */
++static inline void
++swtp_post(const struct swtp_bus *b, struct swtp_res *r, int q, uint16_t d, uint64_t h, uint32_t len, uint16_t flags)
++{
++	uint8_t *v = swtp_vr(b, q), *ds = v + 16u * d, *av = v + 16u * r->vr_num[q];
++	uint32_t *idx = q ? &r->tx_avail : &r->rx_avail;
++
++	swtp_w64(ds, h);
++	swtp_w32(ds + 8, len);
++	swtp_w16(ds + 12, flags);
++	swtp_w16(ds + 14, 0);
++	swtp_w16(av + 4u + 2u * (*idx % r->vr_num[q]), d);
++	__sync_synchronize();
++	(*idx)++;
++	swtp_w16(av + 2, (uint16_t)*idx);
++	__sync_synchronize();
++}
++
++/*
++ * Poll the rx used ring for one message, NOPs 1 ms apart, up to SWTP_CALL_US. On success copies the header fields and up
++ * to 28 payload bytes, re-posts the buffer and kicks rx (trusty-ipc.c _rxvq_cb). Returns SWTP_OK, or SWTP_E_* recorded.
++ */
++struct swtp_msg {
++	uint32_t src, dst, len, w[7];
++};
++
++static inline int
++swtp_recv(const struct swtp_bus *b, struct swtp_res *r, struct swtp_msg *m, int fail_rc)
++{
++	uint64_t dl = b->now_us(b->ctx) + SWTP_CALL_US;
++	uint8_t *v = swtp_vr(b, 0), *u = v + swtp_used_off(r, 0), *buf;
++	uint32_t id, len, i;
++
++	for (;;) {
++		__sync_synchronize();
++		if (swtp_r16(u + 2) != (uint16_t)r->rx_last) {
++			break;
++		}
++		if (b->now_us(b->ctx) > dl || swtp_late(b, r)) {
++			return swtp_fail(r, fail_rc, r->rx_last, 0);
++		}
++		b->delay_us(b->ctx, SWTP_POLL_US);
++		if (swtp_nop(b, r, 0, 0, 0)) {
++			return r->rc;
++		}
++	}
++	__sync_synchronize();
++	id = swtp_r32(u + 4u + 8u * (r->rx_last % r->vr_num[0]));
++	len = swtp_r32(u + 8u + 8u * (r->rx_last % r->vr_num[0]));
++	r->rx_last++;
++	if (id >= SWTP_NRX) {
++		return swtp_fail(r, SWTP_E_RX, id, len);
++	}
++	buf = b->arena + SWTP_OFF_RXB + id * SWTP_BUF;
++	m->src = swtp_r32(buf);
++	m->dst = swtp_r32(buf + 4);
++	m->len = swtp_r16(buf + 12);
++	for (i = 0; i < 7u; i++) {
++		m->w[i] = (SWTP_HDR + 4u * i + 4u <= len) ? swtp_r32(buf + SWTP_HDR + 4u * i) : 0;
++	}
++	if (len < SWTP_HDR || len > SWTP_BUF || len - SWTP_HDR != m->len) {      /* trusty-ipc.c:2035-2062 */
++		return swtp_fail(r, SWTP_E_RX, len, m->len);
++	}
++	for (i = 0; i < SWTP_BUF; i++) {
++		buf[i] = 0;
++	}
++	swtp_post(b, r, 0, (uint16_t)id, r->h[3u + id], SWTP_BUF, SWTP_DESC_F_WRITE);
++	return swtp_nop(b, r, SWTP_NC_KICK_VQ, r->vdev_nid, r->vr_nid[0]);
++}
++
++/* Build one TIPC message in tx buffer k, share it read-only, post it and kick tx (trusty-ipc.c:549-558, :774-801). */
++static inline int
++swtp_send(const struct swtp_bus *b, struct swtp_res *r, uint32_t dst, const uint32_t *w, uint32_t nw, const char *name)
++{
++	uint32_t k = r->tx_next, off = SWTP_OFF_TXB + k * SWTP_BUF, plen = 4u * nw + (name ? SWTP_NAME_LEN : 0u), i;
++	uint8_t *p = b->arena + off;
++	uint64_t h = 0;
++
++	if (k >= SWTP_NTX) {
++		return swtp_fail(r, SWTP_E_ARG, k, 0);
++	}
++	for (i = 0; i < SWTP_BUF; i++) {
++		p[i] = 0;
++	}
++	swtp_w32(p, SWTP_LOCAL_ADDR);
++	swtp_w32(p + 4, dst);
++	swtp_w16(p + 12, (uint16_t)plen);
++	for (i = 0; i < nw; i++) {
++		swtp_w32(p + SWTP_HDR + 4u * i, w[i]);
++	}
++	for (i = 0; name && name[i] && i < SWTP_NAME_LEN - 1u; i++) {
++		p[SWTP_HDR + 4u * nw + i] = (uint8_t)name[i];
++	}
++	r->tx_next++;
++	if (swtp_share(b, r, off, SWTP_BUF, SWTP_FFA_RO, &h)) {
++		return r->rc;
++	}
++	swtp_post(b, r, 1, (uint16_t)k, h, SWTP_HDR + plen, 0);
++	return swtp_nop(b, r, SWTP_NC_KICK_VQ, r->vdev_nid, r->vr_nid[1]);
++}
++
++/* Parse the descriptor (trusty-virtio.c:513-596): exactly one vdev, id 13, two vrings. */
++static inline int
++swtp_parse(const struct swtp_bus *b, struct swtp_res *r)
++{
++	const uint8_t *d = b->arena + SWTP_OFF_DESCR, *v;
++	uint32_t num, off, nvr, i, cl;
++
++	for (i = 0; i < 24u; i++) {
++		r->descr_w[i] = swtp_r32(d + 4u * i);
++	}
++	if (r->descr_sz < 16u || r->descr_sz > SWTP_PG || swtp_r32(d) != 1u) {
++		return swtp_fail(r, SWTP_E_DESCR, r->descr_sz, swtp_r32(d));
++	}
++	num = swtp_r32(d + 4);
++	if (num != 1u || r->descr_sz < 16u + 4u * num) {
++		return swtp_fail(r, SWTP_E_DESCR, num, 1);
++	}
++	off = swtp_r32(d + 16);
++	if (off > r->descr_sz || r->descr_sz - off < 4u + 24u || swtp_r32(d + off) != SWTP_RSC_VDEV) {
++		return swtp_fail(r, SWTP_E_DESCR, off, 2);
++	}
++	v = d + off + 4u;                       /* fw_rsc_vdev */
++	nvr = v[21];
++	cl = swtp_r32(v + 16);
++	if (swtp_r32(v) != SWTP_VIRTIO_ID_TIPC || nvr != 2u || r->descr_sz - off - 4u - 24u < 2u * 20u + cl || cl > SWTP_PG) {
++		return swtp_fail(r, SWTP_E_DESCR, swtp_r32(v), nvr);
++	}
++	r->vdev_nid = swtp_r32(v + 4);
++	r->dfeat = swtp_r32(v + 8);
++	r->cfg_len = cl;
++	r->vstat_off = SWTP_OFF_DESCR + off + 4u + 20u;
++	for (i = 0; i < 2u; i++) {
++		const uint8_t *vr = v + 24u + 20u * i;
++
++		r->vr_align[i] = swtp_r32(vr + 4);
++		r->vr_num[i] = swtp_r32(vr + 8);
++		r->vr_nid[i] = swtp_r32(vr + 12);
++		if (r->vr_num[i] == 0u || r->vr_num[i] > SWTP_QSZ_MAX || (r->vr_num[i] & (r->vr_num[i] - 1u)) ||
++		    r->vr_align[i] < 4u || r->vr_align[i] > SWTP_PG || (r->vr_align[i] & (r->vr_align[i] - 1u)) ||
++		    r->vr_num[i] < SWTP_NRX || r->vr_num[i] < SWTP_NTX) {
++			return swtp_fail(r, SWTP_E_DESCR, r->vr_num[i], r->vr_align[i]);
++		}
++		r->vr_size[i] = (swtp_vring_size(r->vr_num[i], r->vr_align[i]) + SWTP_PG - 1u) & ~(SWTP_PG - 1u);
++		if (r->vr_size[i] > SWTP_VRING_MAX) {
++			return swtp_fail(r, SWTP_E_DESCR, r->vr_size[i], 3);
++		}
++	}
++	if (r->vr_nid[0] == r->vr_nid[1]) {
++		return swtp_fail(r, SWTP_E_DESCR, r->vr_nid[0], 4);
++	}
++	r->msg_max = SWTP_BUF;                  /* tipc_dev_config default (trusty-ipc.c:2152-2160) */
++	if (cl >= 4u) {
++		r->msg_max = swtp_r32(v + 24u + 40u);
++	}
++	if (r->msg_max != SWTP_BUF) {
++		return swtp_fail(r, SWTP_E_DESCR, r->msg_max, 5);
++	}
++	return SWTP_OK;
++}
++
++/* Undo in the stock remove order (trusty-ipc remove -> VDEV_RESET, reclaim; trusty_virtio_remove -> STOP, reclaim descr;
++ * trusty_free_msg_buf -> RXTX_UNMAP). Every call once; a failure is recorded and the rest still runs. */
++static inline void
++swtp_teardown(const struct swtp_bus *b, struct swtp_res *r)
++{
++	struct swtp_ret o;
++	uint32_t ret = 0, i;
++	int saved = r->rc;
++
++	r->rc = SWTP_OK;
++	if (r->reset_done) {
++		if (swtp_std(b, r, SWTP_SC_VDEV_RESET, r->vdev_nid, 0, 0, &ret) || ret != 0) {
++			r->td_bad++;
++			r->td_raw = r->td_raw ? r->td_raw : (ret ? ret : 0xEEEEEEEEu);
++		}
++		r->rc = SWTP_OK;
++	}
++	for (i = r->nshare; i > 1u; i--) {      /* every share but the descriptor (h[0]), newest first */
++		if (swtp_fast(b, r, SWTP_FFA_MEM_RECLAIM, (uint32_t)r->h[i - 1u], (uint32_t)(r->h[i - 1u] >> 32), 0, &o) ||
++		    (uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
++			r->td_bad++;
++			r->td_raw = r->td_raw ? r->td_raw : (uint32_t)o.r0;
++		} else {
++			r->nreclaim++;
++		}
++		r->rc = SWTP_OK;
++	}
++	if (r->descr_loaded) {
++		if (swtp_std(b, r, SWTP_SC_STOP, (uint32_t)r->hdescr, (uint32_t)(r->hdescr >> 32), SWTP_PG, &ret) || ret != 0) {
++			r->td_bad++;
++			r->td_raw = r->td_raw ? r->td_raw : (ret ? ret : 0xEEEEEEEEu);
++		}
++		r->rc = SWTP_OK;
++	}
++	if (r->nshare >= 1u) {
++		if (swtp_fast(b, r, SWTP_FFA_MEM_RECLAIM, (uint32_t)r->h[0], (uint32_t)(r->h[0] >> 32), 0, &o) ||
++		    (uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
++			r->td_bad++;
++			r->td_raw = r->td_raw ? r->td_raw : (uint32_t)o.r0;
++		} else {
++			r->nreclaim++;
++		}
++		r->rc = SWTP_OK;
++	}
++	if (r->mapped) {
++		if (swtp_fast(b, r, SWTP_FFA_RXTX_UNMAP, 0, 0, 0, &o) || (uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
++			r->td_bad++;
++			r->td_raw = r->td_raw ? r->td_raw : (uint32_t)o.r0;
++		}
++		r->rc = SWTP_OK;
++	}
++	r->rc = saved;
++}
++
++static inline int
++swtp_body(const struct swtp_bus *b, struct swtp_res *r)
++{
++	struct swtp_ret o;
++	struct swtp_msg m;
++	uint32_t ret = 0, i, w[5];
++	uint64_t h;
++	uint8_t *st;
++
++	r->stage = 1;                           /* api version */
++	if (swtp_fast(b, r, SWTP_FC_API_VERSION, 5u, 0, 0, &o)) {
++		return r->rc;
++	}
++	r->api = (uint32_t)o.r0;
++	if (r->api != 5u) {
++		return swtp_fail(r, SWTP_E_API, r->api, 0);
++	}
++	r->stage = 2;                           /* FF-A init, trusty.c:607-715 */
++	if (swtp_fast(b, r, SWTP_FFA_VERSION, SWTP_FFA_V10, 0, 0, &o)) {
++		return r->rc;
++	}
++	r->ffa_ver = (uint32_t)o.r0;
++	if ((r->ffa_ver >> 16) != 1u || (r->ffa_ver & 0x80000000u)) {
++		return swtp_fail(r, SWTP_E_FFA, r->ffa_ver, 1);
++	}
++	if (swtp_fast(b, r, SWTP_FFA_FEATURES, SWTP_FFA_MEM_SHARE, 0, 0, &o)) {
++		return r->rc;
++	}
++	if ((uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
++		return swtp_fail(r, SWTP_E_FFA, (uint32_t)o.r0, 2);
++	}
++	if (swtp_fast(b, r, SWTP_FFA_ID_GET, 0, 0, 0, &o)) {
++		return r->rc;
++	}
++	if ((uint32_t)o.r0 != SWTP_FFA_SUCCESS || (uint32_t)o.r2 > 0xFFFFu) {
++		return swtp_fail(r, SWTP_E_FFA, (uint32_t)o.r0, (uint32_t)o.r2);
++	}
++	r->ffa_id = (uint32_t)o.r2;
++	if (swtp_fast(b, r, SWTP_FFA_RXTX_MAP64, b->arena_pa + SWTP_OFF_FTX, b->arena_pa + SWTP_OFF_FRX, 1u, &o)) {
++		return r->rc;
++	}
++	if ((uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
++		return swtp_fail(r, SWTP_E_FFA, (uint32_t)o.r0, (uint32_t)o.r2);
++	}
++	r->mapped = 1;
++	r->stage = 3;                           /* descriptor, trusty-virtio.c:597-640 */
++	if (swtp_share(b, r, SWTP_OFF_DESCR, SWTP_PG, SWTP_FFA_RW, &r->hdescr)) {
++		return r->rc;
++	}
++	if (swtp_std(b, r, SWTP_SC_GET_DESCR, (uint32_t)r->hdescr, (uint32_t)(r->hdescr >> 32), SWTP_PG, &ret)) {
++		return r->rc;
++	}
++	if ((int32_t)ret < 0) {
++		return swtp_fail(r, SWTP_E_DESCR, ret, 0);
++	}
++	r->descr_loaded = 1;                    /* from here the stock error path also calls STOP (trusty-virtio.c:686-688) */
++	r->descr_sz = ret;
++	__sync_synchronize();
++	if (swtp_parse(b, r)) {
++		return r->rc;
++	}
++	r->stage = 4;                           /* register + probe: virtio.c:448-451, 247-311 */
++	if (swtp_std(b, r, SWTP_SC_VDEV_RESET, r->vdev_nid, 0, 0, &ret)) {
++		return r->rc;
++	}
++	r->reset_done = 1;
++	if (ret != 0) {
++		return swtp_fail(r, SWTP_E_VIRTIO, ret, 1);
++	}
++	st = b->arena + r->vstat_off;           /* fw_rsc_vdev.status; gfeatures at -8 */
++	st[0] = (uint8_t)(st[0] | SWTP_S_ACK);
++	st[0] = (uint8_t)(st[0] | SWTP_S_DRIVER);
++	r->gfeat = r->dfeat & (0x1u | 0xF0000000u);     /* driver table {0} + transport bits 28..31 (virtio.c:256-280) */
++	swtp_w32(st - 8, r->gfeat);
++	r->stage = 5;                           /* find_vqs + rx buffers (trusty-virtio.c:326-410, trusty-ipc.c:2138-2210) */
++	for (i = 0; i < 2u; i++) {
++		uint8_t *vr = b->arena + r->vstat_off + 4u + 20u * i;
++
++		if (swtp_share(b, r, i ? SWTP_OFF_VR1 : SWTP_OFF_VR0, r->vr_size[i], SWTP_FFA_RW, &h)) {
++			return r->rc;
++		}
++		swtp_w32(vr + 0, (uint32_t)h);          /* da = low half */
++		swtp_w32(vr + 16, (uint32_t)(h >> 32)); /* pa = high half */
++	}
++	for (i = 0; i < SWTP_NRX; i++) {
++		if (swtp_share(b, r, SWTP_OFF_RXB + i * SWTP_BUF, SWTP_BUF, SWTP_FFA_RW, &h)) {
++			return r->rc;
++		}
++		swtp_post(b, r, 0, (uint16_t)i, h, SWTP_BUF, SWTP_DESC_F_WRITE);
++	}
++	st[0] = (uint8_t)(st[0] | SWTP_S_DRIVER_OK);
++	__sync_synchronize();
++	r->stage = 6;                           /* start */
++	if (swtp_std(b, r, SWTP_SC_START, (uint32_t)r->hdescr, (uint32_t)(r->hdescr >> 32), r->descr_sz, &ret)) {
++		return r->rc;
++	}
++	if (ret != 0) {
++		return swtp_fail(r, SWTP_E_VIRTIO, ret, 2);
++	}
++	r->started = 1;
++	r->stage = 7;                           /* GO_ONLINE (trusty-ipc.c:1796-1806) */
++	if (swtp_recv(b, r, &m, SWTP_E_ONLINE)) {
++		return r->rc;
++	}
++	if (m.dst != SWTP_CTRL_ADDR || m.w[0] != SWTP_CTRL_GO_ONLINE) {
++		return swtp_fail(r, SWTP_E_ONLINE, m.dst, m.w[0]);
++	}
++	r->online = 1;
++	r->stage = 8;                           /* connect (trusty-ipc.c:809-858, 1840-1870) */
++	w[0] = SWTP_CTRL_CONN_REQ;
++	w[1] = SWTP_NAME_LEN;
++	if (swtp_send(b, r, SWTP_CTRL_ADDR, w, 2, swtp_port)) {
++		return r->rc;
++	}
++	if (swtp_recv(b, r, &m, SWTP_E_CONN)) {
++		return r->rc;
++	}
++	if (m.dst != SWTP_CTRL_ADDR || m.w[0] != SWTP_CTRL_CONN_RSP || m.w[1] != 20u || m.w[2] != SWTP_LOCAL_ADDR) {
++		return swtp_fail(r, SWTP_E_CONN, m.w[0], m.w[2]);
++	}
++	if (m.w[3] != 0u) {
++		return swtp_fail(r, SWTP_E_CONN, m.w[3], 1);    /* status: refused */
++	}
++	r->remote = m.w[4];
++	r->max_msg = m.w[5];
++	r->connected = 1;
++	if (r->max_msg < 8u) {
++		return swtp_fail(r, SWTP_E_CONN, r->max_msg, 2);
++	}
++	r->stage = 9;                           /* HWMGR_CMD_STATE_CMD / GSA_AOC_GET_STATE (gsa_core.c:97-131) */
++	w[0] = SWTP_HWMGR_STATE_CMD;
++	w[1] = SWTP_AOC_GET_STATE;
++	if (swtp_send(b, r, r->remote, w, 2, 0)) {
++		return r->rc;
++	}
++	if (swtp_recv(b, r, &m, SWTP_E_REPLY)) {
++		return r->rc;
++	}
++	if (m.dst != SWTP_LOCAL_ADDR || m.src != r->remote || m.len != 12u || m.w[0] != (SWTP_HWMGR_STATE_CMD | SWTP_HWMGR_RESP)) {
++		return swtp_fail(r, SWTP_E_REPLY, m.len, m.w[0]);
++	}
++	r->herr = m.w[1];
++	r->state = m.w[2];
++	if (r->herr != 0u) {
++		return swtp_fail(r, SWTP_E_HWMGR, r->herr, r->state);
++	}
++	return SWTP_OK;
++}
++
++/* The whole step: body, then (connected) DISC_REQ, then the teardown. Returns r->rc. */
++static inline int
++swtp_run(const struct swtp_bus *b, struct swtp_res *r)
++{
++	uint32_t i, w[3];
++
++	if (b == 0 || r == 0 || b->smc == 0 || b->now_us == 0 || b->delay_us == 0 || b->arena == 0 ||
++	    (b->arena_pa & (SWTP_PG - 1u)) || ((uintptr_t)b->arena & (SWTP_PG - 1u))) {
++		return SWTP_E_ARG;
++	}
++	*r = (struct swtp_res){ 0 };
++	r->t0 = b->now_us(b->ctx);
++	for (i = 0; i < SWTP_ARENA; i++) {
++		b->arena[i] = 0;
++	}
++	(void)swtp_body(b, r);
++	if (r->connected) {                     /* tipc_chan_shutdown (trusty-ipc.c:882-925): best effort, no reply awaited */
++		int saved = r->rc;
++
++		r->rc = SWTP_OK;
++		w[0] = SWTP_CTRL_DISC_REQ;
++		w[1] = 4u;
++		w[2] = r->remote;
++		if (swtp_send(b, r, SWTP_CTRL_ADDR, w, 3, 0)) {
++			r->td_bad++;
++		}
++		r->rc = saved;
++	}
++	swtp_teardown(b, r);
++	r->t_us = b->now_us(b->ctx) - r->t0;
++	return r->rc;
++}
++
++#endif /* SWEET_TIPC_H */
+diff --git a/bsd/dev/sweet_trusty.c b/bsd/dev/sweet_trusty.c
+--- a/bsd/dev/sweet_trusty.c
++++ b/bsd/dev/sweet_trusty.c
+@@ -17,6 +17,7 @@
+ 
+ void sweet_trusty_init(void);
+ extern void sweet_aoc_init(void);  /* bsd/dev/sweet_aoc.c (patch 0161), reads only, needs boot-arg sweetaoc=1 */
++extern void sweet_tipc_run(void);  /* bsd/dev/sweet_tipc.c (patch 0162), sweettrusty=2 */
+ 
+ static uint64_t
+ sweet_trusty_smc(__unused void *ctx, uint64_t fid, uint64_t a1)
+@@ -44,8 +45,12 @@
+ 	if (!PE_parse_boot_argn("sweettrusty", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 2) {
++		sweet_tipc_run();          /* patch 0162 (plan A5): one TIPC GET_STATE to hwmgr.aoc, then teardown */
++		return;
++	}
+ 	if (on != 1) {
+-		printf("SWEET TRUSTY: sweettrusty=%u not known (only 1), not touched\n", on);
++		printf("SWEET TRUSTY: sweettrusty=%u not known (only 1, 2), not touched\n", on);
+ 		return;
+ 	}
+ 	printf("SWEET TRUSTY: probe starts (2 version fastcalls only)\n");

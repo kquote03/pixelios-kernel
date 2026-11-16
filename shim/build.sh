@@ -623,6 +623,15 @@ else
 	chk "trusty_host_test" $O/trusty_host_test
 	chk "trusty_asan_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/trusty_asan_host_test trusty_host_test.c
 	chk "trusty_asan_host_test" $O/trusty_asan_host_test
+	# AOC pre-load probe of xnu patch 0161 (bsd/dev/sweet_aoc.h, reads only) and Trusty TIPC GET_STATE of patch 0162 (bsd/dev/sweet_tipc.h) against fakes
+	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test"; do
+		IFS=: read -r hpp hph hpt <<<"$hp"
+		awk -v f="+++ b/bsd/dev/$hph" '$0==f{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/$hpp.patch > $O/$hph
+		chk "$hpt (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/$hpt $hpt.c
+		chk "$hpt" $O/$hpt
+		chk "${hpt}_asan (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/${hpt}_asan $hpt.c
+		chk "${hpt}_asan" $O/${hpt}_asan
+	done
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
 	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c
