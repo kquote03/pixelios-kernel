@@ -7,6 +7,8 @@ endpoint's Bus Master is off; a stop restores the endpoint first, then the root 
 The value is derived in swl_wr() from the word read (on: old | 0x6; off: the recorded old word), the Status half is written as 0. Glue: the DBI page is mapped
 only at level 8; sw3_wr() lets only that word through, only after the release, only if no bit other than memory/master differs from the live word, and the
 master bit only with a host pool. Levels 1..7 are unchanged.
+Review 0160-1 A1: after each bounded completion wait (pass and stop path) run F prints the endpoint's cfg 0x04 and the root port's DBI 0x04 word once (reads only), so
+a second failure shows whether Received Master Abort (Status bit 29) is set.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
@@ -193,7 +195,30 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
  	if (fk == SWM_K_IDX && (old >> 16) != 0u) {     /* run F rule R4: an index slot is stored as a 32-bit word only while its upper half reads 0 */
  		return swl_stop(x, SWW_E_OLD);
  	}
-@@ -2350,10 +2382,13 @@
+@@ -2229,7 +2261,8 @@
+ {
+ 	uint8_t *it = NULL, *c;
+ 	uint64_t pa;
+-	uint32_t i, k, n, w = 0, hr = 0, typ, st = 0, rl = 0, got = 0, acks = 0, moved, trans, nz = 0;
++	uint32_t i, k, n, w = 0, hr = 0, typ, st = 0, rl = 0, got = 0, acks = 0, moved, trans, nz = 0, es = 0, rs = 0;
++	int ef, rf;
+ 
+ 	for (n = 0; name[n] != 0; n++) {
+ 	}
+@@ -2321,6 +2354,12 @@
+ 			swl_delay(x, SWM_POLL_US);
+ 		}
+ 	}
++	/* patch 0160 (review 0160-1 A1): once per wait, on the pass and the stop path, the endpoint's and the root port's Command/Status words, reads only. A memory request that was sent and
++	 * rejected sets Received Master Abort (bit 29) in the requester's Status; the run never clears a Status bit (the Status half is always written as 0). */
++	ef = swl_rdx(x, SWW_CFG, 0, SWW_CFG_CMD, &es);
++	rf = swl_rdx(x, SWW_DBI, 0, SWW_CFG_CMD, &rs);
++	printf("SWEET WLAN: W%u after the wait: EP Command/Status %#x%s (master abort %s), root port Command/Status %#x%s (master abort %s)\n", x->row, es, ef ? " (read failed)" : "",
++	    (es & 0x20000000u) ? "set" : "clear", rs, rf ? " (read failed)" : "", (rs & 0x20000000u) ? "set" : "clear");
+ 	if (!got) {
+ 		swm_sync(x, swm_ring[SWM_NH2D].off, swm_ring[SWM_NH2D].depth * SWM_ITEM_D2H);
+ 		for (i = 0; i < swm_ring[SWM_NH2D].depth * SWM_ITEM_D2H; i++) {
+@@ -2350,10 +2389,13 @@
  {
  	uint8_t mac[6], ver[SWM_VER_MAX + 1u];
  	char vt[SWM_VER_MAX + 1u];
@@ -208,7 +233,7 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
  	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM_BM));
  	printf("SWEET WLAN: W22 bus master ON (EP Command %#x)\n", SWW_CMD_MEM_BM);
  	x->row = 23;
-@@ -2385,6 +2420,8 @@
+@@ -2385,6 +2427,8 @@
  	}
  	SWW_TRY(swl_w84_zero(x));
  	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_CMD, SWW_CMD_MEM));
