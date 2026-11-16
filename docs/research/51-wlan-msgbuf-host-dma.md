@@ -216,7 +216,7 @@ A power cycle resets the chip.
   The firmware did not even fetch the two requests, so the failure is in the chip reaching host memory at all (or in the doorbell), not in
   the answer path.
 - **[src]** The shim's link bring-up writes only `DBI + 0x890` of the root port (`shim/wlanlink.c`); the root port's Command register is
-  never written. Linux enables every bridge above a device and calls `pci_set_master()` on it (`drivers/pci/pci.c:2071-2090`, v6.18).
+  never written. Linux enables every bridge above a device and calls `pci_set_master()` on it (`drivers/pci/pci.c:2071-2090`, v6.18), and the DesignWare host setup writes IO, MEMORY, MASTER and SERR into the root port's Command (`pcie-designware-host.c:1076-1081`).
 - **[guess]** (U8) The root port's Bus Master Enable is clear, so it refuses the endpoint's memory requests. Not observed yet: the word has
   never been read on the phone.
 - **Patch 0160:** level 8 reads and prints the root port's Command/Status (RC-local DBI 0x04), adds the memory and master bits before the
