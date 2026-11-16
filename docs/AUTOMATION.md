@@ -827,3 +827,14 @@ Unknowns (U4), each with its evidence:
 Leftovers after the series (F11; permanent, `restore` removes nothing the overlay created; tell the owner of the root): `/private/var/dev/ramp-{1m,8m,24m}.bin`
 (33 MiB), `/usr/local/bin/sweetgl_once`, `/usr/local/bin/sweetgl_selftest`, `/usr/local/lib/libsweetgl.dylib` (21 MB), directories `/usr/local/bin`,
 `/usr/local/lib` (plus the dev-run leftovers listed above). The launchd cache is the original again after st-restore (checked by st-check).
+## XNU `sweettrusty=1`: Trusty version probe (patch 0156, plan step A3)
+
+Two version fastcalls only (`SMC_FC_GET_VERSION_STR`, `SMC_FC_API_VERSION` with 5), as the stock driver's probe does first; no std-call, no
+shared memory, no MMIO. Logic and allowlist: `bsd/dev/sweet_trusty.h`, host test `shim/trusty_host_test.c` (plain + ASan in `shim/build.sh`).
+```
+SWEET_USBLOG_PORT=64738 tools/xrun --kernel ~/pixelios-artifacts/xnu-local-audio-<tag>/kernel.development.sweet --board oriole --no-camera --gui --rails --cpus 8 \
+  --args 'sweettrusty=1' --expect 'SWEET TRUSTY: (api=|stop )' --label o5-a3-trusty --restart 600,bootloader --lock-wait 3600
+```
+Pass: `SWEET TRUSTY: api=5 version='Project: slider, Build: ...'` then `SWEET TRUSTY: probe done smc=N`. A `stop undefined-smc` line means the
+monitor does not route Trusty calls from XNU: steps A4-A6 and A8-A10 are skipped (never retried with other arguments, plan stop H9).
+Status: *not run yet* (built and host-tested 2026-11-16).

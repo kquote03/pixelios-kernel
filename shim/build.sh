@@ -605,6 +605,12 @@ else
 	chk "sweet_spi_host_test" $O/sweet_spi_host_test
 	chk "sweet_spi_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/sweet_spi_asan_host_test sweet_spi_host_test.c
 	chk "sweet_spi_asan_host_test" $O/sweet_spi_asan_host_test
+	# Trusty version probe of xnu patch 0156 (new-file hunk of bsd/dev/sweet_trusty.h) against a fake monitor: plain and ASan/UBSan
+	awk '$0=="+++ b/bsd/dev/sweet_trusty.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0156-sweet-trusty-probe.patch > $O/sweet_trusty.h
+	chk "trusty_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/trusty_host_test trusty_host_test.c
+	chk "trusty_host_test" $O/trusty_host_test
+	chk "trusty_asan_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/trusty_asan_host_test trusty_host_test.c
+	chk "trusty_asan_host_test" $O/trusty_asan_host_test
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
 	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c
@@ -615,6 +621,14 @@ else
 	chk "hsi2c_fg_xnu_host_test" $O/hsi2c_fg_xnu_host_test
 	chk "hsi2c_fg_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/hsi2c_fg_xnu_asan_host_test hsi2c_fg_xnu_host_test.c
 	chk "hsi2c_fg_xnu_asan_host_test" $O/hsi2c_fg_xnu_asan_host_test
+	# CS35L41 identify + B2 probe writes of xnu patch 0158 (new-file hunk of bsd/dev/sweet_amp.h): against the A1 fake SoC + two fake amps (the 12 stock writes in order, never PWR_CTRL1)
+	awk '$0=="+++ b/bsd/dev/sweet_amp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0158-sweet-amp-init.patch > $O/sweet_amp.h
+	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
+	chk "amp_xnu_host_test" $O/amp_xnu_host_test
+	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c
+	chk "amp_xnu_asan_host_test" $O/amp_xnu_asan_host_test
+	# review 0158 round 2 N2: every listed mutant of the header must fail the host test
+	chk "amp_xnu_mutants" "$PYTHON" ../tools/amp_xnu_mutants.py
 	# the inputs may have been edited while the tests ran: stamp only if the digest is unchanged (otherwise the next build runs them again)
 	if [ "$(htdigest)" = "$ht" ]; then mkdir -p "$htdir" && : >"$htdir/$ht.ok.$$" && mv -f "$htdir/$ht.ok.$$" "$htdir/$ht.ok"; else echo "host tests: inputs changed while they ran, no stamp"; fi
 fi
