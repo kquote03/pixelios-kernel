@@ -1,11 +1,12 @@
-SWEET AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4), boot-arg sweetaoc=1. READS ONLY. Round 2 after run
-o6-a4-aoc (phone hung before USB, no log): the PMU AOC power-domain status 0x17461884 bit 0 is read first (flexpmu_cal_local_gs101.h:3-20);
-the GSA mailbox 0x17C90000 status/shared registers and the ACPM channel 13 descriptor in APM SRAM 0x02039000 are read always (stock: no
-clock/power domain); aoc_req 0x175D0000 and the AOC SysMMU 0x1A090000 only when that bit is 1, else "skipped: pd off". The AOC S2MPU
-0x1A0B0000 is never read. The probe runs in its own thread that starts once the USB log has sent a datagram (new counter
-sweet_usblog_sent in sweet_usb.c, bounded 300 s) and prints "SWEET AOC PRE: aoc: reading <block>" 500 ms before each block, so a stall
-names the block. Started from the top of sweet_trusty_init (patch 0156), the same hook point as sweetamp. Cites in bsd/dev/sweet_aoc.h
-(host test shim/aoc_pre_host_test.c). Last line "SWEET AOC PRE: verdict PASS|FAIL reads=N pd=on|off". Without the boot-arg nothing changes.
+SWEET AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4), boot-arg sweetaoc=1. READS ONLY. Round 3 after runs
+o6-a4-aoc (hang before USB) and o6-a4-aoc2 (system stall right after "aoc: reading acpm"): the APM SRAM / ACPM channel 13 block is
+dropped. Order: the PMU AOC power-domain status 0x17461884 bit 0 (flexpmu_cal_local_gs101.h:3-20), the GSA mailbox 0x17C90000
+status/shared registers, then aoc_req 0x175D0000 and the AOC SysMMU 0x1A090000 only when that bit is 1, else "skipped: pd off".
+The AOC S2MPU 0x1A0B0000 is never read. The probe runs in its own thread once the USB log has sent a datagram (counter
+sweet_usblog_sent in sweet_usb.c, bounded 300 s), prints "SWEET AOC PRE: aoc: reading <block>" 500 ms before each block and that
+block's values right after its reads. Started from the top of sweet_trusty_init (patch 0156), the same hook point as sweetamp.
+Cites in bsd/dev/sweet_aoc.h (host test shim/aoc_pre_host_test.c). Last line "SWEET AOC PRE: verdict PASS|FAIL reads=N pd=on|off".
+Without the boot-arg nothing changes.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -22,14 +23,15 @@ diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_aoc.c
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,137 @@
 +/*
 + * AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4). Boot-arg sweetaoc=1; without it nothing runs.
 + * READS ONLY (cites and the power gating in sweet_aoc.h): PMU AOC power-domain status first, then the GSA mailbox
-+ * status/shared registers and the ACPM channel 13 descriptor, then aoc_req and the AOC SysMMU only if the AOC domain
++ * status/shared registers, then aoc_req and the AOC SysMMU only if the AOC domain
 + * reads on. No write of any kind. sweet_trusty_init (patch 0156, same hook point as sweetamp) starts a thread; the thread
 + * waits until the USB log has sent a datagram (sweet_usblog_sent, sweet_usb.c, bounded 300 s) so that a read that stalls
-+ * the bus still leaves "SWEET AOC PRE: aoc: reading <block>" on the host, and waits 500 ms after each such line.
++ * the bus still leaves "SWEET AOC PRE: aoc: reading <block>" on the host, and waits 500 ms after each such line; each
++ * block's values are printed right after its reads (swa_done), before the next block starts.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -57,7 +59,6 @@ new file mode 100644
 +	[SWA_W_REQ] = { SWA_REQ_PA, SWA_REQ_LEN },
 +	[SWA_W_GSA] = { SWA_GSA_PA, SWA_GSA_LEN },
 +	[SWA_W_MMU] = { SWA_MMU_PA, SWA_MMU_LEN },
-+	[SWA_W_ACPM] = { SWA_ACPM_PA, SWA_ACPM_LEN },
 +	[SWA_W_PMU] = { SWA_PMU_PA, SWA_PMU_LEN },
 +};
 +static vm_offset_t swa_va[SWA_NWIN];
@@ -97,10 +98,38 @@ new file mode 100644
 +}
 +
 +static void
++swa_done(__unused void *ctx, int w, const struct swa_res *r)
++{
++	switch (w) {
++	case SWA_W_PMU:
++		printf("SWEET AOC PRE: pmu ok=%u conf(0x17461880)=%08x status(0x17461884)=%08x aoc pd %s\n", r->ok_pmu,
++		    r->pmu_conf, r->pmu_stat, r->pd_on ? "on" : "off");
++		break;
++	case SWA_W_GSA:
++		printf("SWEET AOC PRE: gsa ok=%u mcuctlr=%08x intmr0=%08x intsr0=%08x intmsr0=%08x intmr1=%08x intsr1=%08x intmsr1=%08x\n",
++		    r->ok_gsa, r->gsa[0], r->gsa[1], r->gsa[2], r->gsa[3], r->gsa[4], r->gsa[5], r->gsa[6]);
++		printf("SWEET AOC PRE: gsa sr0=%08x sr1=%08x sr2=%08x\n", r->gsa[7], r->gsa[8], r->gsa[9]);
++		if (!r->pd_on) {
++			printf("SWEET AOC PRE: aoc_req, sysmmu skipped: pd off\n");
++		}
++		break;
++	case SWA_W_REQ:
++		printf("SWEET AOC PRE: aoc_req ok=%u req=%08x status(+0x40)=%08x\n", r->ok_req, r->req, r->req_st);
++		break;
++	case SWA_W_MMU:
++		printf("SWEET AOC PRE: sysmmu ok=%u ctrl=%08x cfg=%08x status=%08x version=%08x (%u.%u.%u) capa0=%08x capa1=%08x\n",
++		    r->ok_mmu, r->mmu[0], r->mmu[1], r->mmu[2], r->mmu[3], r->mmu_maj, r->mmu_min, r->mmu_rev, r->mmu[4], r->mmu[5]);
++		break;
++	default:
++		break;
++	}
++}
++
++static void
 +swa_thread(__unused void *arg, __unused wait_result_t wr)
 +{
 +	static struct swa_res r;
-+	static const struct swa_bus b = { swa_r32, swa_note, NULL };
++	static const struct swa_bus b = { swa_r32, swa_note, swa_done, NULL };
 +	uint32_t ms;
 +	int ok;
 +
@@ -109,24 +138,6 @@ new file mode 100644
 +	}
 +	printf("SWEET AOC PRE: start after %u ms (usb log %s), reads only\n", ms, sweet_usblog_sent ? "up" : "NOT up");
 +	ok = swa_probe(&b, &r);
-+	printf("SWEET AOC PRE: pmu ok=%u conf(0x17461880)=%08x status(0x17461884)=%08x aoc pd %s\n", r.ok_pmu, r.pmu_conf,
-+	    r.pmu_stat, r.pd_on ? "on" : "off");
-+	printf("SWEET AOC PRE: gsa ok=%u mcuctlr=%08x intmr0=%08x intsr0=%08x intmsr0=%08x intmr1=%08x intsr1=%08x intmsr1=%08x\n",
-+	    r.ok_gsa, r.gsa[0], r.gsa[1], r.gsa[2], r.gsa[3], r.gsa[4], r.gsa[5], r.gsa[6]);
-+	printf("SWEET AOC PRE: gsa sr0=%08x sr1=%08x sr2=%08x\n", r.gsa[7], r.gsa[8], r.gsa[9]);
-+	printf("SWEET AOC PRE: acpm ch13 ok=%u why=%s n=%u tab=%#x idx=%u q=%08x/%08x %08x/%08x\n", r.ok_acpm,
-+	    swa_acpm_why(r.acpm_why), r.acpm_n, r.acpm_tab, r.acpm_idx, r.acpm_q[0], r.acpm_q[1], r.acpm_q[2], r.acpm_q[3]);
-+	printf("SWEET AOC PRE: acpm ch13 d0-8 %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.acpm_d[0], r.acpm_d[1],
-+	    r.acpm_d[2], r.acpm_d[3], r.acpm_d[4], r.acpm_d[5], r.acpm_d[6], r.acpm_d[7], r.acpm_d[8]);
-+	printf("SWEET AOC PRE: acpm ch13 d9-17 %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.acpm_d[9], r.acpm_d[10],
-+	    r.acpm_d[11], r.acpm_d[12], r.acpm_d[13], r.acpm_d[14], r.acpm_d[15], r.acpm_d[16], r.acpm_d[17]);
-+	if (r.pd_on) {
-+		printf("SWEET AOC PRE: aoc_req ok=%u req=%08x status(+0x40)=%08x\n", r.ok_req, r.req, r.req_st);
-+		printf("SWEET AOC PRE: sysmmu ok=%u ctrl=%08x cfg=%08x status=%08x version=%08x (%u.%u.%u) capa0=%08x capa1=%08x\n",
-+		    r.ok_mmu, r.mmu[0], r.mmu[1], r.mmu[2], r.mmu[3], r.mmu_maj, r.mmu_min, r.mmu_rev, r.mmu[4], r.mmu[5]);
-+	} else {
-+		printf("SWEET AOC PRE: aoc_req, sysmmu skipped: pd off\n");
-+	}
 +	printf("SWEET AOC PRE: verdict %s reads=%u pd=%s\n", ok ? "PASS" : "FAIL", r.nread, r.pd_on ? "on" : "off");
 +}
 +
@@ -154,36 +165,27 @@ diff --git a/bsd/dev/sweet_aoc.h b/bsd/dev/sweet_aoc.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_aoc.h
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,113 @@
 +/*
 + * AOC pre-load probe (patch 0161, plan 2026-11-14 oneshot-2 step A4), boot-arg sweetaoc=1. READS ONLY. Pure logic, no kernel
-+ * headers: the host test (shim/aoc_pre_host_test.c) drives it with a fake SoC. Order and power gating (run o6-a4-aoc of the
-+ * first version hung the phone with no log, docs PORT.md):
++ * headers: the host test (shim/aoc_pre_host_test.c) drives it with a fake SoC. Round 3, after two stalls on hardware
++ * (o6-a4-aoc: hang before USB; o6-a4-aoc2: whole-system stall right after "aoc: reading acpm", PMU and GSA read fine):
 + *   1. PMU AOC_STATUS 0x17461884 bit 0 (and AOC_CONFIGURATION 0x17461880): the AOC power-domain status the stock CAL reads
 + *      (google soc/gs 2040787 drivers/soc/google/cal-if/gs101/flexpmu_cal_local_gs101.h:3-20, aoc_on/aoc_off/aoc_status;
-+ *      pmucal_local.c:182-197). PMU reads at 0x1746xxxx are already done by patch 0102 (PMU_G3D_STAT 0x17461E04).
++ *      pmucal_local.c:182-197). Read on this phone in run o6-a4-aoc2 without a stall.
 + *      The stock DT disables pd-aoc@17461880 (ref dt/base/pd-aoc@17461880/status = "disabled"), so Linux never switches
-+ *      that domain: whether it is on after OUR boot path is not known, hence the gate.
-+ *   2. kept, no gate: gsa-ns (stock node has no clocks/power-domains, ref dt/base/gsa-ns; gsa_mbox.c probe touches the
-+ *      mailbox with no clock/PM call, the only pm_runtime use is the PKVM S2MPU path gsa_mbox.c:485-560; probed at dmesg:1729)
-+ *      and the APM SRAM (read on hardware by shim/acpm.c, run acpm3, and by XNU patch 0097, run fvmap1).
-+ *   3. gated on AOC_STATUS bit 0 = 1, else "skipped: pd off": aoc_req and the AOC SysMMU (both registers of the AOC
-+ *      node, ref dt/base/aoc@19000000 reg / iommus; their power domain is not stated by any pinned source).
-+ * Before the first read of each block the glue prints "aoc: reading <block>" and waits, so a hang names the block.
-+ * Block cites:
-+ *   aoc_req   0x175D0000 (iomem:54 "19000000.aoc aoc_req"; dts gs101-aoc.dtsi:31-36): +0x00 the request word written by
-+ *             request_aoc_on() (aoc_v1.c:87-91), +0x40 its status word, polled by the stock reset path (aoc_v1.c:93-106).
-+ *   gsa-ns    0x17C90000 (iomem:58; gs101-gsa.dtsi:3-12): MCUCTLR 0x00, INTMR0 0x28, INTSR0 0x2C, INTMSR0 0x30, INTMR1 0x48,
-+ *             INTSR1 0x4C, INTMSR1 0x50, SR0..SR3 0x80..0x8C (gsa_mbox.c:22-57). No doorbell, no clear, no shared write.
-+ *   sysmmu    0x1A090000 (iomem:61; samsung-sysmmu, dmesg:907 "Ver 8.1.0, no gate clock"): CTRL 0x000, CFG 0x004,
-+ *             STATUS 0x008, VERSION 0x034, CAPA0 0x870, CAPA1 0x874 (google soc/gs 2040787 drivers/iommu/samsung-iommu.h:
-+ *             191-197); the stock probe reads VERSION/CAPA without any clock (samsung-iommu.c:88-118, :1576-1627).
-+ *             Version decode MMU_RAW_VER/MAJ/MIN/REV (samsung-iommu.h:207-211).
-+ *   acpm SRAM 0x02039000 (iomem:2 "17610000.acpm_ipc"; soc/google/gs101/soc.json acpm, layout_verified 1 on hardware,
-+ *             run acpm3): framework at +0xA000 (ipc_channels +0x08, ipc_ap_max +0x18), descriptor stride 0x48, fields as
-+ *             shim/acpm.c D_*; the AOC channel is 13 (gs101-aoc.dtsi acpm-ipc-channel = <13>, docs/research/46:34).
-+ * Not read: the AOC S2MPU 0x1A0B0000. The stock kernel has no node and no iomem claim for it (ref dt/base has no
-+ * s2mpu@1A0B0000; docs/research/50 6.5) and XNU has no fault-safe MMIO read, so an access that the bus refuses would panic.
++ *      that domain: whether it is on after our boot path is not known, hence the gate in 3.
++ *   2. gsa-ns 0x17C90000, no gate (stock node has no clocks/power-domains, ref dt/base/gsa-ns; gsa_mbox.c touches the
++ *      mailbox with no clock/PM call outside the PKVM S2MPU path :485-560; read on this phone in run o6-a4-aoc2):
++ *      MCUCTLR 0x00, INTMR0 0x28, INTSR0 0x2C, INTMSR0 0x30, INTMR1 0x48, INTSR1 0x4C, INTMSR1 0x50, SR0..SR2 0x80..0x88
++ *      (gsa_mbox.c:22-57). No doorbell, no clear, no shared write.
++ *   3. only when AOC_STATUS bit 0 = 1, else "skipped: pd off":
++ *      aoc_req 0x175D0000 (iomem:54 "19000000.aoc aoc_req"; gs101-aoc.dtsi:31-36): +0x00 request word (aoc_v1.c:87-91),
++ *        +0x40 status word (aoc_v1.c:93-106);
++ *      sysmmu 0x1A090000 (iomem:61; dmesg:907 "Ver 8.1.0, no gate clock"): CTRL 0x000, CFG 0x004, STATUS 0x008,
++ *        VERSION 0x034, CAPA0 0x870, CAPA1 0x874 (samsung-iommu.h:191-197); decode MMU_RAW_VER/MAJ/MIN/REV (:207-211).
++ * Not read: the APM SRAM (ACPM channel 13), dropped after run o6-a4-aoc2 stalled at it; the AOC S2MPU 0x1A0B0000 (no stock
++ * node or iomem claim). The glue prints "aoc: reading <block>" before a block and its values right after it (b->done).
 + */
 +#ifndef SWEET_AOC_H
 +#define SWEET_AOC_H
@@ -202,23 +204,17 @@ new file mode 100644
 +#define SWA_GSA_LEN       0x1000u
 +#define SWA_MMU_PA        0x1A090000ull
 +#define SWA_MMU_LEN       0x10000u
-+#define SWA_ACPM_PA       0x02039000ull
-+#define SWA_ACPM_LEN      0x40000u
-+#define SWA_ACPM_INIT     0xA000u
-+#define SWA_ACPM_TAB      0x08u
-+#define SWA_ACPM_APMAX    0x18u
-+#define SWA_ACPM_STRIDE   0x48u
-+#define SWA_ACPM_WORDS    18u
-+#define SWA_ACPM_CH       13u
-+#define SWA_ACPM_MAXCH    32u
 +
-+enum { SWA_W_REQ = 0, SWA_W_GSA, SWA_W_MMU, SWA_W_ACPM, SWA_W_PMU, SWA_NWIN };
-+static const char *const swa_wname[SWA_NWIN] = { "aoc_req", "gsa", "sysmmu", "acpm", "pmu" };
++enum { SWA_W_REQ = 0, SWA_W_GSA, SWA_W_MMU, SWA_W_PMU, SWA_NWIN };
++static const char *const swa_wname[SWA_NWIN] = { "aoc_req", "gsa", "sysmmu", "pmu" };
++
++struct swa_res;
 +
 +struct swa_bus {
 +	/* one aligned 32-bit read at offset off of window w; returns 0 when the window is not mapped or off is outside it */
 +	int (*r32)(void *ctx, int w, uint32_t off, uint32_t *out);
-+	void (*note)(void *ctx, int w);         /* called once before the first read of block w (print + settle) */
++	void (*note)(void *ctx, int w);                                 /* before the first read of block w */
++	void (*done)(void *ctx, int w, const struct swa_res *r);        /* right after the last read of block w */
 +	void *ctx;
 +};
 +
@@ -226,25 +222,14 @@ new file mode 100644
 +static const uint32_t swa_mmu_off[6] = { 0x000, 0x004, 0x008, 0x034, 0x870, 0x874 };
 +
 +struct swa_res {
-+	uint32_t ok_req, ok_gsa, ok_mmu, ok_acpm;       /* 1 = the block was read in full */
++	uint32_t ok_pmu, pmu_conf, pmu_stat, pd_on;     /* pd_on = AOC_STATUS bit 0 */
++	uint32_t ok_req, ok_gsa, ok_mmu;                /* 1 = the block was read in full */
 +	uint32_t req, req_st;
 +	uint32_t gsa[10];
 +	uint32_t mmu[6];
 +	uint32_t mmu_maj, mmu_min, mmu_rev;
-+	uint32_t acpm_n, acpm_tab, acpm_idx, acpm_why;  /* why: 0 ok, 1 read fault, 2 ap_max, 3 table, 4 no ch13, 5 index, 6 ptr */
-+	uint32_t acpm_d[SWA_ACPM_WORDS];
-+	uint32_t acpm_q[4];                             /* AP->APM rear, front; APM->AP rear, front (shim/acpm.c D_RX_ and D_TX_ fields) */
-+	uint32_t ok_pmu, pmu_conf, pmu_stat, pd_on;     /* pd_on = AOC_STATUS bit 0 */
 +	uint32_t nread;
 +};
-+
-+static inline const char *
-+swa_acpm_why(uint32_t w)
-+{
-+	static const char *const n[] = { "ok", "read-fault", "bad-ap-max", "bad-table", "no-ch13", "ch13-not-at-index-13", "bad-ptr" };
-+
-+	return w < 7u ? n[w] : "?";
-+}
 +
 +static inline int
 +swa_rd(const struct swa_bus *b, struct swa_res *r, int w, uint32_t off, uint32_t *out)
@@ -253,89 +238,33 @@ new file mode 100644
 +	return b->r32(b->ctx, w, off, out);
 +}
 +
-+static inline void
-+swa_acpm(const struct swa_bus *b, struct swa_res *r)
-+{
-+	uint32_t i, id = 0, off, desc;
-+
-+	if (!swa_rd(b, r, SWA_W_ACPM, SWA_ACPM_INIT + SWA_ACPM_APMAX, &r->acpm_n) ||
-+	    !swa_rd(b, r, SWA_W_ACPM, SWA_ACPM_INIT + SWA_ACPM_TAB, &r->acpm_tab)) {
-+		r->acpm_why = 1;
-+		return;
-+	}
-+	if (r->acpm_n < 1u || r->acpm_n > SWA_ACPM_MAXCH) {
-+		r->acpm_why = 2;
-+		return;
-+	}
-+	if ((r->acpm_tab & 3u) || (uint64_t)r->acpm_tab + (uint64_t)r->acpm_n * SWA_ACPM_STRIDE > SWA_ACPM_LEN) {
-+		r->acpm_why = 3;
-+		return;
-+	}
-+	for (r->acpm_idx = 0; r->acpm_idx < r->acpm_n; r->acpm_idx++) {
-+		if (!swa_rd(b, r, SWA_W_ACPM, r->acpm_tab + r->acpm_idx * SWA_ACPM_STRIDE, &id)) {
-+			r->acpm_why = 1;
-+			return;
-+		}
-+		if (id == SWA_ACPM_CH) {
-+			break;
-+		}
-+	}
-+	if (r->acpm_idx == r->acpm_n) {
-+		r->acpm_why = 4;
-+		return;
-+	}
-+	desc = r->acpm_tab + r->acpm_idx * SWA_ACPM_STRIDE;
-+	for (i = 0; i < SWA_ACPM_WORDS; i++) {
-+		if (!swa_rd(b, r, SWA_W_ACPM, desc + 4u * i, &r->acpm_d[i])) {
-+			r->acpm_why = 1;
-+			return;
-+		}
-+	}
-+	if (r->acpm_idx != SWA_ACPM_CH) {
-+		r->acpm_why = 5;
-+		return;
-+	}
-+	for (i = 0; i < 4; i++) {       /* D_RX_REAR 4, D_RX_FRONT 5, D_TX_REAR 10, D_TX_FRONT 11 (shim/acpm.c) */
-+		off = r->acpm_d[i < 2 ? 4u + i : 10u + i - 2u];
-+		if ((off & 3u) || off > SWA_ACPM_LEN - 4u) {
-+			r->acpm_why = 6;
-+			return;
-+		}
-+		if (!swa_rd(b, r, SWA_W_ACPM, off, &r->acpm_q[i])) {
-+			r->acpm_why = 1;
-+			return;
-+		}
-+	}
-+	r->acpm_why = 0;
-+	r->ok_acpm = 1;
-+}
-+
-+/* Reads only, in a fixed order: pmu, gsa, acpm, then (AOC domain on only) aoc_req and sysmmu. Returns 1 when every
-+ * block read was read and decoded; with the domain off the gated blocks count as skipped, not failed. */
++/* Reads only, in a fixed order: pmu, gsa, then (AOC domain on only) aoc_req and sysmmu. Returns 1 when every block read
++ * was read and decoded; with the domain off the gated blocks count as skipped, not failed. */
 +static inline int
 +swa_probe(const struct swa_bus *b, struct swa_res *r)
 +{
 +	uint32_t i, raw;
 +
-+	if (b == 0 || b->r32 == 0 || b->note == 0 || r == 0) {
++	if (b == 0 || b->r32 == 0 || b->note == 0 || b->done == 0 || r == 0) {
 +		return 0;
 +	}
 +	*r = (struct swa_res){ 0 };
 +	b->note(b->ctx, SWA_W_PMU);
 +	r->ok_pmu = swa_rd(b, r, SWA_W_PMU, SWA_PMU_CONF, &r->pmu_conf) && swa_rd(b, r, SWA_W_PMU, SWA_PMU_STAT, &r->pmu_stat);
 +	r->pd_on = r->ok_pmu && (r->pmu_stat & 1u);
++	b->done(b->ctx, SWA_W_PMU, r);
 +	b->note(b->ctx, SWA_W_GSA);
 +	r->ok_gsa = 1;
 +	for (i = 0; i < 10u; i++) {
 +		r->ok_gsa &= (uint32_t)swa_rd(b, r, SWA_W_GSA, swa_gsa_off[i], &r->gsa[i]);
 +	}
-+	b->note(b->ctx, SWA_W_ACPM);
-+	swa_acpm(b, r);
++	b->done(b->ctx, SWA_W_GSA, r);
 +	if (!r->pd_on) {
-+		return r->ok_pmu && r->ok_gsa && r->ok_acpm;
++		return r->ok_pmu && r->ok_gsa;
 +	}
 +	b->note(b->ctx, SWA_W_REQ);
 +	r->ok_req = swa_rd(b, r, SWA_W_REQ, SWA_REQ_REQ, &r->req) && swa_rd(b, r, SWA_W_REQ, SWA_REQ_STATUS, &r->req_st);
++	b->done(b->ctx, SWA_W_REQ, r);
 +	b->note(b->ctx, SWA_W_MMU);
 +	r->ok_mmu = 1;
 +	for (i = 0; i < 6u; i++) {
@@ -345,7 +274,8 @@ new file mode 100644
 +	r->mmu_maj = raw >> 11;
 +	r->mmu_min = (raw >> 4) & 0x7Fu;
 +	r->mmu_rev = raw & 0xFu;
-+	return r->ok_pmu && r->ok_req && r->ok_gsa && r->ok_acpm && r->ok_mmu && r->mmu_maj == 8u;
++	b->done(b->ctx, SWA_W_MMU, r);
++	return r->ok_pmu && r->ok_req && r->ok_gsa && r->ok_mmu && r->mmu_maj == 8u;
 +}
 +
 +#endif /* SWEET_AOC_H */
