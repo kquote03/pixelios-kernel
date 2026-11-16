@@ -30,13 +30,18 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("gate without devid (m15)", " && (rr).devid == AMP_DEVID && (rr).revid", " && (rr).revid"),
     # removing the by-name PWR_CTRL1 refusal alone is an equivalent mutant (0x2014 is not in AMP_INIT_SEQ either); the 13th-pair mutant shows the refusal works
     ("a 13th pair", "X(AMP_REG_CCM_CORE, 0u)", "X(AMP_REG_CCM_CORE, 0u) X(0x2014u, 1u)"),
+    # A7 OTP unpack: the unlock / relock path only
+    ("no relock after a failed unpack", "\tif (unlocked) {\n\t\tlk = ", "\tif (unlocked && e == AMP_OK) {\n\t\tlk = "),
+    ("second lock word dropped", "\t\tlk = (amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_LOCK2) == AMP_OK) && lk;\n", ""),
+    ("a failed lock does not fail the amp", "return e == AMP_OK && unlocked && lk && nbad == 0u", "return e == AMP_OK && unlocked && nbad == 0u"),
+    ("unlock without its second word", "\t\tif (e == AMP_OK)\n\t\t\te = amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_UNLOCK2);\n", ""),
 ]
 
 
-def header() -> str:
+def header(name: str = "sweet_amp.h") -> str:
     out, on = [], False
     for ln in PATCH.read_text().splitlines():
-        if ln == "+++ b/bsd/dev/sweet_amp.h":
+        if ln == f"+++ b/bsd/dev/{name}":
             on = True
             continue
         if on and (ln.startswith("diff ") or ln.startswith("--- ")):
@@ -50,6 +55,7 @@ def header() -> str:
 
 def run(hdr: str, d: pathlib.Path) -> bool:
     (d / "sweet_amp.h").write_text(hdr)
+    (d / "sweet_amp_otp.h").write_text(header("sweet_amp_otp.h"))
     c = subprocess.run(["gcc", "-O1", "-w", f"-I{d}", "-o", str(d / "t"), str(TEST)], capture_output=True, text=True)
     if c.returncode:
         return False	# a mutant that does not compile counts as killed

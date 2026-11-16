@@ -633,8 +633,9 @@ else
 	chk "hsi2c_fg_xnu_host_test" $O/hsi2c_fg_xnu_host_test
 	chk "hsi2c_fg_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/hsi2c_fg_xnu_asan_host_test hsi2c_fg_xnu_host_test.c
 	chk "hsi2c_fg_xnu_asan_host_test" $O/hsi2c_fg_xnu_asan_host_test
-	# CS35L41 identify + B2 probe writes of xnu patch 0158 (new-file hunk of bsd/dev/sweet_amp.h): against the A1 fake SoC + two fake amps (the 12 stock writes in order, never PWR_CTRL1)
+	# CS35L41 identify + B2 probe writes of xnu patch 0158 (new-file hunk of bsd/dev/sweet_amp.h): against the A1 fake SoC + two fake amps (the 12 stock writes in order, never PWR_CTRL1; A7 OTP unpack vs the Linux logic, + sweet_amp_otp.h)
 	awk '$0=="+++ b/bsd/dev/sweet_amp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0158-sweet-amp-init.patch > $O/sweet_amp.h
+	awk '$0=="+++ b/bsd/dev/sweet_amp_otp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0158-sweet-amp-init.patch > $O/sweet_amp_otp.h
 	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
 	chk "amp_xnu_host_test" $O/amp_xnu_host_test
 	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c

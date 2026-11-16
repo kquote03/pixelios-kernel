@@ -50,7 +50,7 @@ class Modes(unittest.TestCase):
         self.assertEqual(msgs(tree({"shim/a.c": ""}, lics=("MIT.txt",))), ["R30 map-text"])
 
     def test_map_id_not_allowed(self):
-        self.assertEqual(msgs(tree({"shim/a.c": ""}, mp=MAP + "docs/*\tGPL-2.0-only\tx\n", lics=LICS + ("GPL-2.0-only.txt",))), ["R30 map-id"])
+        self.assertEqual(msgs(tree({"shim/a.c": ""}, mp=MAP + "docs/*\tGPL-3.0-only\tx\n", lics=LICS + ("GPL-3.0-only.txt",))), ["R30 map-id"])
 
     def test_map_syntax(self):
         self.assertEqual(msgs(tree({"shim/a.c": ""}, mp=MAP + "docs/*\tMIT\n")), ["R30 map-syntax"])

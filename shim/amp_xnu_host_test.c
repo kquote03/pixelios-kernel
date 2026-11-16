@@ -1,7 +1,9 @@
 /* Host test for xnu patch 0158 (bsd/dev/sweet_amp.h, boot-arg sweetamp=1): the A1 identify of shim/ampid_host_test.c (same fake SoC and fake CS35L41,
  * typed from the driver text) plus the A7 checks: every write frame is one of the 12 stock B2 probe writes in stock order (cs35l41.c:4306-4308,
  * :3675-3686, :4401), only after that amp was identified, never PWR_CTRL1; an error bit in IRQ1_STATUS1 fails the init; the armed-write allowlist.
- * The header is extracted from the patch by shim/build.sh:
+ * A7 OTP: each amp unpacks its OTP words into the 38 row registers exactly as a re-typed
+ * Linux v6.18 cs35l41_otp_unpack (ref_unpack, GPL-2.0 logic re-typed for the test, THIRD_PARTY row 22), only while unlocked, always relocked or loud.
+ * The headers (sweet_amp.h, sweet_amp_otp.h) are extracted from the patch by shim/build.sh:
  *   gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c */
 #include <assert.h>
 #include <stdio.h>
@@ -83,6 +85,10 @@ struct amp {
 	uint64_t t_low, t_high;	/* tick of the last reset assert (output low) / release */
 	int was_released;
 	unsigned frames;
+	/* A7 OTP: OTPID, the 32 OTP words, a register file of the OTP row registers, the test-key state (0 locked, 1 half unlocked, 2 unlocked, 3 half locked) */
+	uint32_t otpid, mem[32], ra[48], rv[48], ra0[48], rv0[48]; unsigned nreg, nreg0, mem_reads, otp_nwr, lock_seen;
+	int key, mem_flip;	/* mem_flip: OTP_MEM5 reads differently from the second pass on */
+	uint32_t stuck_reg;	/* writes to this register do not stick */
 };
 static struct amp amp[2];
 static unsigned violations;
@@ -90,6 +96,7 @@ static const uint32_t SEQ[12][2] = { { 0x10110u, 0x7FFCFE3Fu }, { 0x40u, 0x5555u
 				     { 0x381Cu, 0x51u }, { 0x2BC20E0u, 0u }, { 0x2BC2020u, 0u }, { 0x40u, 0xCCCCu }, { 0x40u, 0x3333u }, { 0x2BC1000u, 0u } };
 static char why_v[256];
 static unsigned nw, nreads, nframes;
+static unsigned mark_unlock[2], mark_lock[2], mark_otp_end[2];	/* nw at the unlock (key 2), the first lock word, the second lock word */
 static uintptr_t rfault_pa;
 static unsigned rfault_after;		/* the fault applies only after this many reads of rfault_pa */
 static unsigned rfault_cnt;
@@ -192,6 +199,117 @@ static int try_read32(uintptr_t pa, uint32_t *v)
 }
 
 /* the amp sees one byte on MOSI while its chip select is low; returns its MISO byte */
+/* ---- the reference OTP unpack: Linux v6.18 cs35l41_otp_unpack (cs35l41-lib.c:813-880) typed again, int offsets and GENMASK as there; the
+ * map rows are the header tables (data) ---- */
+#define GENMASK(h, l)	((~0u << (l)) & (~0u >> (31 - (h))))
+static const struct amp_otp_field *const REFMAPS[2] = { amp_otp_map_1, amp_otp_map_2 };
+static int ref_target(uint32_t reg)
+{
+	for (int m = 0; m < 2; m++)
+		for (int i = 0; i < 99; i++)
+			if (reg != 0 && REFMAPS[m][i].reg == reg)
+				return 1;
+	return 0;
+}
+static uint32_t ref_mask(uint32_t reg)
+{
+	uint32_t k = 0;
+
+	for (int m = 0; m < 2; m++)
+		for (int i = 0; i < 99; i++)
+			if (REFMAPS[m][i].reg == reg)
+				k |= GENMASK(REFMAPS[m][i].shift + REFMAPS[m][i].size - 1, REFMAPS[m][i].shift);
+	return k;
+}
+static uint32_t *regp(uint32_t *ra, uint32_t *rv, unsigned *n, uint32_t reg)
+{
+	for (unsigned i = 0; i < *n; i++)
+		if (ra[i] == reg)
+			return &rv[i];
+	assert(*n < 48);
+	ra[*n] = reg;
+	rv[*n] = 0;
+	return &rv[(*n)++];
+}
+/* apply the Linux unpack for otp id `id` to the register file (ra, rv, n); 0 = done, -1 = no map */
+static int ref_unpack(uint32_t id, const uint32_t *otp_mem, uint32_t *ra, uint32_t *rv, unsigned *n)
+{
+	const struct amp_otp_field *otp_map;
+	int bit_offset = 16, word_offset = 2, i;	/* every entry of cs35l41_otp_map_map: 16, 2 */
+	uint32_t otp_val;
+
+	if (id == 1 || id == 8) otp_map = amp_otp_map_1;
+	else if (id == 2 || id == 3 || id == 6) otp_map = amp_otp_map_2;
+	else return -1;
+	for (i = 0; i < 99; i++) {
+		if (bit_offset + otp_map[i].size - 1 >= 32) {
+			otp_val = (otp_mem[word_offset] & GENMASK(31, bit_offset)) >> bit_offset;
+			otp_val |= (otp_mem[++word_offset] & GENMASK(bit_offset + otp_map[i].size - 33, 0)) << (32 - bit_offset);
+			bit_offset += otp_map[i].size - 32;
+		} else {
+			otp_val = (otp_mem[word_offset] & GENMASK(bit_offset + otp_map[i].size - 1, bit_offset)) >> bit_offset;
+			bit_offset += otp_map[i].size;
+		}
+		if (bit_offset == 32) {
+			bit_offset = 0;
+			word_offset++;
+		}
+		if (otp_map[i].reg != 0) {
+			uint32_t mask = GENMASK(otp_map[i].shift + otp_map[i].size - 1, otp_map[i].shift), *r = regp(ra, rv, n, otp_map[i].reg);
+
+			*r = (*r & ~mask) | ((otp_val << otp_map[i].shift) & mask);	/* regmap_update_bits */
+		}
+	}
+	return 0;
+}
+
+/* an A7 write after the 12 init writes: the test-key order, OTP row registers only while unlocked, only bits of its rows */
+static void otp_wr(int a, uint32_t wa, uint32_t wv)
+{
+	struct amp *m = &amp[a];
+
+	m->otp_nwr++;
+	if (wa == 0x40u) {
+		if (wv == 0x55u && m->key == 0) m->key = 1;
+		else if (wv == 0xAAu && m->key == 1) { m->key = 2; mark_unlock[a] = nw; }
+		else if (wv == 0xCCu) { m->key = 3; mark_lock[a] = nw; }
+		else if (wv == 0x33u && m->key == 3) { m->key = 0; m->lock_seen++; mark_otp_end[a] = nw; }
+		else if (wv == 0x33u) { }	/* its 0xCC was lost (a faulted frame): the key stays as it is, the run must say lock=FAILED */
+		else violate("a TEST_KEY_CTL write out of the unlock / lock order");
+		return;
+	}
+	if (!ref_target(wa)) {
+		violate("a write after the init that is not an OTP row register");
+		return;
+	}
+	if (m->key != 2)
+		violate("an OTP row register written while the test key is locked");
+	{
+		uint32_t *r = regp(m->ra, m->rv, &m->nreg, wa);
+
+		if ((*r ^ wv) & ~ref_mask(wa))
+			violate("an OTP write changes bits outside the rows of its register");
+		if (wa != m->stuck_reg)
+			*r = wv;
+	}
+}
+
+/* the amp's row registers equal the Linux unpack applied to its starting register file */
+static int otp_as_linux(int a)
+{
+	uint32_t ra[48], rv[48];
+	unsigned n = amp[a].nreg0;
+
+	memcpy(ra, amp[a].ra0, sizeof(ra));
+	memcpy(rv, amp[a].rv0, sizeof(rv));
+	if (ref_unpack(amp[a].otpid, amp[a].mem, ra, rv, &n))
+		return 0;
+	for (unsigned i = 0; i < n; i++)
+		if (*regp(amp[a].ra, amp[a].rv, &amp[a].nreg, ra[i]) != rv[i])
+			return 0;
+	return n == amp[a].nreg;
+}
+
 static int amp_released_ok(int a)
 {
 	return released(a) && amp[a].booted;
@@ -226,11 +344,15 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 
 			if (wa == 0x2014u)
 				violate("PWR_CTRL1 (GLOBAL_EN) written");
-			if (m->nwr >= 12 || SEQ[m->nwr][0] != wa || SEQ[m->nwr][1] != wv) {
-				m->seq_bad++;
-				violate("a write outside the stock B2 sequence or out of order");
+			if (m->nwr >= 12) {
+				otp_wr(a, wa, wv);	/* A7: the OTP unpack after the 12 */
+			} else {
+				if (SEQ[m->nwr][0] != wa || SEQ[m->nwr][1] != wv) {
+					m->seq_bad++;
+					violate("a write outside the stock B2 sequence or out of order");
+				}
+				m->nwr++;
 			}
-			m->nwr++;
 			if (m->st1_late_at && m->nwr >= m->st1_late_at)
 				m->st1 |= m->st1_late;
 			if (wa == 0x10110u && !m->ignore_mask) m->mask1 = wv;
@@ -248,7 +370,8 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 		m->st1_seen = 1;
 	if (p == 5) {
 		addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
-		if (addr != REGS4[0] && addr != REGS4[1] && addr != REGS4[2] && addr != REGS4[3] && addr != 0x10010u && addr != 0x10110u && addr != 0x2BC1000u)
+		if (addr != REGS4[0] && addr != REGS4[1] && addr != REGS4[2] && addr != REGS4[3] && addr != 0x10010u && addr != 0x10110u && addr != 0x2BC1000u &&
+		    addr != 0x10u && !(addr >= 0x400u && addr <= 0x47Cu && !(addr & 3u)) && !ref_target(addr))
 			violate("a frame names a register outside the four");
 		if (released(a) && m->was_released && first_frame_tick[a] && first_frame_tick[a] - m->t_high < 2000u)
 			violate("first frame less than 2 ms after the reset release");
@@ -258,6 +381,16 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 	if (addr == 0x1001Cu && p == 6 && !m->booted && ++m->reads_since >= m->boot_polls)
 		m->booted = 1;
+	if (addr == 0x400u && p == 6)
+		m->mem_reads++;
+	if (addr == 0x10u || (addr >= 0x400u && addr <= 0x47Cu)) {
+		val = addr == 0x10u ? m->otpid : m->mem[(addr - 0x400u) / 4u] ^ (m->mem_flip && m->mem_reads >= 2 && addr == 0x414u ? 1u : 0u);
+		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
+	}
+	if (ref_target(addr)) {
+		val = *regp(m->ra, m->rv, &m->nreg, addr);
+		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
+	}
 	val = addr == 0x0u ? (m->devid ? m->devid : 0x35A40u) : addr == 0x4u ? (m->revid ? m->revid : 0xB2u) : addr == 0x1001Cu ? (m->booted ? 0x2u : 0u) : addr == 0x10110u ? m->mask1 :
 	      addr == 0x2BC1000u ? m->ccm : addr == 0x10010u ? m->st1 : addr == 0x10018u ? m->st3 : 0u;
 	return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
@@ -394,6 +527,21 @@ static void reset_hw(void)
 	h.usicon = 1u; h.ch = 0; h.clk = 0; h.mode = 0; h.slave = 1u; h.inten = 0; h.pkt = 0; h.swap = 0; h.fb = 0; h.usiopt = 0;
 	h.ch |= ch_snap_inject;
 	for (int a = 0; a < 2; a++) { amp[a].boot_polls = 3; amp[a].mask1 = 0xFFFFFFFFu; amp[a].ccm = 0x1u; }
+	for (int a = 0; a < 2; a++) {	/* A7: OTP id 1 (map 1) on L, 2 (map 2) on R; pseudo-random OTP words and row registers, the same in every run */
+		uint32_t sd = 0x2468ACE1u + (uint32_t)a;
+
+		amp[a].otpid = a == 0 ? 1u : 2u;
+		for (int i = 0; i < 32; i++)
+			amp[a].mem[i] = sd = sd * 1664525u + 1013904223u;
+		for (int mm = 0; mm < 2; mm++)
+			for (int i = 0; i < 99; i++)
+				if (REFMAPS[mm][i].reg)
+					*regp(amp[a].ra, amp[a].rv, &amp[a].nreg, REFMAPS[mm][i].reg) = sd = sd * 1664525u + 1013904223u;
+		memcpy(amp[a].ra0, amp[a].ra, sizeof(amp[a].ra));
+		memcpy(amp[a].rv0, amp[a].rv, sizeof(amp[a].rv));
+		amp[a].nreg0 = amp[a].nreg;
+	}
+	memset(mark_unlock, 0, sizeof(mark_unlock)); memset(mark_lock, 0, sizeof(mark_lock)); memset(mark_otp_end, 0, sizeof(mark_otp_end));
 	nw = nreads = nframes = violations = mux_writes = 0; why_v[0] = 0;
 	flip_at = 0; flip_bank = 0; flip_bit = 0;
 	rfault_pa = 0; rfault_after = 0; rfault_cnt = 0; wfault_n = 0; ignore_from = 0; no_clock = 0;
@@ -439,11 +587,15 @@ static void full_ok(const char *label, uint32_t mux0)
 	CHECK(rc == 0, label);
 	CHECK(violations == 0, why_v);
 	CHECK(has("SWEET AMP RESULT: l=0x35a40/0xb2 r=0x35a40/0xb2 restore=ok"), label);
-	CHECK(has("SWEET AMP: init ok (no otp unpack) l,r devid 35a40 rev b2, errors=0"), label);
+	CHECK(has("SWEET AMP: init ok (otp unpack) l,r devid 35a40 rev b2, errors=0"), label);
+	CHECK(!has("no otp unpack") && !has("partial"), label);
 	CHECK(amp[0].nwr == 12 && amp[1].nwr == 12 && !amp[0].seq_bad && !amp[1].seq_bad, "each amp got exactly the 12 stock writes in order");
+	CHECK(otp_as_linux(0) && otp_as_linux(1), "A7: the row registers equal the Linux unpack (L map 1, R map 2)");
+	CHECK(amp[0].key == 0 && amp[1].key == 0 && amp[0].lock_seen == 1 && amp[1].lock_seen == 1, "A7: each amp unlocked once and locked again");
+	CHECK(has("AMP L otp id=1 map=1") && has("AMP R otp id=2 map=2") && has("readback-bad=0 first=0 lock=ok"), "A7: the otp lines");
 	CHECK(restored_exact(), label);
 	CHECK(amp[0].frames >= 4 && amp[1].frames >= 4, "both amps answered at least four frames");
-	CHECK(nframes <= 2u * (100u + 4u + 12u + 3u), "no more frames than polls + reads + the init per amp");
+	CHECK(nframes <= 2u * (100u + 4u + 12u + 3u + 1u + 64u + 99u + 99u + 4u + 99u), "no more frames than polls + reads + the init + the otp unpack per amp");
 	if (!(mux0 & 0x10u)) {
 		/* no mux write at all: run again counting writes to MUX via the violation-free path */
 		CHECK(h.mux == mux0 && mux_writes == 0, "mux never written");
@@ -539,6 +691,21 @@ static void unit_writes(void)
 	CHECK(!w32_allowed(R_CH, 0, CH_TX | CH_RX, 10u << 6, 0, 1, 0x2014u, 1u), "TX on for PWR_CTRL1: refused");
 	CHECK(w32_allowed(R_PKT, 0, 10u, 0, 0, 1, 0x40u, 0x5555u) && !w32_allowed(R_PKT, 0, 10u, 0, 0, 0, 0, 0), "PACKET_CNT 10 only when armed");
 	CHECK(amp_write_ok(0x2BC1000u, 0u) && !amp_write_ok(0x2014u, 0u) && !amp_write_ok(0x2014u, 1u) && !amp_write_ok(0x2BC1000u, 1u), "amp_write_ok");
+	/* A7 OTP: the four test-key words, the row registers (38, any value), nothing else; armed reads exact */
+	CHECK(amp_write_ok(0x40u, 0x55u) && amp_write_ok(0x40u, 0xAAu) && amp_write_ok(0x40u, 0xCCu) && amp_write_ok(0x40u, 0x33u) && !amp_write_ok(0x40u, 0x56u) && !amp_write_ok(0x40u, 0u), "test-key words");
+	CHECK(amp_write_ok(0x6E48u, 0x12345678u) && amp_write_ok(0x4000u, 0x800u) && amp_write_ok(0x17044u, 1u) && !amp_write_ok(0x6E68u, 0u) && !amp_write_ok(0u, 0u) && !amp_write_ok(0x400u, 0u) && !amp_write_ok(0x10u, 0u), "OTP row registers only");
+	{
+		unsigned nt = 0;
+
+		for (uint32_t r = 0; r < 0x20000u; r += 4u)
+			nt += amp_otp_reg_ok(r) != 0;
+		CHECK(nt == 38u, "38 OTP row registers");
+	}
+	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 2u << 6, 0x04u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 3u << 6, 0x7Cu, 0, 0, 2, 0x47Cu, 0), "armed OTP_MEM31 read frame");
+	CHECK(!w32_allowed(R_TX, 3u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && !w32_allowed(R_TX, 6u << 6, 0x00u, 0, 0, 2, 0x47Cu, 0), "armed read: another byte / a seventh byte refused");
+	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2014u, 0), "armed read of an unlisted register refused");
+	CHECK(!w32_allowed(R_PKT, 0, 10u, 0, 0, 2, 0x400u, 0) && !w32_allowed(R_CH, 0, CH_TX | CH_RX, 10u << 6, 0, 2, 0x400u, 0), "an armed read never sends a write frame");
+	CHECK(w32_allowed(R_CH, 0, CH_TX | CH_RX, 6u << 6, 0, 2, 0x400u, 0), "an armed read sends its 6-byte frame");
 	printf("ok: armed write unit cases\n");
 }
 
@@ -713,20 +880,54 @@ int main(void)
 	reset_hw(); amp[1].devid = 0x35B40u; stopped("R DEVID is CS35L41R 0x35B40 (gate needs devid)", 1);
 	CHECK(amp[1].nwr == 0 && !has("init ok"), "wrong DEVID: no write to R");
 	reset_hw(); amp[0].st3 = 0x20000000u; amp[1].st3 = 0x20000000u; rc = amp_init_run();
-	CHECK(rc == 0 && has("init ok (no otp unpack)") && amp[0].nwr == 12 && amp[1].nwr == 12, "st3 = 0x20000000 (the observed hardware value, bit 29) passes");
+	CHECK(rc == 0 && has("init ok (otp unpack)") && amp[0].nwr == 12 && amp[1].nwr == 12, "st3 = 0x20000000 (the observed hardware value, bit 29) passes");
 	printf("ok: st3 = 0x20000000 on both amps (observed o5-a1-ampid) passes\n");
 	reset_hw(); no_clock = 1; stopped("the bus never clocks (RX timeout)", 1);
 	CHECK(has("timeout"), "timeout reported");
 	reset_hw(); (void)amp_init_run(); unsigned nfull = nw;
-	for (unsigned k = 1; k <= nfull; k++) {	/* every write position of a full run, the restore included */
+	unsigned mu[2] = { mark_unlock[0], mark_unlock[1] }, ml[2] = { mark_lock[0], mark_lock[1] }, me[2] = { mark_otp_end[0], mark_otp_end[1] };
+	unsigned nk = 0, nrel = 0, nlf = 0;
+	CHECK(mu[0] && ml[0] > mu[0] && me[0] > ml[0] && mu[1] > me[0] && ml[1] > mu[1] && me[1] > ml[1], "A7: the unlock / lock marks of a full run");
+	for (unsigned k = 1; k <= nfull; k++) {	/* every write position of a full run, the restore included; inside the OTP row writes every 5th (run time) */
+		int inrows = (k > mu[0] + 40u && k + 40u < ml[0]) || (k > mu[1] + 40u && k + 40u < ml[1]);
+
+		if (inrows && k % 5u)
+			continue;
+		nk++;
 		reset_hw();
 		wfault_n = k;
 		rc = amp_init_run();
 		CHECK(rc == 1, "a faulting write is a failure");
 		CHECK(violations == 0, why_v);
 		CHECK(!has("restore=ok") || restored_exact(), "restore=ok only when exact");
+		/* A7: once unlocked, the run relocks or says lock=FAILED */
+		CHECK((amp[0].key == 0 && amp[1].key == 0) || has("lock=FAILED"), "A7: a fault after the unlock: relocked or lock=FAILED");
+		if (k > mu[0] && k < ml[0]) {	/* a fault between the L unlock and its lock: the L lock goes out (or, chip select stuck low, lock=FAILED); R untouched */
+			int relocked = amp[0].key == 0 && amp[0].lock_seen == 1 && has("lock=ok FAILED");
+
+			CHECK(amp[1].nwr == 0 && (relocked || (amp[0].key == 2 && has("lock=FAILED") && has("!!! otp test-key LOCK"))), "A7: L relocked or loud after a fault in its rows");
+			nrel += relocked;
+			nlf += !relocked;
+		}
 	}
-	printf("ok: a faulting write at each write position of a full run stops, restores, never claims a false ok\n");
+	CHECK(nrel > 400u, "A7: faults in the L rows relock (a fault that leaves the controller or a chip select stuck cannot: lock=FAILED)");
+	printf("ok: a faulting write at %u of %u write positions of a full run stops, restores, never claims a false ok; L rows: %u relocked, %u lock=FAILED (controller / CS stuck by the fault)\n", nk, nfull, nrel, nlf);
+	/* A7 OTP stop paths */
+	reset_hw(); amp[0].otpid = 5u; stopped("L OTP id 5 has no map", 1);
+	CHECK(amp[0].otp_nwr == 0 && amp[1].nwr == 0 && has("no otp map") && has("lock=untouched FAILED"), "unknown id: no unlock, no R write");
+	reset_hw(); amp[0].mem_flip = 1; stopped("L OTP word 5 reads differently the second time", 1);
+	CHECK(amp[0].otp_nwr == 0 && amp[1].nwr == 0 && has("otp words differ"), "unstable OTP read: no unlock, no R write");
+	reset_hw(); amp[1].stuck_reg = 0x6E48u; stopped("R VOFF_GAIN_0..2 write does not stick", 1);
+	CHECK(amp[1].key == 0 && amp[1].lock_seen == 1 && has("first=6e48 lock=ok FAILED") && !has("init ok"), "read-back mismatch: relocked, reported, no pass");
+	reset_hw(); amp[0].otpid = 8u; amp[1].otpid = 6u; rc = amp_init_run();
+	CHECK(rc == 0 && violations == 0 && otp_as_linux(0) && otp_as_linux(1) && has("otp id=8 map=1") && has("otp id=6 map=2"), "ids 8 / 6 select maps 1 / 2 as Linux");
+	reset_hw(); amp[0].otpid = 3u; amp[1].otpid = 1u; rc = amp_init_run();
+	CHECK(rc == 0 && violations == 0 && otp_as_linux(0) && otp_as_linux(1), "ids 3 / 1");
+	{	/* a fault in the first lock word of L: reported lock=FAILED, no pass, no R write */
+		reset_hw(); wfault_n = ml[0] - 3u; rc = amp_init_run();
+		CHECK(rc == 1 && has("lock=FAILED") && amp[1].nwr == 0, "A7: a lost lock word is a failure");
+	}
+	printf("ok: A7 otp stop paths (unknown id, unstable OTP, read-back mismatch, lost lock word) and ids 8/6/3/1\n");
 	for (unsigned k = 1; k <= 200; k += 7) {
 		reset_hw();
 		ignore_from = k;
