@@ -283,7 +283,7 @@ def audit_store_path(hdr, glue):
         f.append("sw3_wr does not limit the doorbells to bus master on, the PCIe core window and value 1")
     # patch 0160: the root port's Command: level 8 after the release, Status half 0, only memory/master may differ from the live word, master only with a pool; one word of the page
     if "if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL && (v >> 16) == 0 && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0 && (!(v & 0x4u) || h->pool != NULL))) {" not in w \
-            or "return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;" not in body(glue, "sw3_ptr") or w.find("space == SWW_DBI && !(f") > store:
+            or "return h->dbi != NULL && (off == SWW_CFG_CMD || off == SWW_RC_BUS) ? &h->dbi[off / 4] : NULL;" not in body(glue, "sw3_ptr") or w.find("space == SWW_DBI && !(f") > store:
         f.append("sw3_wr does not limit the root port to its Command word at level 8 with only memory/master changing")
     if not re.search(r"^#define SW_F_STORES\s+96u\b", glue, re.M) or w.find("h->f_stores++;") < 0 or w.find("h->f_stores++;") > store:
         f.append("sw3_wr does not bound the chip-RAM stores after the release")
@@ -1380,7 +1380,7 @@ GLUE_MUTANTS = [
     ("SYS_MEM refused before the release too", [("if (space == SWW_BAR0 && h->released && (win == SWW_WIN_SYSMEM", "if (space == SWW_BAR0 && (win == SWW_WIN_SYSMEM")]),
     # patch 0160: the root port's Command
     ("root port without the run F gate", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD", "if (space == SWW_DBI && !(off == SWW_CFG_CMD")]),
-    ("root port: any word of the page", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL", "if (space == SWW_DBI && !(f && h->dbi != NULL"), ("return h->dbi != NULL && off == SWW_CFG_CMD ? &h->dbi[SWW_CFG_CMD / 4] : NULL;", "return h->dbi != NULL && off < 0x1000 ? &h->dbi[off / 4] : NULL;")]),
+    ("root port: any word of the page", [("if (space == SWW_DBI && !(f && off == SWW_CFG_CMD && h->dbi != NULL", "if (space == SWW_DBI && !(f && h->dbi != NULL"), ("return h->dbi != NULL && (off == SWW_CFG_CMD || off == SWW_RC_BUS) ? &h->dbi[off / 4] : NULL;", "return h->dbi != NULL && off < 0x1000 ? &h->dbi[off / 4] : NULL;")]),
     ("root port: Status half written", [(" && (v >> 16) == 0 && ((v ^ h->dbi", " && ((v ^ h->dbi")]),
     ("root port: any Command bit may change", [(" && ((v ^ h->dbi[SWW_CFG_CMD / 4]) & 0xFFFFu & ~SWW_CMD_MEM_BM) == 0", "")]),
     ("root port: the IO bit may change too", [("& 0xFFFFu & ~SWW_CMD_MEM_BM) == 0", "& 0xFFFFu & ~(SWW_CMD_MEM_BM | 0x1u)) == 0")]),

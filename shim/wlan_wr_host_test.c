@@ -66,6 +66,7 @@ struct fake {
 	 * makes it consume the control-submit items from the host pool and write ACK + completion + answer back into the pool. Host addresses outside the pool are counted in oob and not followed. */
 	int mb, fw_mute, fw_extra, fw_guard, bm_stuck, idx_dirty;
 	uint32_t rc_cmd; unsigned rc_writes; int rc_stuck, rc_dead;   /* patch 0160: the root port's Command/Status word (DBI 0x04) */
+	uint32_t rc_bus; unsigned rc_bus_writes; int rc_bus_stuck;   /* patch 0160 (review A2): the root port's bus-number word (DBI 0x18) */
 	int fw_late, ri_host;                           /* review 0159-1: the completion items arrive one delay after the index; a non-zero host index-buffer word in ring_info */
 	uint32_t fw_cmd_xor;
 	struct { uint8_t *at; uint8_t b[24]; } late[8]; unsigned nlate;
@@ -107,9 +108,9 @@ static int f_rd(void *c, int space, uint32_t win, uint32_t off, uint32_t *v)
 	case SWW_ELBI:
 		*v = f->ltssm;
 		return off == 0x2C8 ? 0 : -1;
-	case SWW_DBI:                                   /* patch 0160: only the Command/Status word exists */
-		*v = f->rc_dead ? 0xFFFFFFFFu : f->rc_cmd;
-		return off == 0x04 ? 0 : -1;
+	case SWW_DBI:                                   /* patch 0160: only the Command/Status word and the bus-number word exist */
+		*v = f->rc_dead ? 0xFFFFFFFFu : off == 0x18 ? f->rc_bus : f->rc_cmd;
+		return off == 0x04 || off == 0x18 ? 0 : -1;
 	case SWW_ISO:
 		*v = f->iso;
 		return off == 0 ? 0 : -1;
@@ -199,7 +200,7 @@ static void fw_msgbuf(struct fake *f)
 	uint64_t base, qpa;
 	uint8_t *it, *q, *a;
 
-	if (!f->mb || !f->ram || !(f->cmd & 4u) || !(f->rc_cmd & 4u))   /* no bus master on the endpoint or on the root port above it: the chip cannot read or write host memory */
+	if (!f->mb || !f->ram || !(f->cmd & 4u) || !(f->rc_cmd & 4u) || ((f->rc_bus >> 8) & 0xFFu) != 1u)   /* no bus master on the endpoint or on the root port above it, or completions not routed to bus 1: the chip cannot read or write host memory */
 		return;
 	f->bm_on_at_db++;
 	base = fw_ringbase(f, 0, &depth, &item);
@@ -260,6 +261,7 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 		return 0;
 	if (f->corrupt_at == f->nw)
 		v ^= 1u;
+	if (space == SWW_DBI && off == 0x18) { f->rc_bus_writes++; if (!f->rc_bus_stuck) f->rc_bus = v; return 0; }
 	if (space == SWW_DBI) { f->rc_writes++; if (off != 0x04) return -1; if (!f->rc_stuck) f->rc_cmd = (f->rc_cmd & 0xFFFF0000u) | (v & 0xFFFFu); return 0; }
 	if (space == SWW_CFG && off == 0x04) { if (!f->bm_stuck) f->cmd = (f->cmd & 0xFFFF0000u) | (v & 0xFFFFu); return 0; }
 	if (space == SWW_BAR0 && f->win0 == SWW_WIN_PCIE && (off == 0x140 || off == 0x144)) {
@@ -405,6 +407,7 @@ static void obs(struct fake *f)
 
 	memset(f, 0, sizeof *f);
 	f->rc_cmd = 0x00100000u;                       /* synthetic: capabilities bit in Status, Command 0 (the shim never writes it) */
+	f->rc_bus = 0x40000000u;                       /* synthetic: a top byte to keep, bus numbers 0 (the shim never writes them) */
 	f->cmd = 0x00100002; f->bar0lo = 0x60000004; f->bar2lo = SWW_BAR2_CFG; f->win0 = 0x18123000; f->c88 = 0x00080080;
 	f->iso = 1; f->ltssm = 0x0300a911;
 	memcpy(f->a0, a0, sizeof a0);
@@ -1853,7 +1856,7 @@ static void runc_deny_sweep(void)
 			CHECK(((swl_wt[v].flags & SWT_TW) != 0) == (v >= SWT_NV_VARS && v <= SWT_NV_RTLV) && (!(swl_wt[v].flags & SWT_TW) || (swl_wt[v].kind >= SWK_VARS && swl_wt[v].kind <= SWK_RTLV)) &&
 			      (!!(swl_wt[v].flags & SWT_TW) || swl_wt[v].kind == 0));
 	}
-	CHECK(SWT_N == 42 && SWT_N_D == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
+	CHECK(SWT_N == 44 && SWT_N_D == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
 }
 
 /* the stores that reached the bus other than the restore of cfg 0x84 (a refused store with the window moved runs that restore) */
@@ -2743,6 +2746,7 @@ static void rune(void)
 #define FLEVEL8 (ELEVEL7 | SWF_W18 | SWF_W19 | SWF_W20 | SWF_W21 | SWF_W23)
 static uint8_t fpool[SWM_POOL_LEN];
 static uint32_t f_rc0;                         /* patch 0160: the root port Command (low half) the current case started with */
+static uint32_t f_bus0;                        /* patch 0160 (review A2): the root port bus-number word the current case started with */
 static const uint32_t flen = 1764018u, fpin = 0x1153ccffu;
 
 static void f_sync(void *c, uint32_t off, uint32_t len)
@@ -2765,6 +2769,7 @@ static void fwf(struct fake *f)
 	f->dw = 0x47E800u; f->dr = 0x47EC00u;
 	f->maxsub = 42; f->maxcpl = 5;
 	f_rc0 = f->rc_cmd & 0xFFFFu;
+	f_bus0 = f->rc_bus;
 }
 
 /* what = 0 normal; 1 no pool; 2 misaligned pool; 3 no sync callback; 4 short pool; 5 pool ends above 2^36; 6 pool ends exactly at 2^36 */
@@ -2788,12 +2793,13 @@ static int runf(struct fake *f, struct swl_wx *x)
 
 static int bm_off(const struct fake *f)         /* rule R2: however the run ended, EP Command is memory-only, no doorbell was rung without bus master, the firmware was told no address outside the pool */
 {
-	return (f->cmd & 0xFFFFu) == 0x0002u && f->db_nobm == 0 && f->oob == 0 && f->win2 == 0 && (f->rc_stuck || f->rc_dead || (f->rc_cmd & 0xFFFFu) == f_rc0);   /* patch 0160: and the root port's Command is the word it was */
+	return (f->cmd & 0xFFFFu) == 0x0002u && f->db_nobm == 0 && f->oob == 0 && f->win2 == 0 && (f->rc_stuck || f->rc_dead || (f->rc_cmd & 0xFFFFu) == f_rc0) &&   /* patch 0160: and the root port's Command is the word it was */
+	    (f->rc_bus_stuck || f->rc_dead || f->rc_bus == f_bus0);                                                                              /* review A2: and its bus numbers */
 }
 
 static int nothing_f(const struct fake *f)      /* a refusal before the first run F store: nothing after the release reached chip RAM, EP Command and the doorbells untouched */
 {
-	return f->bar2_stores_after_rel == 0 && f->cfg04_writes == 0 && f->ndb0 == 0 && f->nrdy == 0 && f->oob == 0 && (f->cmd & 0xFFFFu) == 0x0002u && f->rc_writes == 0;
+	return f->bar2_stores_after_rel == 0 && f->cfg04_writes == 0 && f->ndb0 == 0 && f->nrdy == 0 && f->oob == 0 && (f->cmd & 0xFFFFu) == 0x0002u && f->rc_writes == 0 && f->rc_bus_writes == 0;
 }
 
 static void runf_tests(void)
@@ -2822,7 +2828,9 @@ static void runf_tests(void)
 	CHECK(x.stopped == 0 && x.flags == FLEVEL8 && x.armed == 0 && x.restore == SWW_RS_NONE && bm_off(&f));
 	CHECK(f.rc_writes == 2 && (f.rc_cmd & 0xFFFFu) == 0 && strstr(logbuf, "W22 root port Command/Status 0x100000 (memory off, bus master off)") != 0 && strstr(logbuf, "W25 root port Command back at 0") != 0);
 	CHECK(f.cfg04_writes == 2 && f.nrdy == 1 && f.ndb0 == 4 && f.fw_items == 4 && f.bm_on_at_db == 4 && x.f_ndb == 5 && x.f_other == 0);
-	CHECK(f.lastw.space == SWW_DBI && f.lastw.off == 0x04 && f.lastw.val == 0x0000u);                      /* the last store of the run: bus master off */
+	CHECK(f.rc_bus_writes == 2 && f.rc_bus == 0x40000000u && strstr(logbuf, "W22 root port bus numbers 0x40000000 (primary 0 secondary 0 subordinate 0)") != 0 &&
+	    strstr(logbuf, "W22 root port bus numbers now 0x40ff0100 (secondary 1") != 0 && strstr(logbuf, "W25 root port bus numbers back at 0x40000000") != 0);
+	CHECK(f.lastw.space == SWW_DBI && f.lastw.off == 0x18 && f.lastw.val == 0x40000000u);                  /* the last store of the run: the root port's bus numbers back */
 	CHECK(x.f_nstore == 2 + 25 + 6 + 6 && f.bar2_stores_after_rel == x.f_nstore);
 	CHECK(f.ram[0x480054 / 4] == 0x1407u && f.ram[0x480070 / 4] == 0);
 	a = FPA + SWM_O_SCRATCH;
@@ -2839,7 +2847,7 @@ static void runf_tests(void)
 	CHECK(strstr(logbuf, "SWEET WLAN: fw version wl0: Jan  1 2026 00:00:00 version 99.9.9 (synthetic) FWID 01-abcdef mac xx:xx:xx:xx:44:55\n") != 0);
 	CHECK(strstr(logbuf, "second line") == 0 && strstr(logbuf, "11:22") == 0 && strstr(logbuf, "02:11") == 0 && strstr(logbuf, "33:44") == 0);       /* one line of text, only the last two MAC bytes */
 	CHECK(strstr(logbuf, "W22 bus master ON") != 0 && strstr(logbuf, "W25 bus master off, guards intact") != 0 && strstr(logbuf, "level 8 done msgbuf round trip ok") != 0 && strstr(logbuf, "STOP") == 0);
-	CHECK(f.nsync == 16 && n8 == n7 + 4 + x.f_nstore + x.f_ndb + 15);        /* + 2 root port Command stores (patch 0160), + 2 EP Command stores, + 1 cfg 0x80 select (PCIe core), + 14 cfg 0x84 moves between window 0 and the tail window */
+	CHECK(f.nsync == 16 && n8 == n7 + 6 + x.f_nstore + x.f_ndb + 15);        /* + 2 root port bus-number stores (review A2), + 2 root port Command stores (patch 0160), + 2 EP Command stores, + 1 cfg 0x80 select (PCIe core), + 14 cfg 0x84 moves between window 0 and the tail window */
 	for (i = 0; i < SWM_POOL_LEN; i++)                                              /* the guard gaps hold the pattern, also after the run */
 		if (fpool[i] != SWM_GUARD && !((i < 0xA00) || (i >= 0x1000 && i < 0x1600) || (i >= 0x2000 && i < 0x2008) || (i >= 0x2400 && i < 0x2800) || (i >= 0x3000 && i < 0x3800) ||
 		    (i >= 0x4000 && i < 0x6000) || (i >= 0x8000 && i < 0x22000)))
@@ -2901,15 +2909,52 @@ static void runf_tests(void)
 	CHECK(runf(&f, &x) == 0 && (f.rc_cmd & 0xFFFFu) == 0x0006u && bm_off(&f) && strstr(logbuf, "(memory on, bus master on)") != 0);
 	/* the word reads all-ones (the DBI page is not there): stop before any Command store, endpoint never a master */
 	fwf(&f); f.rc_dead = 1;
-	CHECK(runf(&f, &x) < 0 && x.row == 22 && f.rc_writes == 0 && f.cfg04_writes == 0 && f.nrdy == 0 && (f.cmd & 0xFFFFu) == 2);
-	/* the root port does not take the bits: stop at the read-back, the endpoint never becomes a master, the restore writes the old word */
+	CHECK(runf(&f, &x) < 0 && x.row == 22 && f.rc_writes == 0 && f.rc_bus_writes == 0 && f.cfg04_writes == 0 && f.nrdy == 0 && (f.cmd & 0xFFFFu) == 2);
+	/* the root port does not take the bits: stop at the read-back, the endpoint never becomes a master, the restore writes the old word, then the old bus numbers */
 	fwf(&f); f.rc_stuck = 1;
-	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.cfg04_writes == 0 && f.nrdy == 0 && f.rc_writes == 2 && f.lastw.space == SWW_DBI && f.lastw.val == 0);
-	/* a stop with both master bits on puts the endpoint back first, then the root port */
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.cfg04_writes == 0 && f.nrdy == 0 && f.rc_writes == 2 && f.rc_bus_writes == 2 && bm_off(&f) &&
+	    f.lastw.space == SWW_DBI && f.lastw.off == 0x18 && f.lastw.val == 0x40000000u);
+	/* a stop with both master bits on puts the endpoint back first, then the root port's Command, then its bus numbers */
 	fwf(&f); f.fw_mute = 1;
-	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_TMO && bm_off(&f) && (x.rs_ok & (SWW_RG_BM | SWW_RG_RCBM)) == (SWW_RG_BM | SWW_RG_RCBM) && f.lastw.space == SWW_DBI && f.lastw.val == 0);
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_TMO && bm_off(&f) && (x.rs_ok & (SWW_RG_BM | SWW_RG_RCBM | SWW_RG_RCBUS)) == (SWW_RG_BM | SWW_RG_RCBM | SWW_RG_RCBUS) &&
+	    f.lastw.space == SWW_DBI && f.lastw.off == 0x18 && f.lastw.val == 0x40000000u);
 	CHECK(strstr(logbuf, "restore space 1 win 0 off 0x4 := 0x2 ok") != 0 && strstr(logbuf, "restore space 7 win 0 off 0x4 := 0 ok") != 0 &&
-	    strstr(logbuf, "restore space 1 win 0 off 0x4") < strstr(logbuf, "restore space 7 win 0 off 0x4"));
+	    strstr(logbuf, "restore space 7 win 0 off 0x18 := 0x40000000 ok") != 0 &&
+	    strstr(logbuf, "restore space 1 win 0 off 0x4") < strstr(logbuf, "restore space 7 win 0 off 0x4") &&
+	    strstr(logbuf, "restore space 7 win 0 off 0x4") < strstr(logbuf, "restore space 7 win 0 off 0x18"));
+	/* review A2: the bus numbers do not take: stop at the read-back before any Command store, the restore writes the old word */
+	fwf(&f); f.rc_bus_stuck = 1;
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.rc_writes == 0 && f.cfg04_writes == 0 && f.nrdy == 0 && f.rc_bus_writes == 2 &&
+	    f.lastw.off == 0x18 && f.lastw.val == 0x40000000u && (x.rs_ok & SWW_RG_RCBUS));
+	/* review A2: the top byte is kept, whatever the bus numbers were they come back exactly (also when they already are the target) */
+	fwf(&f); f.rc_bus = 0x12345678u; f_bus0 = f.rc_bus;
+	CHECK(runf(&f, &x) == 0 && bm_off(&f) && x.rc_bus_old == 0x12345678u && strstr(logbuf, "W22 root port bus numbers now 0x12ff0100") != 0);
+	fwf(&f); f.rc_bus = 0x00FF0100u; f_bus0 = f.rc_bus;
+	CHECK(runf(&f, &x) == 0 && bm_off(&f) && f.rc_bus_writes == 2);
+	/* review A2: a store that fails at any point after the bus-number store (each later row): a stop, and everything is back */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw;
+	for (i = n - 1; i > n7; i--) {
+		fwf(&f); f.fail_wr_at = i;
+		if (runf(&f, &x) == 0 || !(f.rc_bus_writes >= 1))
+			continue;
+		CHECK(x.stopped && bm_off(&f) && f.rc_bus == f_bus0 && (f.rc_cmd & 0xFFFFu) == f_rc0);
+	}
+	/* review A2: the writer's rules for the bus-number word */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BUS_ON) | SWT_BIT(SWT_RC_BUS_OFF));
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x18u, 0x40FF0200u) == -SWW_E_OLD && f.nw == n);                              /* on: another secondary bus */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BUS_ON) | SWT_BIT(SWT_RC_BUS_OFF));
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x18u, 0x00FF0100u) == -SWW_E_OLD && f.nw == n);                              /* on: the top byte changed */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_RC_BUS_OFF);
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x18u, 0x40FF0100u) == -SWW_E_ORDER && f.nw == n);                            /* off: not the recorded word */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~SWT_BIT(SWT_RC_BUS_OFF); x.flags |= SWF_BM; f.cmd |= 4u;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x18u, 0x40000000u) == -SWW_E_ORDER && f.nw == n);                            /* off: never while the endpoint is a master */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BUS_OFF) | SWT_BIT(SWT_RC_BM_OFF));
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x18u, 0x40000000u) == -SWW_E_ORDER && f.nw == n);                            /* off: only after the root port's Command is back */
+	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BM_ON) | SWT_BIT(SWT_RC_BUS_ON));
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0006u) == -SWW_E_ORDER && f.nw == n);                                /* the root port's Command only after its bus numbers */
+	fwf(&f); CHECK(runf_x(&f, &x, 7, 0) == 0); n = f.nw;
+	CHECK(swl_wr(&x, SWW_DBI, 0, 0x18u, 0x40FF0100u) == -SWW_E_DENIED && f.nw == n && f.rc_bus_writes == 0);   /* level 7 has no such tuple */
+	CHECK(swl_wr_ok_run(0, SWW_RUN_F, SWW_DBI, 0, 0x18, 0) == SWT_RC_BUS_ON && swl_rd_find(SWW_DBI, 0, 0x18) >= 0);
 	/* the writer's rules for that word, on finished runs (a refusal latches STOPPED) */
 	fwf(&f); CHECK(runf(&f, &x) == 0); n = f.nw; x.done &= ~(SWT_BIT(SWT_RC_BM_ON) | SWT_BIT(SWT_RC_BM_OFF));
 	CHECK(swl_wr(&x, SWW_DBI, 0, 0x04u, 0x0007u) == -SWW_E_OLD && f.nw == n);                                  /* on: more than memory + master */
@@ -2934,7 +2979,7 @@ static void runf_tests(void)
 
 	/* W22: EP Command does not take the bit: stop, the restore writes memory-only, no doorbell */
 	fwf(&f); f.bm_stuck = 1;
-	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.cfg04_writes == 2 && f.lastw.space == SWW_DBI && f.lastw.off == 0x04 && f.lastw.val == 0 && f.rc_writes == 2 && f.nrdy == 0 && f.ndb0 == 0 && bm_off(&f));
+	CHECK(runf(&f, &x) < 0 && x.stop_code == SWW_E_READBACK && x.row == 22 && f.cfg04_writes == 2 && f.lastw.space == SWW_DBI && f.lastw.off == 0x18 && f.lastw.val == 0x40000000u && f.rc_writes == 2 && f.nrdy == 0 && f.ndb0 == 0 && bm_off(&f));
 
 	/* rule R3/R2: the firmware never answers: 200 polls, then stop with bus master off */
 	fwf(&f); f.fw_mute = 1;
@@ -3018,7 +3063,7 @@ static void runf_tests(void)
 	fwf(&f); CHECK(runf_x(&f, &x, 7, 0) == 0); n = f.nw;
 	CHECK(swl_wr(&x, SWW_BAR2, 0x400000u, 0x80054u, 0x1407u) == -SWW_E_NV + 0 * (int)n || x.stop_code != 0);                            /* level 7: judged as before (a tail tuple), never stored */
 	CHECK(f.nw == n && f.bar2_stores_after_rel == 0);
-	CHECK(SWT_N == 42 && SWT_F_LO == 34 && SWT_RC_BM_ON == 38 && SWT_DB_H2D == 41 && swl_wr_ok(SWW_BAR2, 0, 0x3F0000u, 5) < 0 && swl_wr_ok(SWW_CFG, 0, 0x04, 6) < 0 && swl_wr_ok(SWW_BAR0, SWW_WIN_PCIE, 0x140, 1) < 0);
+	CHECK(SWT_N == 44 && SWT_F_LO == 34 && SWT_RC_BUS_ON == 38 && SWT_RC_BM_ON == 40 && SWT_DB_H2D == 43 && swl_wr_ok(SWW_BAR2, 0, 0x3F0000u, 5) < 0 && swl_wr_ok(SWW_CFG, 0, 0x04, 6) < 0 && swl_wr_ok(SWW_BAR0, SWW_WIN_PCIE, 0x140, 1) < 0);
 	CHECK(swl_wr_ok_run(0, SWW_RUN_F, SWW_BAR2, 0, 0x3F0000u, 5) == SWT_F_LO && swl_wr_ok_run(0, SWW_RUN_F, SWW_CFG, 0, 0x04, 6) == SWT_BM_ON && swl_wr_ok_run(0, SWW_RUN_F, SWW_BAR0, SWW_WIN_PCIE, 0x144, 1) == SWT_DB_RDY);
 }
 
