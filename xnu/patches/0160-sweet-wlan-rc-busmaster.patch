@@ -9,6 +9,7 @@ only at level 8; sw3_wr() lets only that word through, only after the release, o
 master bit only with a host pool. Levels 1..7 are unchanged.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 --- a/bsd/dev/sweet_wlan.c
 +++ b/bsd/dev/sweet_wlan.c
 @@ -50,11 +50,13 @@
@@ -104,7 +105,7 @@ diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
 -	[SWT_BM_ON]      = { .row = 22, .run = 6, .space = SWW_CFG, .rgrp = SWW_RG_BM, .flags = SWT_ONCE, .off = SWW_CFG_CMD, .val = SWW_CMD_MEM_BM, .vmask = 0xFFFFu,
 +	/* Patch 0160: the root port forwards a memory request from the endpoint upstream only while its own Command has Bus Master Enable (PCI Express Base: Command register of a Type 1 function;
 +	 * Linux v6.18 drivers/pci/pci.c:2071-2090 pci_enable_bridge(): enabling a device first enables every bridge above it and calls pci_set_master() on it; the DesignWare host setup also sets
-+	 * MEMORY and MASTER on the root port (dw_pcie_setup_rc, not in the pinned checkout: [guess] for the exact line). The shim's link bring-up never writes that register (shim/wlanlink.c writes DBI + 0x890 only), and run o5-w7-l8 showed the firmware never fetching a
++	 * IO, MEMORY, MASTER and SERR on the root port (dw_pcie_setup_rc, drivers/pci/controller/dwc/pcie-designware-host.c:1076-1081, v6.18). The shim's link bring-up never writes that register (shim/wlanlink.c writes DBI + 0x890 only), and run o5-w7-l8 showed the firmware never fetching a
 +	 * request (h2d fw r 0). Run F therefore sets the memory and master bits on the root port before the endpoint's, and puts the word back afterwards. The value is not the caller's: swl_wr()
 +	 * requires old | 0x6 (on) or the recorded old word (off); the Status half is written as 0 (write-1-to-clear). */
 +	[SWT_RC_BM_ON]   = { .row = 22, .run = 6, .space = SWW_DBI, .rgrp = SWW_RG_RCBM, .flags = SWT_ONCE | SWT_RC, .off = SWW_CFG_CMD, .vmask = 0xFFFFu, .need = SWF_W21 },
