@@ -8,7 +8,8 @@ from .lib import Finding
 
 RULE = "R30"
 MAP = "tools/license-map.txt"
-ALLOWED = {"MIT", "ISC", "APSL-2.0", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "GPL-2.0-only"}	# GPL-2.0-only: the CS35L41 OTP maps only (user 2026-11-16, THIRD_PARTY row 22)
+ALLOWED = {"MIT", "ISC", "APSL-2.0", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0"}
+ALLOWED_AT = {"GPL-2.0-only": {"xnu/patches/0158-*"}}	# only the CS35L41 OTP maps (user 2026-11-16, THIRD_PARTY row 22)
 # forbidden tracked material (AGENTS.md rule 4): firmware / Apple payloads / secrets, by basename; ALLOW_TRACKED_BINARY is the exception list (empty)
 FORBIDDEN_NAMES = ["*.img", "*.bin", "*.ipsw", "*.dmg", "*.im4p", "*.im4m", "*.img4", "*.ota", "*.mbn", "*.pem", "*.key", "*.p12",
                    "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", ".env", ".env.*", "*.env", "dyld_shared_cache*", "kernelcache*"]
@@ -62,7 +63,7 @@ def read_map(root, out):
             out.append(Finding(MAP, n, l, f"{RULE} map-syntax: want glob<TAB>SPDX<TAB>origin"))
             continue
         for i in sorted(ids(c[1])):
-            if i not in ALLOWED:
+            if i not in ALLOWED and c[0].strip() not in ALLOWED_AT.get(i, ()):
                 out.append(Finding(MAP, n, l, f"{RULE} map-id: {i} is not in the allowlist {sorted(ALLOWED)}"))
             elif not list((Path(root) / "LICENSES").glob(f"*{i}*.txt")):
                 out.append(Finding(MAP, n, l, f"{RULE} map-text: no LICENSES/*{i}*.txt for {i}"))
