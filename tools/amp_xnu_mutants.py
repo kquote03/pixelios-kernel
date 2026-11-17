@@ -6,6 +6,7 @@ import pathlib, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PATCH = ROOT / "xnu/patches/0158-sweet-amp-init.patch"
+PATCH_A9 = ROOT / "xnu/patches/0166-aoc-audio.patch"	# patch 0166 (A9b) extends sweet_amp.h: its hunk is applied on top
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
 MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 m13) + the round-2 fixes
@@ -35,6 +36,14 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("second lock word dropped", "\t\tlk = (amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_LOCK2) == AMP_OK) && lk;\n", ""),
     ("a failed lock does not fail the amp", "return e == AMP_OK && unlocked && lk && nbad == 0u", "return e == AMP_OK && unlocked && nbad == 0u"),
     ("unlock without its second word", "\t\tif (e == AMP_OK)\n\t\t\te = amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_UNLOCK2);\n", ""),
+    # patch 0166 A9b (new stop / restore paths)
+    # dropping only the by-name PWR_CTRL1 refusal is equivalent (no row names 0x2014: _Static_assert + reg == t->reg), so it is paired with the row check
+    ("A9: PWR_CTRL1 allowed while armed (and row register unchecked)", "if (!amp_a9.on || amp_a9.idx >= AMP_A9_N || reg == AMP_REG_PWR_CTRL1)\n\t\treturn 0;\n\tt = &amp_a9_tab[amp_a9.idx];\n\treturn reg == t->reg && ", "if (!amp_a9.on || amp_a9.idx >= AMP_A9_N)\n\t\treturn 0;\n\tt = &amp_a9_tab[amp_a9.idx];\n\treturn "),
+    ("A9: row register not checked", "\treturn reg == t->reg && (val & t->mask)", "\treturn (val & t->mask)"),
+    ("A9: bits outside the mask not checked", " && (val & ~t->mask) == (amp_a9.old & ~t->mask);", ";"),
+    ("A9: GLOBAL_EN before the config not checked", "((d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))", "(d->st1 & AMP_ERR_BITS)"),
+    ("A9: AOC close skipped", "\tamp_a9_cb.close(amp_a9_cb.ctx);", "\tif (0) amp_a9_cb.close(amp_a9_cb.ctx);"),
+    ("A9: PLL poll does not stop at the lock", "d->polls < AMP_A9_PLL_POLLS && !d->locked", "d->polls < AMP_A9_PLL_POLLS"),
 ]
 
 
@@ -53,6 +62,29 @@ def header(name: str = "sweet_amp.h") -> str:
     return "\n".join(out) + "\n"
 
 
+def header_a9() -> str:
+    """The 0158 header with the sweet_amp.h hunk of patch 0166 applied on top (as shim/build.sh does)."""
+    diff, on = [], False
+    for ln in PATCH_A9.read_text().splitlines(keepends=True):
+        if ln.rstrip("\n") == "diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h":
+            on = True
+        elif on and ln.startswith("diff --git"):
+            break
+        if on:
+            diff.append(ln)
+    if not diff:
+        raise SystemExit("RESULT: FAIL no sweet_amp.h hunk in " + PATCH_A9.name)
+    with tempfile.TemporaryDirectory() as td:
+        d = pathlib.Path(td)
+        (d / "bsd/dev").mkdir(parents=True)
+        (d / "bsd/dev/sweet_amp.h").write_text(header())
+        (d / "p.diff").write_text("".join(diff))
+        c = subprocess.run(["patch", "-s", "-p1", "--no-backup-if-mismatch", "-i", "p.diff"], cwd=d, capture_output=True, text=True)
+        if c.returncode:
+            raise SystemExit("RESULT: FAIL 0166 does not apply to sweet_amp.h: " + c.stdout + c.stderr)
+        return (d / "bsd/dev/sweet_amp.h").read_text()
+
+
 def run(hdr: str, d: pathlib.Path) -> bool:
     (d / "sweet_amp.h").write_text(hdr)
     (d / "sweet_amp_otp.h").write_text(header("sweet_amp_otp.h"))
@@ -63,7 +95,7 @@ def run(hdr: str, d: pathlib.Path) -> bool:
 
 
 def main() -> int:
-    good = header()
+    good = header_a9()
     with tempfile.TemporaryDirectory() as td:
         d = pathlib.Path(td)
         if not run(good, d):

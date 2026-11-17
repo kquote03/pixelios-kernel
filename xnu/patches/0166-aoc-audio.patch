@@ -1,0 +1,1071 @@
+SWEET AUDIO (patch 0166, plan 2026-11-14 oneshot-2 step A9), boot-arg sweetaoc=4 together with sweetamp=1. Runs the A8 start of patch 0165 unchanged;
+after "online" (sweet_aoc_start.c swau_run): maps the IPC window again and calls the amp run of patch 0158 (sweet_amp.c sweet_amp_audio_run, late, with
+the touch thread up: gpp23 DAT race documented there) with two callbacks. Inside it, between the init of both amps and the restore (sweet_amp.h
+amp_a9_part): A9b the TDM0 config of stock cs35l41 set_pdata / set_dai_fmt / set_sysclk / hw_params (23 cited rows, each a (register, mask, field)
+merge allowed only while armed against the word just read; PWR_CTRL1 0x2014 / GLOBAL_EN read only, refused by name, never written), then A9a the AOC
+open (sweet_audio.h: audio_output_control queue I/O as aoc_ipc_core.c, doorbell AOC mailbox INTGR0, commands GET_DSP_STATE 233 and BIND2 271
+src 0 -> SINK_SPEAKER bind 1), the PLL lock read (IRQ1_STATUS3 PLL_LOCK, <= 100 x 1 ms per amp), the AOC close (BIND2 bind 0 whenever a bind 1 may
+have been sent), then the 0158 restore (both resets low, every word back). A9c: sweet_cs_dsp.h parses the HALO .wmfw / .bin as Linux v6.18 cs_dsp
+(host test on the stock files); NOT loaded, nothing included by the kernel. Pass line "SWEET AUDIO: tdm0 up, amp pll locked l,r, dsp not loaded".
+Also: the A8 line "ssmt ... restored 1" now reads "written-back 0 kept 1" (the bypass was never written back once the AOC started).
+Host tests: shim/aoc_audio_host_test.c (fake AOC queue peer + parser), shim/amp_xnu_host_test.c (+ A9 register / PLL model). BUILT, UNRUN.
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+index 3cf6a5f..585c01d 100644
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -143,4 +143,42 @@ sweet_amp_init(void)
+ 	printf("SWEET AMP: init run (sweetamp=1), timebase %llu Hz\n", sa_freq);
+ 	printf("SWEET AMP: verdict %s\n", amp_init_run() == 0 ? "PASS" : "FAIL (see the AMP lines)");	/* review F1: the return value */
+ }
++/* patch 0166 (plan A9b, sweetaoc=4): the same identify + init + restore run, late, from the AOC audio step, with the A9 TDM config, the AOC open /
++ * close callbacks and the PLL lock read between the init and the restore (sweet_amp.h amp_a9_part). Needs the windows of the sweetamp=1 run above.
++ * Runs while the touch thread is up: gpp23 DAT is shared with the touch chip select (a GPIO, toggled by tg_pin_put of patch 0088 with a
++ * read-modify-write). A lost update either leaves the R reset low (the R identify then fails: no write) or re-drives the touch CS for one transfer
++ * (the next transfer drives it again); the restore compares only the amp bits. out[]: 0 run rc (0 = pass), 1 a9 ran, 2 AOC opened, 3/4 cfg L/R,
++ * 5/6 PLL locked L/R, 7 bits: 1 L error, 2 R error, 4 L GLOBAL_EN, 8 R GLOBAL_EN, 16 L PLL_UNLOCK, 32 R PLL_UNLOCK. */
++int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint32_t out[8]);
++int
++sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint32_t out[8])
++{
++	unsigned i;
++	int rc;
++
++	for (i = 0; i < 8u; i++) {
++		out[i] = 0;
++	}
++	for (i = 0; i < SA_NWIN; i++) {
++		if (sa_win[i].va == NULL) {
++			printf("SWEET AMP: a9 refused: the sweetamp=1 windows are not mapped (boot-arg sweetamp=1 needed), not touched\n");
++			return -1;
++		}
++	}
++	printf("SWEET AMP: a9 run (sweetaoc=4): identify, init, TDM config, AOC open, PLL lock, AOC close, restore\n");
++	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx };
++	rc = amp_init_run();
++	amp_a9_cb = (struct amp_a9_cb){ 0 };
++	out[0] = (uint32_t)rc;
++	out[1] = (uint32_t)amp_a9_res.ran;
++	out[2] = (uint32_t)amp_a9_res.opened;
++	for (i = 0; i < 2u; i++) {
++		out[3 + i] = (uint32_t)amp_a9_res.a[i].cfg;
++		out[5 + i] = (uint32_t)amp_a9_res.a[i].locked;
++		out[7] |= (amp_a9_res.a[i].err ? 1u : 0u) << i | (amp_a9_res.a[i].gen ? 4u : 0u) << i | (amp_a9_res.a[i].unlock ? 16u : 0u) << i;
++	}
++	printf("SWEET AMP: a9 verdict run %s\n", rc == 0 ? "PASS" : "FAIL (see the AMP lines)");
++	return rc;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+index 20839eb..72116a1 100644
+--- a/bsd/dev/sweet_amp.h
++++ b/bsd/dev/sweet_amp.h
+@@ -196,6 +196,71 @@ static inline const char *peri_gate_name(enum peri_gate g)
+ 	X(AMP_REG_TEST_KEY, 0x5555u) X(AMP_REG_TEST_KEY, 0xAAAAu) X(0x4100u, 0u) X(0x4310u, 0u) X(0x4400u, 0u) X(0x381Cu, 0x51u) X(0x2BC20E0u, 0u) \
+ 	X(0x2BC2020u, 0u) X(AMP_REG_TEST_KEY, 0xCCCCu) X(AMP_REG_TEST_KEY, 0x3333u) X(AMP_REG_CCM_CORE, 0u)
+ 
++/* ---- A9b (patch 0166, sweetaoc=4 with sweetamp=1): what stock does between probe and "ready to enable" on the TDM0 path ----
++ * Values from the stock DT (ref dt/base/spi@10D60000/cs35l41@0, @1: boost-peak-milliamp 3500, boost-ind-nanohenry 1000, boost-cap-microfarad 30,
++ * asp-sdout-hiz 3, hw-noise-gate-select 0x3f; sound-aoc/dai_link/be_tdm0_rx daifmt "dsp_a", no clock-provider property = codec consumer, NB_NF;
++ * sound-aoc/clks/sys@cs35l41_l/_r: src BCLK, id 0, srcid 0, in_mul 1) and the card defaults for TDM_0_RX (aoc_alsa_card.c:238-246: S16_LE, 2 ch,
++ * 48000 Hz, 4 slots of S32_LE) -> bclk = 48000 * 32 * 4 = 6144000 (i2s_hw_params :611). Each row is one stock regmap_update_bits (reg, mask, field)
++ * or regmap_write (mask ~0) of AMP cs35l41.c (cs35l41.h for the masks); a row writes only if its field differs (regmap_update_bits), the written word
++ * keeps every bit outside the mask (checked by amp_a9_ok against the word read just before).
++ *   set_pdata (component probe :3242 -> :3036-3075, boost_config :2917-3013, tables cs35l41.c:189-204 [k1/k2 row lbst 0, col cbst 1; slope row 0], DT parse :3520-3547):
++ *     BSTCVRT_COEFF 0x3810 K1 0xFF := 0x32, K2 0xFF00 := 0x49; BSTCVRT_SLOPE_LBST 0x3814 SLOPE 0xFF00 := 0x75, LBST_VAL 0x3 := 0 (1000 nH);
++ *     BSTCVRT_PEAK_CUR 0x3808 IPK 0x7F := (3500 - 1600) / 50 + 0x10 = 0x36; SP_HIZ_CTRL 0x480C DOUT_HIZ 0x3 := 3; NG_CFG 0x6808 HW_NG_SEL 0x3F00 := 0x3F.
++ *   set_dai_fmt (:2594-2680; DSP_A asp_fmt 0, CBC_CFC clock_mode 0, NB_NF): SP_FORMAT 0x4808 ASP_FMT 0x700 := 0, SCLK_MSTR 0x10 := 0,
++ *     LRCLK_MSTR 0x1 := 0, LRCLK_INV 0x4 := 0, SCLK_INV 0x40 := 0.
++ *   card i2s_hw_params -> set_sys_clk(codec, 6144000) (aoc_alsa_card.c:463-500, 626-633): dai_set_sysclk (:2880-2914, fs_mon row 6144000 = 16 / 24 :186,
++ *     :145-186): TST_FS_MON0 0x2D10 := 16 | 24 << 12 = 0x18010; component_set_sysclk (:2816-2877, clk_id 0 = PLLSRC_SCLK, refclk 6144000 = 0x28
++ *     :72-143): PLL_CLK_CTRL 0x2C04 OPENLOOP 0x800 := 1, REFCLK_FREQ 0x7E0 := 0x28, PLL_CLK_EN 0x10 := 0, PLL_CLK_SEL 0x7 := 0, OPENLOOP := 0,
++ *     PLL_CLK_EN := 1. Before it IRQ1_STATUS3 0x10018 := PLL_LOCK 0x2 (the stock write-1-to-clear of :2040-2042) so the lock read is fresh.
++ *   pcm_hw_params (:2704-2774, 48000 -> fs_cfg 0x03 :2688-2702, S16_LE: width 16, wl 16): GLOBAL_CLK_CTRL 0x2C0C GLOBAL_FS 0x1F := 3,
++ *     SP_FORMAT ASP_WIDTH_RX 0xFF000000 := 16, SP_RX_WL 0x4840 ASP_RX_WL 0x3F := 16.
++ * Not written (stock DAPM power-up, outside A9): SP_ENABLES (ASPRX1), PWR_CTRL2/3, the pup patch, PWR_CTRL1 0x2014 / GLOBAL_EN. PWR_CTRL1 is READ
++ * (must read GLOBAL_EN = 0) and stays refused by amp_write_ok. Then, after the AOC open callback: IRQ1_STATUS3 PLL_LOCK 0x2 / PLL_UNLOCK 0x10
++ * (cs35l41.h:691-692) polled <= 100 x 1 ms, IRQ1_STATUS1 error bits must be 0 (H8). */
++#define AMP_A9_TAB(X) \
++	X(0x3810u, 0x000000FFu, 0x00000032u) X(0x3810u, 0x0000FF00u, 0x00004900u) X(0x3814u, 0x0000FF00u, 0x00007500u) X(0x3814u, 0x00000003u, 0u) \
++	X(0x3808u, 0x0000007Fu, 0x00000036u) X(0x480Cu, 0x00000003u, 0x00000003u) X(0x6808u, 0x00003F00u, 0x00003F00u) \
++	X(0x4808u, 0x00000700u, 0u) X(0x4808u, 0x00000010u, 0u) X(0x4808u, 0x00000001u, 0u) X(0x4808u, 0x00000004u, 0u) X(0x4808u, 0x00000040u, 0u) \
++	X(0x2D10u, 0xFFFFFFFFu, 0x00018010u) X(0x10018u, 0xFFFFFFFFu, 0x00000002u) \
++	X(0x2C04u, 0x00000800u, 0x00000800u) X(0x2C04u, 0x000007E0u, 0x00000500u) X(0x2C04u, 0x00000010u, 0u) X(0x2C04u, 0x00000007u, 0u) \
++	X(0x2C04u, 0x00000800u, 0u) X(0x2C04u, 0x00000010u, 0x00000010u) \
++	X(0x2C0Cu, 0x0000001Fu, 0x00000003u) X(0x4808u, 0xFF000000u, 0x10000000u) X(0x4840u, 0x0000003Fu, 0x00000010u)
++#define AMP_A9_N 23u
++#define AMP_REG_PLL_CTRL	0x2C04u
++#define AMP_PLL_LOCK		0x2u
++#define AMP_PLL_UNLOCK		0x10u
++#define AMP_GLOBAL_EN		0x1u
++#define AMP_A9_PLL_POLLS	100u
++#define AMP_A9_X_ASSERT(r, m, f) _Static_assert((r) != AMP_REG_PWR_CTRL1 && ((f) & ~(m)) == 0u, "A9 row: never PWR_CTRL1, field inside its mask");
++AMP_A9_TAB(AMP_A9_X_ASSERT)
++#undef AMP_A9_X_ASSERT
++struct amp_a9_row { uint32_t reg, mask, field; };
++static const struct amp_a9_row amp_a9_tab[AMP_A9_N] = {
++#define AMP_A9_X_ROW(r, m, f) { (r), (m), (f) },
++	AMP_A9_TAB(AMP_A9_X_ROW)
++#undef AMP_A9_X_ROW
++};
++/* the armed A9 row: amp_a9_write sets it for exactly one amp_write; old = the word read just before */
++static struct { int on; uint32_t idx, old; } amp_a9;
++
++/* an A9 write is allowed only while its row is armed: same register, the mask's bits = the field, every other bit = the word read before */
++static inline __attribute__((always_inline)) int amp_a9_ok(uint32_t reg, uint32_t val)
++{
++	const struct amp_a9_row *t;
++
++	if (!amp_a9.on || amp_a9.idx >= AMP_A9_N || reg == AMP_REG_PWR_CTRL1)
++		return 0;
++	t = &amp_a9_tab[amp_a9.idx];
++	return reg == t->reg && (val & t->mask) == t->field && (val & ~t->mask) == (amp_a9.old & ~t->mask);
++}
++
++/* registers the A9 part reads: the rows' registers (read before each write and read back), PWR_CTRL1 (read only) */
++static inline __attribute__((always_inline)) int amp_a9_read_ok(uint32_t reg)
++{
++	return reg == 0x3810u || reg == 0x3814u || reg == 0x3808u || reg == 0x480Cu || reg == 0x6808u || reg == 0x4808u || reg == 0x2D10u ||
++	       reg == 0x2C04u || reg == 0x2C0Cu || reg == 0x4840u || reg == AMP_REG_PWR_CTRL1;
++}
++
+ /* a (register, value) pair the init may write: the 12 of AMP_INIT_SEQ, the four OTP test-key words, a register an OTP map row names; never PWR_CTRL1 */
+ static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint32_t val)
+ {
+@@ -207,7 +272,7 @@ static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint
+ 	AMP_INIT_SEQ(AMP_W_OK)
+ #undef AMP_W_OK
+ 	ok |= reg == AMP_REG_TEST_KEY && (val == AMP_OTP_KEY_UNLOCK1 || val == AMP_OTP_KEY_UNLOCK2 || val == AMP_OTP_KEY_LOCK1 || val == AMP_OTP_KEY_LOCK2);
+-	return ok || amp_otp_reg_ok(reg);
++	return ok || amp_otp_reg_ok(reg) || amp_a9_ok(reg, val);	/* patch 0166: + the armed A9 row */
+ }
+ 
+ /* a register an armed read may name: the seven of the A1 / A7 reads, OTPID, OTP_MEM0..31, a register an OTP map row names */
+@@ -215,7 +280,7 @@ static inline __attribute__((always_inline)) int amp_read_ok(uint32_t reg)
+ {
+ 	return reg == AMP_REG_IRQ1_STATUS4 || reg == AMP_REG_IRQ1_STATUS3 || reg == AMP_REG_DEVID || reg == AMP_REG_REVID || reg == AMP_REG_IRQ1_STATUS1 ||
+ 	       reg == AMP_REG_IRQ1_MASK1 || reg == AMP_REG_CCM_CORE || reg == AMP_OTP_REG_OTPID ||
+-	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg);
++	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg) || amp_a9_read_ok(reg);
+ }
+ 
+ /* byte `pos` of the 10-byte write frame of (reg, val): the address with bit 31 clear, 2 pad bytes 0, the value, all big endian */
+@@ -1029,6 +1094,128 @@ static int bring_up(const struct amp_snap *s)
+ 	return AMP_OK;
+ }
+ 
++/* ---- A9b run (patch 0166): called by amp_init_run between the init of both amps and the restore, only when the AOC glue armed amp_a9_cb ---- */
++struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; };
++static struct amp_a9_cb amp_a9_cb;
++struct amp_a9_side { int cfg, locked, unlock, gen, err; unsigned writes, skipped, polls; uint32_t st1, st3, pwr1; };
++static struct amp_a9_res { int ran, opened; struct amp_a9_side a[2]; } amp_a9_res;
++
++/* one row: read, merge, write only if it changes (regmap_update_bits; a plain write row always writes), read back the field.
++ * IRQ1_STATUS3 (write-1-to-clear) is not compared after its write. */
++static int amp_a9_write(const struct amp_snap *s, int cs, uint32_t idx, struct amp_a9_side *d)
++{
++	const struct amp_a9_row *t = &amp_a9_tab[idx];
++	uint32_t old = 0, v, rb = 0;
++	int e = amp_read(s, cs, t->reg, &old);
++
++	if (e != AMP_OK)
++		return e;
++	v = (old & ~t->mask) | t->field;
++	if (t->mask != 0xFFFFFFFFu && v == old) {
++		d->skipped++;
++		return AMP_OK;
++	}
++	amp_a9.on = 1;
++	amp_a9.idx = idx;
++	amp_a9.old = old;
++	e = amp_write(s, cs, t->reg, v);
++	amp_a9.on = 0;
++	amp_a9.idx = 0;
++	amp_a9.old = 0;
++	d->writes++;
++	if (e == AMP_OK && t->reg != AMP_REG_IRQ1_STATUS3) {
++		e = amp_read(s, cs, t->reg, &rb);
++		if (e == AMP_OK && (rb & t->mask) != t->field)
++			e = AMP_ERROR;
++	}
++	return e;
++}
++
++static void amp_a9_line(const char *name, const char *what, const struct amp_a9_side *d)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, name);
++
++	p = put_txt(line, sizeof(line), p, what);
++	p = put_txt(line, sizeof(line), p, " w=");
++	p = put_dec(line, sizeof(line), p, d->writes);
++	p = put_txt(line, sizeof(line), p, " skip=");
++	p = put_dec(line, sizeof(line), p, d->skipped);
++	p = put_txt(line, sizeof(line), p, " pwr1=");
++	p = put_hex(line, sizeof(line), p, d->pwr1, 8);
++	p = put_txt(line, sizeof(line), p, " st1=");
++	p = put_hex(line, sizeof(line), p, d->st1, 8);
++	p = put_txt(line, sizeof(line), p, " st3=");
++	p = put_hex(line, sizeof(line), p, d->st3, 8);
++	p = put_txt(line, sizeof(line), p, " polls=");
++	p = put_dec(line, sizeof(line), p, d->polls);
++	emit("AMP", line, p);
++}
++
++/* the rows in order; before: IRQ1_STATUS1 error bits 0 and GLOBAL_EN 0; after: GLOBAL_EN still 0 */
++static int amp_a9_cfg(const struct amp_snap *s, int cs, const char *name, struct amp_a9_side *d)
++{
++	int e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1);
++
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	if (e == AMP_OK && ((d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))) {
++		say(name, " a9: error bit or GLOBAL_EN set before the TDM config: no write (H8)");
++		e = AMP_ERROR;
++	}
++	for (uint32_t i = 0; e == AMP_OK && i < AMP_A9_N; i++)
++		e = amp_a9_write(s, cs, i, d);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	if (e == AMP_OK && (d->pwr1 & AMP_GLOBAL_EN))
++		e = AMP_ERROR;
++	d->cfg = e == AMP_OK;
++	amp_a9_line(name, d->cfg ? " a9 cfg ok" : " a9 cfg FAILED", d);
++	return e;
++}
++
++/* after the AOC open: PLL_LOCK in IRQ1_STATUS3, <= AMP_A9_PLL_POLLS x 1 ms; then IRQ1_STATUS1 and PWR_CTRL1 (reads only) */
++static void amp_a9_pll(const struct amp_snap *s, int cs, const char *name, struct amp_a9_side *d)
++{
++	int e = AMP_OK;
++
++	for (d->polls = 0; e == AMP_OK && d->polls < AMP_A9_PLL_POLLS && !d->locked; d->polls++) {
++		if (wait_ms(1u))
++			e = AMP_TIMEOUT;
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_REG_IRQ1_STATUS3, &d->st3);
++		d->locked = e == AMP_OK && (d->st3 & AMP_PLL_LOCK);
++	}
++	d->unlock = (d->st3 & AMP_PLL_UNLOCK) != 0u;
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	d->err = e != AMP_OK || (d->st1 & AMP_ERR_BITS);
++	d->gen = e != AMP_OK || (d->pwr1 & AMP_GLOBAL_EN);
++	amp_a9_line(name, d->locked ? " a9 pll locked" : " a9 pll NOT locked", d);
++	if (d->err)
++		say(name, " !!! a9: amp error bit or read failure after the TDM open (H8)");
++}
++
++static void amp_a9_part(const struct amp_snap *s, int il, int ir)
++{
++	amp_a9_res = (struct amp_a9_res){ 0 };
++	amp_a9_res.ran = 1;
++	if (il != AMP_OK || ir != AMP_OK) {
++		say("a9: ", "init not ok on both amps: no TDM config, no AOC open");
++		return;
++	}
++	if (amp_a9_cfg(s, 0, "L", &amp_a9_res.a[0]) != AMP_OK || amp_a9_cfg(s, 1, "R", &amp_a9_res.a[1]) != AMP_OK)
++		return;
++	amp_a9_res.opened = amp_a9_cb.open(amp_a9_cb.ctx);
++	if (amp_a9_res.opened) {
++		amp_a9_pll(s, 0, "L", &amp_a9_res.a[0]);
++		amp_a9_pll(s, 1, "R", &amp_a9_res.a[1]);
++	}
++	amp_a9_cb.close(amp_a9_cb.ctx);		/* undo the AOC bind on every path after an open attempt (the glue knows if it was sent) */
++}
++
+ static int amp_init_run(void)
+ {
+ 	struct amp_snap s = { 0 };
+@@ -1106,6 +1293,8 @@ static int amp_init_run(void)
+ 		if (il == AMP_OK && AMP_ID_OK(er, r))	/* review F4: no R write after a failed L init */
+ 			ir = amp_init(&s, 1, "R");
+ 	}
++	if (amp_a9_cb.on && e == AMP_OK)
++		amp_a9_part(&s, il, ir);	/* patch 0166 (sweetaoc=4): TDM config, AOC open, PLL lock, AOC close; then the same restore */
+ 
+ 	/* ALWAYS put everything back (a write was attempted on every path that reaches here) */
+ 	restored = restore(&s, stage);
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index b947b20..b9d740b 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -24,6 +24,7 @@ extern volatile uint32_t sweet_usblog_sent;             /* sweet_usb.c (this pat
+ void sweet_aoc_init(void);
+ extern void sweet_aoc_load_start(void);              /* bsd/dev/sweet_aoc_load.c (patch 0164), sweetaoc=2 */
+ extern void sweet_aoc_load_start3(void);             /* same file (patch 0165), sweetaoc=3: load, then AOC start */
++extern int sweet_aoc_audio_mode;                 /* sweet_aoc_start.c (patch 0166), 4 = sweetaoc=4: A8 start, then the A9 audio path open */
+ 
+ #define SWA_WAIT_USB_MS   300000u
+ #define SWA_SETTLE_MS     500u
+@@ -126,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 4) {
++		sweet_aoc_audio_mode = 4;   /* patch 0166, step A9: the A8 sequence, then audio_output_control BIND2 + the amp TDM config (needs sweetamp=1) */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 3) {
+ 		sweet_aoc_load_start3();    /* patch 0165, step A8: the A6 load, then param block, SSMT, hwmgr START, ready, services */
+ 		return;
+@@ -135,7 +141,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index 234f634..b3c2020 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -25,6 +25,7 @@
+ 
+ #include "sweet_aoc_start.h"
+ #include "sweet_tipc.h"
++#include "sweet_audio.h"                 /* patch 0166 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);   /* osfmk/arm64/machine_routines.c:1574 */
+@@ -160,6 +161,95 @@ swas_tipc(__unused void *ctx, struct swas_tipc *t)
+ 	t->start_replied = tr.start_replied;
+ }
+ 
++/* ---- patch 0166 (plan A9, sweetaoc=4): after "online", the audio path open of sweet_audio.h, run from inside the amp run (sweet_amp.c
++ * sweet_amp_audio_run: amp identify + init + TDM config, then our open callback, the PLL lock read, our close callback, the amp restore).
++ * New writes of this file: the IPC window (the audio_output_control queue slots and counters, sweet_audio.h) and the AOC mailbox INTGR0 = 1 << irq
++ * (the doorbell; irq read from the service header, <= 15). ---- */
++int sweet_aoc_audio_mode;                       /* set by sweet_aoc.c for sweetaoc=4 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint32_t out[8]);   /* sweet_amp.c (patch 0166) */
++#endif
++_Static_assert(SWAU_IPC_LEN == SWAS_IPC_LEN, "one IPC window");
++
++static void
++swau_say(__unused void *ctx, const char *what)
++{
++	printf("SWEET AUDIO: %s\n", what);
++	swas_sleep_ms(NULL, SWAS_SETTLE_MS);
++}
++
++static struct swau_res swau_r;
++static struct swas_res *swau_as;
++static int swau_open_rc = -1, swau_close_rc = -1;
++
++static int
++swau_doorbell(__unused void *ctx, uint32_t irq)
++{
++	return irq <= 15u && swas_w32(NULL, SWAS_W_MBOX, 0x20u, 1u << irq);    /* MB_INTGR0 mailbox-wc.c:24, :91-98 */
++}
++
++static void
++swau_x_line(const struct swau_x *x)
++{
++	printf("SWEET AUDIO: cmd id %u cntr %u len %u -> rc %d (%s) drained %u waited %u ms reply len %u type %u id %u reply %d byte8 %u aoc_err %#x\n",
++	    x->id, x->cntr, x->sent_len, x->rc, x->rc >= 0 && x->rc < SWAU_NSTOP ? swau_stop_name[x->rc] : "?", x->drained, x->waited_ms,
++	    x->reply_len, x->reply_type, x->reply_id, x->reply, x->payload0, x->aoc_err);
++}
++
++static int
++swau_cb_open(__unused void *ctx)
++{
++	static const struct swau_bus ab = { swas_ir32, swas_iw32, swas_isync, swau_doorbell, swas_sleep_ms, NULL, NULL };
++	struct swau_bus b = ab;
++
++	b.say = swau_say;
++	swau_open_rc = swau_open(&b, &swau_r, swau_as->services_offset, swau_as->service_size, swau_as->ctl_index);
++	printf("SWEET AUDIO: service %u hdr %#x flags %#x irq %u up off %#x size %u slots %u tx %u rx %u down off %#x size %u slots %u tx %u rx %u\n",
++	    swau_as->ctl_index, swau_r.s.hdr, swau_r.s.flags, swau_r.s.irq, swau_r.s.r[0].offset, swau_r.s.r[0].size, swau_r.s.r[0].slots,
++	    swau_r.s.r[0].tx, swau_r.s.r[0].rx, swau_r.s.r[1].offset, swau_r.s.r[1].size, swau_r.s.r[1].slots, swau_r.s.r[1].tx, swau_r.s.r[1].rx);
++	return swau_open_rc == SWAU_OK;
++}
++
++static void
++swau_cb_close(__unused void *ctx)
++{
++	static const struct swau_bus ab = { swas_ir32, swas_iw32, swas_isync, swau_doorbell, swas_sleep_ms, NULL, NULL };
++	struct swau_bus b = ab;
++
++	b.say = swau_say;
++	swau_close_rc = swau_close(&b, &swau_r);
++}
++
++static void
++swau_run(struct swas_res *r, uint32_t image_size)
++{
++	uint32_t out[8] = { 0 }, i;
++	int arc = -1;
++
++	swau_as = r;
++	swau_open_rc = swau_close_rc = -1;
++	if (!swas_imap(NULL, SWAS_CARVE_PA + image_size, SWAS_IPC_LEN)) {
++		printf("SWEET AUDIO: stop ipc-map-failed, nothing written\n");
++		return;
++	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, NULL, out);
++#endif
++	swas_iunmap(NULL);
++	for (i = 0; i < swau_r.nx && i < SWAU_NX; i++) {
++		swau_x_line(&swau_r.x[i]);
++	}
++	printf("SWEET AUDIO: open rc %d (%s) dsp mode %u bound %u unbound %u close rc %d; amp rc %d a9 %u opened %u cfg %u/%u pll %u/%u flags %#x\n",
++	    swau_open_rc, swau_open_rc >= 0 && swau_open_rc < SWAU_NSTOP ? swau_stop_name[swau_open_rc] : "not-run", swau_r.dsp_mode,
++	    swau_r.bound, swau_r.unbound, swau_close_rc, arc, out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++	if (arc == 0 && out[2] && swau_open_rc == SWAU_OK && swau_close_rc == SWAU_OK && out[3] && out[4] && !(out[7] & 0xFu)) {
++		printf("SWEET AUDIO: tdm0 up, amp pll %s l,r, dsp not loaded%s\n", out[5] && out[6] ? "locked" : "NOT locked",
++		    out[5] && out[6] ? "" : " (lock bits l/r in the AMP lines; GLOBAL_EN stays 0)");
++		return;
++	}
++	printf("SWEET AUDIO: stop (see the AUDIO / AMP lines), GLOBAL_EN never written\n");
++}
++
+ void
+ sweet_aoc_start_after_load(uint32_t image_size)
+ {
+@@ -176,8 +266,8 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	swas_iunmap(NULL);
+ 	printf("SWEET AOC: chip prod %#x rev %#x type %#x; pre aoc_req %u/%u sysmmu ctrl %#x cfg %#x st %#x\n", r.chip_prod,
+ 	    r.chip_rev, r.chip_type, r.req, r.req_st, r.mmu_ctrl, r.mmu_cfg, r.mmu_st);
+-	printf("SWEET AOC: param words %u bad %u; ssmt bypass found %u/64 wrote %u restored %u\n", SWAS_PARAM_WORDS, r.param_bad,
+-	    r.ssmt_bypass_found, r.ssmt_wrote, r.ssmt_restored);
++	printf("SWEET AOC: param words %u bad %u; ssmt bypass found %u/64 wrote %u written-back %u kept %u\n", SWAS_PARAM_WORDS,
++	    r.param_bad, r.ssmt_bypass_found, r.ssmt_wrote, r.ssmt_restored, r.ssmt_kept);
+ 	printf("SWEET AOC: hwmgr rc %d (%s) replies %u state %u/%u/%u err %u/%u/%u start sent %u replied %u\n", r.t.rc,
+ 	    r.t.why ? r.t.why : "-", r.t.n, r.t.st[0], r.t.st[1], r.t.st[2], r.t.err[0], r.t.err[1], r.t.err[2], r.t.start_sent,
+ 	    r.t.start_replied);
+@@ -199,6 +289,9 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
++		if (sweet_aoc_audio_mode == 4) {
++			swau_run(&r, image_size);       /* patch 0166, step A9 */
++		}
+ 		return;
+ 	}
+ 	printf("SWEET AOC: start stop %s (code %d, bad index %d why %u), no retry\n",
+diff --git a/bsd/dev/sweet_aoc_start.h b/bsd/dev/sweet_aoc_start.h
+index a926c16..1a41800 100644
+--- a/bsd/dev/sweet_aoc_start.h
++++ b/bsd/dev/sweet_aoc_start.h
+@@ -115,7 +115,7 @@ struct swas_res {
+ 	int stage;
+ 	uint32_t image_size, chip0, chip10, chip_rev, chip_type, chip_prod, rand;
+ 	uint32_t req, req_st, mmu_ctrl, mmu_cfg, mmu_st;
+-	uint32_t ssmt_found[2 * SWAS_NSSMT], ssmt_bypass_found, ssmt_wrote, ssmt_restored;
++	uint32_t ssmt_found[2 * SWAS_NSSMT], ssmt_bypass_found, ssmt_wrote, ssmt_restored, ssmt_kept;   /* patch 0166: kept = the AOC may run, the bypass stays (was counted as "restored") */
+ 	uint32_t param[SWAS_PARAM_WORDS], param_bad;
+ 	struct swas_tipc t;
+ 	uint32_t magic, waited_ms, dumped;
+@@ -182,7 +182,7 @@ swas_ssmt_restore(const struct swas_bus *b, struct swas_res *r)
+ {
+ 	uint32_t k;
+ 
+-	if (!r->ssmt_wrote || r->ssmt_restored) {
++	if (!r->ssmt_wrote || r->ssmt_restored || r->ssmt_kept) {
+ 		return;
+ 	}
+ 	b->say(b->ctx, "ssmt: writing back the values found (AOC not started)");
+@@ -378,7 +378,7 @@ swas_run(const struct swas_bus *b, struct swas_res *r, uint32_t image_size)
+ 	r->t = (struct swas_tipc){ 0 };
+ 	b->tipc(b->ctx, &r->t);
+ 	if (r->t.start_sent && !(r->t.start_replied && r->t.n >= 2u && r->t.err[1] != 0u)) {
+-		r->ssmt_restored = 1;           /* the AOC may run: its routing stays (stock never undoes it) */
++		r->ssmt_kept = 1;               /* the AOC may run: its routing stays (stock never undoes it); NOT written back */
+ 	}
+ 	for (i = 0; i < r->t.n && i < 3u; i++) {
+ 		if (r->t.st[i] > 2u) {
+diff --git a/bsd/dev/sweet_audio.h b/bsd/dev/sweet_audio.h
+new file mode 100644
+index 0000000..3659292
+--- /dev/null
++++ b/bsd/dev/sweet_audio.h
+@@ -0,0 +1,381 @@
++/*
++ * AOC audio control (patch 0166, plan 2026-11-14 oneshot-2 step A9a), boot-arg sweetaoc=4 (= the A8 start of patch 0165, then this).
++ * Pure logic, no kernel headers: the host test shim/aoc_audio_host_test.c drives it with a fake AOC queue peer.
++ * Sources (docs/research/50 s.6.6 / s.7; aoc = google-modules/aoc ac69293, ipc = aoc-ipc 1fe9b9c, alsa = aoc/alsa):
++ *   service header (ipc aoc_ipc_core_internal.h:76-98): name[32], u32 flags @32, regions[2] @36, each 28 bytes
++ *     {offset, size, slots, tx, rx, wp, rp}; region 0 = AOC_UP (FW -> AP), 1 = AOC_DOWN (AP -> FW) (aoc_ipc_core.h:36-44);
++ *     type = (flags >> 16) & 7 (0 queue), irq index = (flags >> 19) & 0x1F (aoc_ipc_core.c:221-246). A8 measured
++ *     audio_output_control = service 6, flags 0 (queue, irq 0).
++ *   queue write (aoc_service_write_message aoc_ipc_core.c:654-690, _aoc_queue_write_buffer :102-113): slot = offset +
++ *     size * (tx % slots), {u16 length, u16 0, u16 0, u16 0} then the payload; barrier; tx += 1, wp = (wp + 1) % size
++ *     (_region_advance_tx :53-65); room = slots - (tx - rx) (:400-422); payload <= size - 8 (aoc_service_message_size :287-306).
++ *     Then the doorbell: AOC mailbox INTGR0 = 1 << irq (signal_aoc aoc_service_core.c:192-195, 560-563; wc_mbox_int_generate
++ *     mailbox-wc.c:91-98).
++ *   queue read (aoc_service_read_message :613-652): slot at offset + size * (rx % slots), length from its header, then
++ *     rx += 1, rp = (rp + 1) % size; if the queue was full before the read, ring the doorbell (aoc_service_read aoc_service_core.c:495-511).
++ *   one command (aoc_audio_control alsa:aoc_alsa_hw.c:196-311): drain stale replies, write, poll the reply <= 500 ms
++ *     (WAITING_TIME_MS); a 4-byte reply is an error code (:277-282). Stock then only logs; here every exchange stops on: timeout,
++ *     a 4-byte error, a reply shorter than the 8-byte header, a reply whose type / id differ from the command (unknown), reply != 0
++ *     (rejected). Stock would trigger the AOC watchdog on a timeout (:268-276): not done.
++ *   header (aoc-interface-gs101.h:330-334, 419-423, AocCmdHdrSet :2499-2511): {u8 type = DATA_TYPE_CMD 0, u8 cntr (running,
++ *     first 0), u16 len = total size, u16 id, i16 reply}, packed little endian.
++ * Commands (exactly docs/research/50 s.7.3 rows 0 and 1, the path open of aoc_audio_path_open alsa:aoc_alsa_hw.c:1322-1343,
++ * 1635-1660; and its undo, row 5):
++ *   CMD_AUDIO_OUTPUT_GET_DSP_STATE 233 (:154, struct :1199-1202): + u8 mode = 0, 9 bytes (read only);
++ *   CMD_AUDIO_OUTPUT_BIND2 271 (:225, struct CMD_AUDIO_OUTPUT_BIND :894-899): + u8 src = 0 (ep_id_to_source(0)), u8 dst =
++ *     SINK_SPEAKER 0 (:2083, PORT_TDM_0_RX -> SINK_SPEAKER alsa:aoc_alsa_hw.c:33-48), u8 bind = 1; 11 bytes;
++ *   the same with bind = 0 on every path after a BIND2 bind = 1 was written (restore).
++ * No EP_SETUP, no SOURCE, no PCM data, no gain, no SET_PARAMETER. Every wait bounded.
++ */
++#ifndef SWEET_AUDIO_H
++#define SWEET_AUDIO_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define SWAU_IPC_LEN        0x00400000u     /* = SWAS_IPC_LEN of sweet_aoc_start.h (patch 0165) */
++#define SWAU_HDR            8u              /* struct aoc_ipc_message_header */
++#define SWAU_MAX_SLOT       4096u           /* our bound on one slot (the stock reader allocates 1024 bytes, aoc_alsa_hw.c:203) */
++#define SWAU_MAX_MSG        64u             /* our reply buffer: the replies here are 9 / 11 bytes */
++#define SWAU_REPLY_MS       500u            /* WAITING_TIME_MS */
++#define SWAU_POLL_MS        1u
++#define SWAU_UP             0u
++#define SWAU_DOWN           1u
++
++#define SWAU_CMD_GET_DSP_STATE 233u
++#define SWAU_CMD_BIND2         271u
++#define SWAU_SINK_SPEAKER      0u
++#define SWAU_SRC_EP0           0u
++
++enum {
++	SWAU_OK = 0, SWAU_E_ARGS, SWAU_E_READ, SWAU_E_SVC, SWAU_E_FULL, SWAU_E_WRITE, SWAU_E_RING, SWAU_E_TIMEOUT, SWAU_E_AOCERR,
++	SWAU_E_SHORT, SWAU_E_UNKNOWN, SWAU_E_REJECTED, SWAU_E_CORRUPT, SWAU_NSTOP
++};
++static const char *const swau_stop_name[SWAU_NSTOP] = { "ok", "bad-args", "read-failed", "bad-service-header", "queue-full",
++	"write-failed", "doorbell-failed", "reply-timeout", "aoc-error-code", "short-reply", "unknown-reply", "rejected",
++	"queue-counters-corrupt" };
++
++struct swau_bus {
++	int (*ir32)(void *ctx, uint32_t off, uint32_t *v);      /* IPC window word (offset from ipc_base); 1 ok */
++	int (*iw32)(void *ctx, uint32_t off, uint32_t v);
++	void (*isync)(void *ctx);                               /* write barrier */
++	int (*doorbell)(void *ctx, uint32_t irq);               /* AOC mailbox INTGR0 := 1 << irq; 1 ok */
++	void (*sleep_ms)(void *ctx, uint32_t ms);
++	void (*say)(void *ctx, const char *what);
++	void *ctx;
++};
++
++struct swau_region { uint32_t base, offset, size, slots, tx, rx, wp, rp; };
++
++struct swau_svc {
++	uint32_t hdr;                   /* ipc offset of the service header */
++	uint32_t flags, irq;
++	struct swau_region r[2];
++};
++
++/* one exchange, for the log line of the glue */
++struct swau_x {
++	uint16_t id;
++	uint8_t cntr, sent_len;
++	uint32_t drained, waited_ms, reply_len, aoc_err;
++	int16_t reply;
++	uint8_t reply_type;
++	uint16_t reply_id;
++	uint8_t payload0;               /* first payload byte of the reply (GET_DSP_STATE: mode) */
++	uint8_t written;                /* the message may have reached the AOC (write started) */
++	int rc;
++};
++
++#define SWAU_NX 3
++struct swau_res {
++	struct swau_svc s;
++	struct swau_x x[SWAU_NX];
++	uint32_t nx, bound, unbound, dsp_mode;
++	uint8_t cntr;
++	int rc;
++};
++
++static int
++swau_region_read(const struct swau_bus *b, struct swau_region *g)
++{
++	return b->ir32(b->ctx, g->base + 0u, &g->offset) && b->ir32(b->ctx, g->base + 4u, &g->size) &&
++	       b->ir32(b->ctx, g->base + 8u, &g->slots) && b->ir32(b->ctx, g->base + 12u, &g->tx) &&
++	       b->ir32(b->ctx, g->base + 16u, &g->rx) && b->ir32(b->ctx, g->base + 20u, &g->wp) && b->ir32(b->ctx, g->base + 24u, &g->rp);
++}
++
++/* the counters only (tx, rx, wp, rp) */
++static int
++swau_counters(const struct swau_bus *b, struct swau_region *g)
++{
++	return b->ir32(b->ctx, g->base + 12u, &g->tx) && b->ir32(b->ctx, g->base + 16u, &g->rx) &&
++	       b->ir32(b->ctx, g->base + 20u, &g->wp) && b->ir32(b->ctx, g->base + 24u, &g->rp);
++}
++
++/* the service header of service `idx` (A8 table): a queue, both regions inside the window, word aligned, sane sizes */
++static int
++swau_svc_open(const struct swau_bus *b, struct swau_svc *s, uint32_t services_offset, uint32_t service_size, uint32_t idx)
++{
++	uint32_t i, end;
++
++	*s = (struct swau_svc){ 0 };
++	if (service_size < 32u + 4u + 56u || services_offset >= SWAU_IPC_LEN || idx >= 200u) {
++		return SWAU_E_ARGS;
++	}
++	s->hdr = services_offset + idx * service_size;
++	if (s->hdr > SWAU_IPC_LEN - (32u + 4u + 56u) || (s->hdr & 3u)) {
++		return SWAU_E_SVC;
++	}
++	if (!b->ir32(b->ctx, s->hdr + 32u, &s->flags)) {
++		return SWAU_E_READ;
++	}
++	if (((s->flags >> 16) & 7u) != 0u) {
++		return SWAU_E_SVC;      /* not a queue */
++	}
++	s->irq = (s->flags >> 19) & 0x1Fu;
++	if (s->irq > 15u) {
++		return SWAU_E_SVC;      /* 16 AOC mailbox channels (gs101-aoc.dtsi:9-19) */
++	}
++	for (i = 0; i < 2u; i++) {
++		s->r[i].base = s->hdr + 36u + 28u * i;
++		if (!swau_region_read(b, &s->r[i])) {
++			return SWAU_E_READ;
++		}
++		if (s->r[i].slots == 0u || s->r[i].slots > 256u || s->r[i].size <= SWAU_HDR || s->r[i].size > SWAU_MAX_SLOT ||
++		    (s->r[i].size & 3u) || (s->r[i].offset & 3u) || s->r[i].offset >= SWAU_IPC_LEN) {
++			return SWAU_E_SVC;
++		}
++		end = s->r[i].offset + s->r[i].size * s->r[i].slots;
++		if (end > SWAU_IPC_LEN || end < s->r[i].offset) {
++			return SWAU_E_SVC;
++		}
++	}
++	return SWAU_OK;
++}
++
++/* messages waiting in region g (tx - rx as aoc_ipc_core.c _read_write_delta for the non-wrapped case); > slots = corrupt */
++static int
++swau_pending(const struct swau_region *g, uint32_t *n)
++{
++	*n = g->tx - g->rx;
++	return *n <= g->slots ? SWAU_OK : SWAU_E_CORRUPT;
++}
++
++static int
++swau_write(const struct swau_bus *b, struct swau_svc *s, const uint8_t *msg, uint32_t len)
++{
++	struct swau_region *g = &s->r[SWAU_DOWN];
++	uint32_t n, slot, i, w;
++
++	if (len == 0u || len > g->size - SWAU_HDR || len > SWAU_MAX_MSG) {
++		return SWAU_E_ARGS;
++	}
++	if (!swau_counters(b, g)) {
++		return SWAU_E_READ;
++	}
++	if (swau_pending(g, &n) != SWAU_OK) {
++		return SWAU_E_CORRUPT;
++	}
++	if (n >= g->slots) {
++		return SWAU_E_FULL;
++	}
++	slot = g->offset + g->size * (g->tx % g->slots);
++	if (!b->iw32(b->ctx, slot + 0u, len & 0xFFFFu) || !b->iw32(b->ctx, slot + 4u, 0u)) {
++		return SWAU_E_WRITE;
++	}
++	for (i = 0; i < len; i += 4u) {
++		w = 0;
++		for (n = 0; n < 4u && i + n < len; n++) {
++			w |= (uint32_t)msg[i + n] << (8u * n);
++		}
++		if (!b->iw32(b->ctx, slot + SWAU_HDR + i, w)) {
++			return SWAU_E_WRITE;
++		}
++	}
++	b->isync(b->ctx);
++	if (!b->iw32(b->ctx, g->base + 12u, g->tx + 1u) || !b->iw32(b->ctx, g->base + 20u, (g->wp + 1u) % g->size)) {
++		return SWAU_E_WRITE;
++	}
++	b->isync(b->ctx);
++	return b->doorbell(b->ctx, s->irq) ? SWAU_OK : SWAU_E_RING;
++}
++
++/* one message from AOC_UP: 1 = got one (len set), 0 = none, < 0 = -error */
++static int
++swau_read(const struct swau_bus *b, struct swau_svc *s, uint8_t *buf, uint32_t cap, uint32_t *len)
++{
++	struct swau_region *g = &s->r[SWAU_UP];
++	uint32_t n, slot, i, k, w = 0, h0 = 0;
++
++	if (!swau_counters(b, g)) {
++		return -SWAU_E_READ;
++	}
++	if (swau_pending(g, &n) != SWAU_OK) {
++		return -SWAU_E_CORRUPT;
++	}
++	if (n == 0u) {
++		return 0;
++	}
++	slot = g->offset + g->size * (g->rx % g->slots);
++	if (!b->ir32(b->ctx, slot, &h0)) {
++		return -SWAU_E_READ;
++	}
++	*len = h0 & 0xFFFFu;
++	if (*len > g->size - SWAU_HDR) {
++		return -SWAU_E_CORRUPT;
++	}
++	for (i = 0; i < *len && i < cap; i += 4u) {
++		if (!b->ir32(b->ctx, slot + SWAU_HDR + i, &w)) {
++			return -SWAU_E_READ;
++		}
++		for (k = 0; k < 4u && i + k < *len && i + k < cap; k++) {
++			buf[i + k] = (uint8_t)(w >> (8u * k));
++		}
++	}
++	if (!b->iw32(b->ctx, g->base + 16u, g->rx + 1u) || !b->iw32(b->ctx, g->base + 24u, (g->rp + 1u) % g->size)) {
++		return -SWAU_E_WRITE;
++	}
++	b->isync(b->ctx);
++	if (n == g->slots && !b->doorbell(b->ctx, s->irq)) {
++		return -SWAU_E_RING;            /* it was full: tell the AOC there is room (aoc_service_core.c:504-511) */
++	}
++	return 1;
++}
++
++static void
++swau_hdr(uint8_t *m, uint8_t cntr, uint16_t len, uint16_t id)
++{
++	m[0] = 0u;              /* DATA_TYPE_CMD */
++	m[1] = cntr;
++	m[2] = (uint8_t)len;
++	m[3] = (uint8_t)(len >> 8);
++	m[4] = (uint8_t)id;
++	m[5] = (uint8_t)(id >> 8);
++	m[6] = 0u;
++	m[7] = 0u;
++}
++
++/* one command, the stock exchange; x records it */
++static int
++swau_cmd(const struct swau_bus *b, struct swau_res *r, const uint8_t *m, uint32_t len)
++{
++	struct swau_x *x = &r->x[r->nx < SWAU_NX ? r->nx : SWAU_NX - 1u];
++	uint8_t rb[SWAU_MAX_MSG];
++	uint32_t ms, rl = 0, i;
++	int g;
++
++	if (r->nx < SWAU_NX) {
++		r->nx++;
++	}
++	*x = (struct swau_x){ 0 };
++	x->id = (uint16_t)(m[4] | m[5] << 8);
++	x->cntr = m[1];
++	x->sent_len = (uint8_t)len;
++	for (i = 0; i <= r->s.r[SWAU_UP].slots; i++) {          /* drain stale replies (aoc_alsa_hw.c:236-245), bounded by the slots */
++		g = swau_read(b, &r->s, rb, sizeof(rb), &rl);
++		if (g < 0) {
++			return x->rc = -g;
++		}
++		if (g == 0) {
++			break;
++		}
++		x->drained++;
++	}
++	x->rc = swau_write(b, &r->s, m, len);
++	x->written = x->rc == SWAU_OK || x->rc == SWAU_E_WRITE || x->rc == SWAU_E_RING;
++	if (x->rc != SWAU_OK) {
++		return x->rc;
++	}
++	for (ms = 0;; ms += SWAU_POLL_MS) {
++		g = swau_read(b, &r->s, rb, sizeof(rb), &rl);
++		if (g < 0) {
++			return x->rc = -g;
++		}
++		if (g == 1 || ms >= SWAU_REPLY_MS) {
++			break;
++		}
++		b->sleep_ms(b->ctx, SWAU_POLL_MS);
++	}
++	x->waited_ms = ms;
++	if (g != 1) {
++		return x->rc = SWAU_E_TIMEOUT;
++	}
++	x->reply_len = rl;
++	if (rl == 4u) {
++		x->aoc_err = (uint32_t)rb[0] | (uint32_t)rb[1] << 8 | (uint32_t)rb[2] << 16 | (uint32_t)rb[3] << 24;
++		return x->rc = SWAU_E_AOCERR;
++	}
++	if (rl < 8u || rl > sizeof(rb)) {
++		return x->rc = SWAU_E_SHORT;
++	}
++	x->reply_type = rb[0];
++	x->reply_id = (uint16_t)(rb[4] | rb[5] << 8);
++	x->reply = (int16_t)(uint16_t)(rb[6] | rb[7] << 8);
++	x->payload0 = rl > 8u ? rb[8] : 0u;
++	if (x->reply_type != 0u || x->reply_id != x->id || rl != len) {
++		return x->rc = SWAU_E_UNKNOWN;
++	}
++	if (x->reply != 0) {
++		return x->rc = SWAU_E_REJECTED;
++	}
++	return x->rc = SWAU_OK;
++}
++
++static int
++swau_get_dsp_state(const struct swau_bus *b, struct swau_res *r)
++{
++	uint8_t m[9];
++
++	swau_hdr(m, r->cntr++, sizeof(m), SWAU_CMD_GET_DSP_STATE);
++	m[8] = 0u;
++	return swau_cmd(b, r, m, sizeof(m));
++}
++
++static int
++swau_bind2(const struct swau_bus *b, struct swau_res *r, uint8_t bind)
++{
++	uint8_t m[11];
++
++	swau_hdr(m, r->cntr++, sizeof(m), SWAU_CMD_BIND2);
++	m[8] = SWAU_SRC_EP0;
++	m[9] = SWAU_SINK_SPEAKER;
++	m[10] = bind;
++	return swau_cmd(b, r, m, sizeof(m));
++}
++
++/* open: service header, GET_DSP_STATE, BIND2 bind = 1. After a BIND2 bind = 1 was WRITTEN (whatever the reply), r->bound = 1 and
++ * the caller must call swau_close on every path. */
++static int
++swau_open(const struct swau_bus *b, struct swau_res *r, uint32_t services_offset, uint32_t service_size, uint32_t ctl_index)
++{
++	*r = (struct swau_res){ 0 };
++	b->say(b->ctx, "audio_output_control: service header (queue, regions inside the window)");
++	r->rc = swau_svc_open(b, &r->s, services_offset, service_size, ctl_index);
++	if (r->rc != SWAU_OK) {
++		return r->rc;
++	}
++	b->say(b->ctx, "cmd 233 GET_DSP_STATE (read only)");
++	r->rc = swau_get_dsp_state(b, r);
++	if (r->rc != SWAU_OK) {
++		return r->rc;
++	}
++	r->dsp_mode = r->x[0].payload0;
++	b->say(b->ctx, "cmd 271 BIND2 src 0 dst 0 (SINK_SPEAKER = TDM_0_RX) bind 1");
++	r->rc = swau_bind2(b, r, 1u);
++	r->bound = r->x[1].written;     /* the message may have reached the AOC: undo it */
++
++	return r->rc;
++}
++
++/* undo: BIND2 bind = 0 once, if a bind = 1 may have reached the AOC */
++static int
++swau_close(const struct swau_bus *b, struct swau_res *r)
++{
++	if (!r->bound || r->unbound) {
++		return SWAU_OK;
++	}
++	b->say(b->ctx, "cmd 271 BIND2 src 0 dst 0 bind 0 (undo)");
++	r->unbound = 1;
++	return swau_bind2(b, r, 0u);
++}
++
++#endif /* SWEET_AUDIO_H */
+diff --git a/bsd/dev/sweet_cs_dsp.h b/bsd/dev/sweet_cs_dsp.h
+new file mode 100644
+index 0000000..f073861
+--- /dev/null
++++ b/bsd/dev/sweet_cs_dsp.h
+@@ -0,0 +1,194 @@
++/*
++ * CS35L41 HALO firmware file parser (patch 0166, plan A9c, PARSER ONLY: nothing in the kernel includes it yet; host test
++ * shim/aoc_audio_host_test.c runs it on the stock files when present). It walks a .wmfw and a .bin exactly as Linux v6.18 does and lists
++ * what the loader would write; it writes nothing.
++ * Sources (linux-v6.18 7d0a66e4bb90, $A/research-src/linux-v6.18): drivers/firmware/cirrus/cs_dsp.c cs_dsp_load :1477-1648 (wmfw, regions unpadded :1629),
++ * cs_dsp_load_coeff :2163-2356 (bin, blocks 4-byte aligned :2337), cs_dsp_halo_validate_version :1467-1475 (ver 3), cs_dsp_adsp2_parse_sizes :1433-1451 (16 bytes of sizes),
++ * cs_dsp_halo_region_to_reg :595-612 (XM/YM unpacked: base + 4 * off; XM/YM packed: (base + 3 * off) & ~3; PM packed: base + 5 * off);
++ * include/linux/firmware/cirrus/wmfw.h (wmfw_header 12 bytes {magic, le32 len, le16 rev, u8 core, u8 ver}, wmfw_adsp2_sizes 16, wmfw_footer 12,
++ * wmfw_region {u32 type/offset, le32 len, data}: offset = le32 & 0xFFFFFF, type = be32 & 0xFF i.e. the top byte; wmfw_coeff_hdr {magic, le32 len,
++ * be32 rev, le32 core_ver}, wmfw_coeff_item 20 bytes {le16 offset, le16 type, le32 id, ver, sr, len}; WMFW_HALO 4, region types);
++ * sound/soc/codecs/cs35l41-lib.c:1409-1415 the CS35L41 regions (include/sound/cs35l41.h: PM 0x3800000, XM packed 0x2000000, YM packed 0x2C00000,
++ * XM unpacked24 0x2800000, YM unpacked24 0x3400000).
++ * A bin block of an XM/YM/PM type is relative to an algorithm's base, which Linux reads back from the running core (cs_dsp_halo_setup_algs);
++ * the parser reports those as "alg-relative" (reg 0), absolute blocks with their register.
++ */
++#ifndef SWEET_CS_DSP_H
++#define SWEET_CS_DSP_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define SWCD_HALO           4u
++#define SWCD_ABSOLUTE       0xF0u
++#define SWCD_ALGORITHM_DATA 0xF2u
++#define SWCD_METADATA       0xFCu
++#define SWCD_NAME_TEXT      0xFEu
++#define SWCD_INFO_TEXT      0xFFu
++#define SWCD_ADSP2_XM       5u
++#define SWCD_ADSP2_YM       6u
++#define SWCD_PM_PACKED      0x10u
++#define SWCD_XM_PACKED      0x11u
++#define SWCD_YM_PACKED      0x12u
++#define SWCD_PM_BASE        0x03800000u
++#define SWCD_XM_PACK_BASE   0x02000000u
++#define SWCD_YM_PACK_BASE   0x02C00000u
++#define SWCD_XM_UNP_BASE    0x02800000u
++#define SWCD_YM_UNP_BASE    0x03400000u
++#define SWCD_MAX_REGIONS    256u
++
++enum { SWCD_OK = 0, SWCD_E_SHORT, SWCD_E_MAGIC, SWCD_E_VERSION, SWCD_E_CORE, SWCD_E_LEN, SWCD_E_OVERFLOW, SWCD_E_TYPE, SWCD_E_MANY };
++
++struct swcd_item { uint32_t type, offset, len, pos, reg, id; };
++struct swcd_file {
++	uint32_t ver, core, rev, hdr_len, nitems, write_bytes, alg_relative, text_items, odd_len;
++	uint32_t sizes[4];                      /* wmfw: xm, ym, pm, zm */
++	uint64_t timestamp;
++	struct swcd_item it[SWCD_MAX_REGIONS];
++};
++
++static uint32_t swcd_le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static uint32_t swcd_le16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
++
++/* cs_dsp_halo_region_to_reg + cs35l41_dsp1_regions; 0 = not a memory region */
++static uint32_t
++swcd_region_to_reg(uint32_t type, uint32_t off)
++{
++	switch (type) {
++	case SWCD_ADSP2_XM: return SWCD_XM_UNP_BASE + off * 4u;
++	case SWCD_ADSP2_YM: return SWCD_YM_UNP_BASE + off * 4u;
++	case SWCD_XM_PACKED: return (SWCD_XM_PACK_BASE + off * 3u) & ~3u;
++	case SWCD_YM_PACKED: return (SWCD_YM_PACK_BASE + off * 3u) & ~3u;
++	case SWCD_PM_PACKED: return SWCD_PM_BASE + off * 5u;
++	default: return 0u;
++	}
++}
++
++static int
++swcd_wmfw(const uint8_t *d, size_t n, struct swcd_file *f)
++{
++	size_t pos;
++	uint32_t len, type, off;
++
++	*f = (struct swcd_file){ 0 };
++	if (n <= 12u) {
++		return SWCD_E_SHORT;
++	}
++	if (d[0] != 'W' || d[1] != 'M' || d[2] != 'F' || d[3] != 'W') {
++		return SWCD_E_MAGIC;
++	}
++	f->hdr_len = swcd_le32(d + 4);
++	f->rev = swcd_le16(d + 8);
++	f->core = d[10];
++	f->ver = d[11];
++	if (f->ver != 3u) {
++		return SWCD_E_VERSION;
++	}
++	if (f->core != SWCD_HALO) {
++		return SWCD_E_CORE;
++	}
++	if (n < 12u + 16u + 12u) {
++		return SWCD_E_OVERFLOW;
++	}
++	for (pos = 0; pos < 4u; pos++) {
++		f->sizes[pos] = swcd_le32(d + 12u + 4u * pos);
++	}
++	f->timestamp = (uint64_t)swcd_le32(d + 28) | (uint64_t)swcd_le32(d + 32) << 32;
++	pos = 12u + 16u + 12u;
++	if (f->hdr_len != pos) {
++		return SWCD_E_LEN;
++	}
++	while (pos < n) {
++		if (n - pos < 8u) {
++			return SWCD_E_OVERFLOW;
++		}
++		len = swcd_le32(d + pos + 4u);
++		if (len > n - pos - 8u) {
++			return SWCD_E_OVERFLOW;
++		}
++		off = swcd_le32(d + pos) & 0xFFFFFFu;
++		type = d[pos + 3u];             /* be32 type & 0xff = the 4th byte */
++		if (f->nitems >= SWCD_MAX_REGIONS) {
++			return SWCD_E_MANY;
++		}
++		f->it[f->nitems] = (struct swcd_item){ type, off, len, (uint32_t)pos, 0u, 0u };
++		switch (type) {
++		case SWCD_INFO_TEXT: case SWCD_NAME_TEXT: case SWCD_ALGORITHM_DATA: case SWCD_METADATA:
++			f->text_items++;
++			break;
++		case SWCD_ABSOLUTE:
++			f->it[f->nitems].reg = off;
++			break;
++		case SWCD_ADSP2_XM: case SWCD_ADSP2_YM: case SWCD_PM_PACKED: case SWCD_XM_PACKED: case SWCD_YM_PACKED:
++			f->it[f->nitems].reg = swcd_region_to_reg(type, off);
++			break;
++		default:
++			return SWCD_E_TYPE;     /* Linux warns and skips; a stock file has none, so unknown = stop here */
++		}
++		if (f->it[f->nitems].reg) {
++			f->write_bytes += len;
++			f->odd_len += (len & 3u) != 0u;
++		}
++		f->nitems++;
++		pos += 8u + len;
++	}
++	return SWCD_OK;
++}
++
++static int
++swcd_bin(const uint8_t *d, size_t n, struct swcd_file *f)
++{
++	size_t pos;
++	uint32_t len, type, off;
++
++	*f = (struct swcd_file){ 0 };
++	if (n <= 16u) {
++		return SWCD_E_SHORT;
++	}
++	if (d[0] != 'W' || d[1] != 'M' || d[2] != 'D' || d[3] != 'R') {
++		return SWCD_E_MAGIC;
++	}
++	f->hdr_len = swcd_le32(d + 4);
++	f->rev = (uint32_t)d[8] << 24 | (uint32_t)d[9] << 16 | (uint32_t)d[10] << 8 | d[11];        /* be32 */
++	f->ver = swcd_le32(d + 12);
++	if ((f->rev & 0xFFu) != 1u && (f->rev & 0xFFu) != 2u) {
++		return SWCD_E_VERSION;
++	}
++	if (f->hdr_len < 16u || f->hdr_len > n) {
++		return SWCD_E_LEN;
++	}
++	pos = f->hdr_len;
++	while (pos < n) {
++		if (n - pos < 20u) {
++			return SWCD_E_OVERFLOW;
++		}
++		len = swcd_le32(d + pos + 16u);
++		if (len > n - pos - 20u) {
++			return SWCD_E_OVERFLOW;
++		}
++		off = swcd_le16(d + pos);
++		type = swcd_le16(d + pos + 2u);
++		if (f->nitems >= SWCD_MAX_REGIONS) {
++			return SWCD_E_MANY;
++		}
++		f->it[f->nitems] = (struct swcd_item){ type, off, len, (uint32_t)pos, 0u, swcd_le32(d + pos + 4u) };
++		if (type == SWCD_NAME_TEXT << 8 || type == SWCD_INFO_TEXT << 8 || type == SWCD_METADATA << 8) {
++			f->text_items++;
++		} else if (type == SWCD_ABSOLUTE << 8) {
++			f->it[f->nitems].reg = off;     /* "register" (the fw_id / offset 0 global-coefficient case aside) */
++			f->write_bytes += len;
++		} else if (type == SWCD_ADSP2_XM || type == SWCD_ADSP2_YM || type == SWCD_XM_PACKED || type == SWCD_YM_PACKED ||
++		    type == SWCD_PM_PACKED) {
++			f->alg_relative++;              /* reg = alg base (from the running core) + offset */
++			f->write_bytes += len;
++		} else {
++			return SWCD_E_TYPE;
++		}
++		f->odd_len += (len & 3u) != 0u && type != SWCD_NAME_TEXT << 8 && type != SWCD_INFO_TEXT << 8 && type != SWCD_METADATA << 8;
++		f->nitems++;
++		pos += (20u + len + 3u) & ~3u;     /* blocks are 4-byte aligned (cs_dsp.c:2337) */
++	}
++	return SWCD_OK;
++}
++
++#endif /* SWEET_CS_DSP_H */

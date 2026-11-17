@@ -89,6 +89,8 @@ struct amp {
 	uint32_t otpid, mem[32], ra[48], rv[48], ra0[48], rv0[48]; unsigned nreg, nreg0, mem_reads, otp_nwr, lock_seen;
 	int key, mem_flip;	/* mem_flip: OTP_MEM5 reads differently from the second pass on */
 	uint32_t stuck_reg;	/* writes to this register do not stick */
+	/* patch 0166 A9: the TDM / boost / clock registers, PWR_CTRL1 (read only), the PLL model */
+	uint32_t a9v[11]; unsigned a9_nwr, a9_bad; int pll_en_seen;
 };
 static struct amp amp[2];
 static unsigned violations;
@@ -263,6 +265,69 @@ static int ref_unpack(uint32_t id, const uint32_t *otp_mem, uint32_t *ra, uint32
 	return 0;
 }
 
+/* ---- patch 0166 A9 model: registers typed from cs35l41.h (not from the header under test) ---- */
+static const uint32_t A9R[11] = { 0x3810u, 0x3814u, 0x3808u, 0x480Cu, 0x6808u, 0x4808u, 0x2D10u, 0x2C04u, 0x2C0Cu, 0x4840u, 0x2014u };
+static int sclk_on, pll_never, a9_opens, a9_closes, a9_open_ret = 1;
+static uint32_t a9v0[2][11];
+static int a9_idx(uint32_t reg)
+{
+	for (int i = 0; i < 11; i++)
+		if (A9R[i] == reg)
+			return i;
+	return -1;
+}
+/* the expected final word of each A9 register from its start value: the stock fields (cs35l41.c set_pdata / set_dai_fmt / set_sysclk / hw_params) */
+static uint32_t a9_expect(uint32_t reg, uint32_t v0)
+{
+	switch (reg) {
+	case 0x3810u: return (v0 & ~0xFFFFu) | 0x4932u;
+	case 0x3814u: return (v0 & ~0xFF03u) | 0x7500u;
+	case 0x3808u: return (v0 & ~0x7Fu) | 0x36u;
+	case 0x480Cu: return v0 | 3u;
+	case 0x6808u: return v0 | 0x3F00u;
+	case 0x4808u: return (v0 & ~(0xFF000000u | 0x700u | 0x10u | 0x1u | 0x4u | 0x40u)) | 0x10000000u;
+	case 0x2D10u: return 0x18010u;
+	case 0x2C04u: return (v0 & ~(0x800u | 0x7E0u | 0x10u | 0x7u)) | 0x500u | 0x10u;
+	case 0x2C0Cu: return (v0 & ~0x1Fu) | 3u;
+	case 0x4840u: return (v0 & ~0x3Fu) | 16u;
+	default: return v0;
+	}
+}
+static void a9_wr(int a, uint32_t wa, uint32_t wv)
+{
+	struct amp *m = &amp[a];
+	int i = a9_idx(wa);
+
+	if (wa == 0x10018u) {		/* IRQ1_STATUS3 write-1-to-clear */
+		if (wv != 0x2u)
+			violate("an IRQ1_STATUS3 write other than PLL_LOCK");
+		m->st3 &= ~wv;
+		m->a9_nwr++;
+		return;
+	}
+	if (i < 0 || wa == 0x2014u) {
+		violate(wa == 0x2014u ? "PWR_CTRL1 written by A9" : "an A9-phase write to a register outside the A9 set");
+		m->a9_bad++;
+		return;
+	}
+	m->a9v[i] = wv;
+	m->a9_nwr++;
+	if (wa == 0x2C04u && (wv & 0x10u))
+		m->pll_en_seen = 1;
+}
+/* IRQ1_STATUS3 as read: PLL_LOCK latches once the PLL is enabled from SCLK (sel 0, closed loop) and the AOC drives SCLK */
+static uint32_t a9_st3(int a)
+{
+	struct amp *m = &amp[a];
+	uint32_t pll = m->a9v[7];
+
+	if (!pll_never && sclk_on && (pll & 0x10u) && !(pll & 0x800u) && (pll & 7u) == 0u && ((pll >> 5) & 0x3Fu) == 0x28u)
+		m->st3 |= 0x2u;
+	return m->st3;
+}
+static int cb_open(void *ctx) { (void)ctx; a9_opens++; sclk_on = a9_open_ret; return a9_open_ret; }
+static void cb_close(void *ctx) { (void)ctx; a9_closes++; sclk_on = 0; }
+
 /* an A7 write after the 12 init writes: the test-key order, OTP row registers only while unlocked, only bits of its rows */
 static void otp_wr(int a, uint32_t wa, uint32_t wv)
 {
@@ -276,6 +341,10 @@ static void otp_wr(int a, uint32_t wa, uint32_t wv)
 		else if (wv == 0x33u && m->key == 3) { m->key = 0; m->lock_seen++; mark_otp_end[a] = nw; }
 		else if (wv == 0x33u) { }	/* its 0xCC was lost (a faulted frame): the key stays as it is, the run must say lock=FAILED */
 		else violate("a TEST_KEY_CTL write out of the unlock / lock order");
+		return;
+	}
+	if (amp_a9_cb.on && m->lock_seen && (a9_idx(wa) >= 0 || wa == 0x10018u)) {
+		a9_wr(a, wa, wv);	/* patch 0166: after the OTP relock */
 		return;
 	}
 	if (!ref_target(wa)) {
@@ -371,7 +440,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	if (p == 5) {
 		addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 		if (addr != REGS4[0] && addr != REGS4[1] && addr != REGS4[2] && addr != REGS4[3] && addr != 0x10010u && addr != 0x10110u && addr != 0x2BC1000u &&
-		    addr != 0x10u && !(addr >= 0x400u && addr <= 0x47Cu && !(addr & 3u)) && !ref_target(addr))
+		    addr != 0x10u && !(addr >= 0x400u && addr <= 0x47Cu && !(addr & 3u)) && !ref_target(addr) && a9_idx(addr) < 0)
 			violate("a frame names a register outside the four");
 		if (released(a) && m->was_released && first_frame_tick[a] && first_frame_tick[a] - m->t_high < 2000u)
 			violate("first frame less than 2 ms after the reset release");
@@ -387,6 +456,12 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 		val = addr == 0x10u ? m->otpid : m->mem[(addr - 0x400u) / 4u] ^ (m->mem_flip && m->mem_reads >= 2 && addr == 0x414u ? 1u : 0u);
 		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
 	}
+	if (a9_idx(addr) >= 0) {
+		val = m->a9v[a9_idx(addr)];
+		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
+	}
+	if (addr == 0x10018u && amp_a9_cb.on)
+		(void)a9_st3(a);
 	if (ref_target(addr)) {
 		val = *regp(m->ra, m->rv, &m->nreg, addr);
 		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
@@ -541,6 +616,13 @@ static void reset_hw(void)
 		memcpy(amp[a].rv0, amp[a].rv, sizeof(amp[a].rv));
 		amp[a].nreg0 = amp[a].nreg;
 	}
+	for (int a = 0; a < 2; a++) {	/* patch 0166 A9: random start words, PWR_CTRL1 with GLOBAL_EN clear */
+		for (int i = 0; i < 10; i++)
+			amp[a].a9v[i] = rnd();
+		amp[a].a9v[10] = rnd() & ~1u;
+	}
+	memcpy(a9v0[0], amp[0].a9v, sizeof(a9v0[0])); memcpy(a9v0[1], amp[1].a9v, sizeof(a9v0[1]));
+	sclk_on = 0; pll_never = 0; a9_opens = a9_closes = 0; a9_open_ret = 1;
 	memset(mark_unlock, 0, sizeof(mark_unlock)); memset(mark_lock, 0, sizeof(mark_lock)); memset(mark_otp_end, 0, sizeof(mark_otp_end));
 	nw = nreads = nframes = violations = mux_writes = 0; why_v[0] = 0;
 	flip_at = 0; flip_bank = 0; flip_bit = 0;
@@ -703,7 +785,8 @@ static void unit_writes(void)
 	}
 	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 2u << 6, 0x04u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 3u << 6, 0x7Cu, 0, 0, 2, 0x47Cu, 0), "armed OTP_MEM31 read frame");
 	CHECK(!w32_allowed(R_TX, 3u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && !w32_allowed(R_TX, 6u << 6, 0x00u, 0, 0, 2, 0x47Cu, 0), "armed read: another byte / a seventh byte refused");
-	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2014u, 0), "armed read of an unlisted register refused");
+	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2018u, 0), "armed read of an unlisted register refused");
+	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2014u, 0), "patch 0166: PWR_CTRL1 may be READ (GLOBAL_EN must read 0), never written");
 	CHECK(!w32_allowed(R_PKT, 0, 10u, 0, 0, 2, 0x400u, 0) && !w32_allowed(R_CH, 0, CH_TX | CH_RX, 10u << 6, 0, 2, 0x400u, 0), "an armed read never sends a write frame");
 	CHECK(w32_allowed(R_CH, 0, CH_TX | CH_RX, 6u << 6, 0, 2, 0x400u, 0), "an armed read sends its 6-byte frame");
 	printf("ok: armed write unit cases\n");
@@ -948,6 +1031,58 @@ int main(void)
 		CHECK(has("!!! RESTORE FAILED"), "loud restore failure");
 		CHECK(has("restore=FAILED"), "restore=FAILED");
 		printf("ok: a dropped restore write is loud (!!! RESTORE FAILED, restore=FAILED)\n");
+	}
+	/* ---- patch 0166 A9b: TDM config, AOC open / close callbacks, PLL lock, never PWR_CTRL1 ---- */
+	{
+		int a9ok;
+
+		/* the allowlist: PWR_CTRL1 never, even with a row armed; an armed row only with its field and the other bits as read */
+		CHECK(!amp_write_ok(0x2014u, 0u) && !amp_write_ok(0x2014u, 1u), "PWR_CTRL1 refused (unarmed)");
+		amp_a9.on = 1; amp_a9.idx = 0; amp_a9.old = 0x12345600u;
+		CHECK(amp_write_ok(0x3810u, 0x12345632u), "armed K1 row allows its exact merge");
+		CHECK(!amp_write_ok(0x3810u, 0x12345633u) && !amp_write_ok(0x3810u, 0x12345732u) && !amp_write_ok(0x3814u, 0x12345632u), "armed row: other field / bits / register refused");
+		CHECK(!amp_write_ok(0x2014u, 0x1u) && !amp_write_ok(0x2014u, 0x12345632u), "PWR_CTRL1 refused with a row armed");
+		for (uint32_t i = 0; i < AMP_A9_N; i++) {
+			amp_a9.idx = i;
+			CHECK(amp_a9_tab[i].reg != 0x2014u && !amp_write_ok(0x2014u, amp_a9.old | 1u), "no row names PWR_CTRL1");
+		}
+		amp_a9.on = 0; amp_a9.idx = 0; amp_a9.old = 0;
+		CHECK(!amp_write_ok(0x3810u, 0x32u) && !amp_write_ok(0x2C04u, 0x510u), "unarmed A9 register refused");
+		printf("ok: A9 allowlist (rows armed one at a time, PWR_CTRL1 0x2014 never writable)\n");
+
+		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		a9ok = rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && amp_a9_res.opened && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked;
+		CHECK(a9ok, "A9 good: run passes, opened once, closed once, PLL locked l,r");
+		CHECK(violations == 0, why_v);
+		for (int a = 0; a < 2; a++)
+			for (int i = 0; i < 10; i++)
+				if (amp[a].a9v[i] != a9_expect(A9R[i], a9v0[a][i])) {
+					printf("  amp %d reg %#x = %#x want %#x\n", a, A9R[i], amp[a].a9v[i], a9_expect(A9R[i], a9v0[a][i]));
+					CHECK(0, "A9 register = the stock field merge of its start value");
+				}
+		CHECK(amp[0].a9v[10] == a9v0[0][10] && amp[1].a9v[10] == a9v0[1][10] && !amp[0].a9_bad && !amp[1].a9_bad, "PWR_CTRL1 untouched");
+		CHECK(amp[0].pll_en_seen && amp[1].pll_en_seen && has("L a9 pll locked") && has("R a9 pll locked"), "PLL lines");
+		CHECK(amp_a9_res.a[0].polls == 1u && amp_a9_res.a[1].polls == 1u, "PLL poll stops at the first lock read (the model locks at once)");
+		CHECK(restored_exact(), "A9: the same restore (resets low, every word back)");
+		printf("ok: A9 good: %u / %u A9 writes, PLL locked l,r, AOC open + close once, restore exact\n", amp[0].a9_nwr, amp[1].a9_nwr);
+
+		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		CHECK(rc == 0 && violations == 0 && !amp_a9_res.a[0].locked && !amp_a9_res.a[1].locked && amp_a9_res.a[0].polls == 100u &&
+		      amp_a9_res.a[1].polls == 100u && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "PLL never locks: 100 polls each, closed, restored");
+		printf("ok: A9 PLL never locks (bounded 100 x 1 ms per amp, AOC closed, restore exact)\n");
+
+		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		CHECK(rc == 0 && violations == 0 && !amp_a9_res.opened && amp_a9_res.a[0].polls == 0u && a9_closes == 1 && restored_exact(), "AOC open refused: no PLL poll, close called, restored");
+		printf("ok: A9 AOC open refused (no PLL poll, close still called)\n");
+
+		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		CHECK(violations == 0 && amp_a9_res.a[0].cfg && !amp_a9_res.a[1].cfg && amp[1].a9_nwr == 0 && a9_opens == 0 && restored_exact(), "GLOBAL_EN found set on R: no R write, no AOC open");
+		printf("ok: A9 GLOBAL_EN found set: no write to that amp, no AOC open\n");
+
+		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		CHECK(violations == 0 && amp[0].a9_nwr == 0 && amp[1].a9_nwr == 0 && a9_opens == 0, "error bit (H8): no A9 write, no open");
+		amp_a9_cb = (struct amp_a9_cb){ 0 };
+		printf("ok: A9 amp error bit: no TDM config, no AOC open\n");
 	}
 	if (fails) {
 		printf("amp_xnu_host_test: %u FAILED\n", fails);

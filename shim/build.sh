@@ -625,7 +625,9 @@ else
 	chk "trusty_asan_host_test" $O/trusty_asan_host_test
 	# AOC pre-load probe of xnu patch 0161 (bsd/dev/sweet_aoc.h, reads only), Trusty TIPC GET_STATE of patch 0162 (bsd/dev/sweet_tipc.h) and the AOC firmware load of patch 0164 (bsd/dev/sweet_aoc_load.h) against fakes
 	# a 4th field names a later patch whose hunk for the same file is applied on top (0165 extends sweet_tipc.h); 0165 adds the A8 start (bsd/dev/sweet_aoc_start.h)
-	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test:0165-aoc-start" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0165-aoc-start:sweet_aoc_start.h:aoc_start_host_test"; do
+	# 0166 (A9) changes sweet_aoc_start.h (the ssmt kept count) and adds sweet_audio.h (AOC queue I/O + commands) and sweet_cs_dsp.h (HALO file parser, read by aoc_audio_host_test)
+	awk '$0=="+++ b/bsd/dev/sweet_cs_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0166-aoc-audio.patch > $O/sweet_cs_dsp.h
+	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test:0165-aoc-start" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0165-aoc-start:sweet_aoc_start.h:aoc_start_host_test:0166-aoc-audio" "0166-aoc-audio:sweet_audio.h:aoc_audio_host_test"; do
 		IFS=: read -r hpp hph hpt hpx <<<"$hp"
 		awk -v f="+++ b/bsd/dev/$hph" '$0==f{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/$hpp.patch > $O/$hph
 		if [ -n "$hpx" ]; then
@@ -651,6 +653,10 @@ else
 	# CS35L41 identify + B2 probe writes of xnu patch 0158 (new-file hunk of bsd/dev/sweet_amp.h): against the A1 fake SoC + two fake amps (the 12 stock writes in order, never PWR_CTRL1; A7 OTP unpack vs the Linux logic, + sweet_amp_otp.h)
 	awk '$0=="+++ b/bsd/dev/sweet_amp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0158-sweet-amp-init.patch > $O/sweet_amp.h
 	awk '$0=="+++ b/bsd/dev/sweet_amp_otp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0158-sweet-amp-init.patch > $O/sweet_amp_otp.h
+	# patch 0166 (A9b) extends sweet_amp.h: its hunk is applied on top (TDM config rows, PLL read, AOC callbacks; the A9 cases of amp_xnu_host_test)
+	rm -rf $O/ampx && mkdir -p $O/ampx/bsd/dev && cp $O/sweet_amp.h $O/ampx/bsd/dev/sweet_amp.h
+	awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0166-aoc-audio.patch > $O/ampx/p.diff
+	chk "amp_xnu_host_test: 0166-aoc-audio applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
 	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
 	chk "amp_xnu_host_test" $O/amp_xnu_host_test
 	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c
