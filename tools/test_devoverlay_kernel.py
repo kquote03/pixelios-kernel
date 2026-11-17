@@ -1,12 +1,14 @@
-"""Compile the kernel's pure archive/path functions (xnu patch 0117, between the host-test markers) on the host with
+"""Compile the kernel's pure archive/path/inflate functions (xnu patch 0117 + 0163 on top, between the host-test markers) on the host with
 ASan/UBSan and compare them with the Python twin tools/mkdevoverlay.py on a seeded corpus; then check that known
-mutants of the C code are caught (review 18 finding 4). Skips when gcc/cc is missing."""
-import os, random, re, shutil, struct, subprocess, sys, tempfile, unittest
+mutants of the C code are caught (review 18 finding 4). The inflate driver sd_stream (0163) is linked against host zlib.
+Skips when gcc/cc is missing."""
+import glob, os, random, re, shutil, struct, subprocess, sys, tempfile, unittest, zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import mkdevoverlay as m
 
 PATCH = os.path.join(HERE, '..', 'xnu', 'patches', '0117-sweet-dev-overlay.patch')
+PATCH_Z = os.path.join(HERE, '..', 'xnu', 'patches', '0163-sweet-dev-overlay-z.patch')
 CC = shutil.which('gcc') or shutil.which('cc')
 
 MAIN = r'''
@@ -16,19 +18,33 @@ MAIN = r'''
 #include <string.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <zlib.h>
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define SD_ZALLOC Z_NULL
+#define SD_ZFREE Z_NULL
 %s
+static uint64_t g_usize;
+/* discard sink; aborts if sd_stream ever hands it a byte past usize (bomb cut-off) */
+static int sink(void *ctx, const uint8_t *p, uint32_t n, uint64_t off) {
+	(void)ctx; (void)p;
+	if (n == 0 || n > 4096 || off + n > g_usize) abort();
+	return 0;
+}
 /* stdin: repeated [u32 len][len bytes]; one result block per archive, ending "--" */
 int main(void) {
 	uint32_t n;
+	(void)sd_crc32;
 	while (fread(&n, 4, 1, stdin) == 1) {
 		uint8_t *b = malloc(n ? n : 1);                    /* exact size: ASan sees any read past the end */
 		if (fread(b, 1, n, stdin) != n) return 2;
-		uint32_t count = 0;
-		if (sd_hdr(b, n, &count) || sd_walk(b, n, count)) { puts("ERR"); }
+		uint32_t count = 0, ver = 0;
+		if (sd_hdr(b, n, &count, &ver) || sd_walk(b, n, ver, count)) { puts("ERR"); }
 		else {
 			uint64_t off = SD_HDR; struct sd_ent e;
 			for (uint32_t i = 0; i < count; i++) {
-				sd_next(b, n, &off, &e);
+				sd_next(b, n, ver, &off, &e);
+				static uint8_t zb[4096]; const char *zw; g_usize = e.usize;
+				int sok = sd_stream(&e, zb, sizeof(zb), sink, NULL, &zw) == 0;
 				char path[SD_MAXPATH + 1], tmp[SD_MAXPATH + 16], orig[SD_MAXPATH + 16], sh[160]; size_t mk = 0;
 				const char *why = sd_path_check(&e, path, &mk);
 				tmp[0] = orig[0] = 0;
@@ -36,8 +52,8 @@ int main(void) {
 				sd_show(&e, sh, sizeof(sh));                /* exact-size array: ASan sees a one-byte overflow */
 				char t2[40], o2[40];                        /* too-small buffers: sd_names must refuse, never truncate */
 				int small = why ? 0 : sd_names(path, t2, sizeof(t2), o2, sizeof(o2)) != 0;
-				printf("E %%s|%%u|%%u|%%u|%%llu|%%d|%%lld|%%s|%%s|%%d|%%s\n", why ? why : "ok", e.mode, e.uid, e.gid, (unsigned long long)e.size,
-				    sd_crc32(e.data, e.size) == e.crc, why ? 0LL : (long long)mk, tmp, orig, small, sh);
+				printf("E %%s|%%u|%%u|%%u|%%llu|%%d|%%lld|%%s|%%s|%%d|%%s\n", why ? why : "ok", e.mode, e.uid, e.gid, (unsigned long long)e.usize,
+				    sok, why ? 0LL : (long long)mk, tmp, orig, small, sh);
 			}
 		}
 		puts("--"); free(b);
@@ -47,13 +63,57 @@ int main(void) {
 '''
 
 
-def kernel_source():
+def kernel_file():
+    """bsd/dev/sweet_devoverlay.c as 0117 creates it with 0163 applied on top (git apply outside a repo)."""
     s = open(PATCH).read()
     s = s[s.index('+++ b/bsd/dev/sweet_devoverlay.c'):]
     lines = [l[1:] for l in s.split('\n')[2:] if l.startswith('+')]
-    src = '\n'.join(lines)
+    d = tempfile.mkdtemp(); os.makedirs(os.path.join(d, 'bsd', 'dev'))
+    try:
+        f = os.path.join(d, 'bsd', 'dev', 'sweet_devoverlay.c')
+        open(f, 'w').write('\n'.join(lines) + '\n')
+        r = subprocess.run(['git', 'apply', '--unsafe-paths', os.path.abspath(PATCH_Z)], cwd=d, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return open(f).read()
+    finally:
+        shutil.rmtree(d, True)
+
+
+def kernel_source():
+    src = kernel_file()
     a, b = src.index('/* host-test begin'), src.index('/* host-test end */')
     return src[a:b]
+
+
+_ZF = []
+
+
+def zlib_flags():
+    """Compiler flags for host zlib: $ZLIB_CFLAGS/$ZLIB_LIBS, else the first candidate that links (default paths, then a
+    Nix store zlib: -dev headers + a lib of the host architecture)."""
+    if _ZF:
+        return _ZF[0]
+    if os.environ.get('ZLIB_CFLAGS') or os.environ.get('ZLIB_LIBS'):
+        _ZF.append(os.environ.get('ZLIB_CFLAGS', '').split() + os.environ.get('ZLIB_LIBS', '-lz').split())
+        return _ZF[0]
+    cands = [['-lz']]
+    for inc in sorted(glob.glob('/nix/store/*-zlib-*-dev/include'), reverse=True):
+        ver = os.path.basename(os.path.dirname(inc))[33:-4]                  # <hash>-zlib-1.3.2-dev -> zlib-1.3.2
+        for lib in sorted(glob.glob('/nix/store/*-%s/lib/libz.so' % ver)):
+            d = os.path.dirname(lib)
+            cands.append(['-I' + inc, '-L' + d, '-Wl,-rpath,' + d, '-lz'])
+    t = tempfile.mkdtemp()
+    try:
+        c = os.path.join(t, 'z.c')
+        open(c, 'w').write('#include <zlib.h>\nint main(void){return zlibVersion()[0]==0;}\n')
+        for f in cands:
+            if subprocess.run([CC, '-o', os.path.join(t, 'z'), c, *f], capture_output=True).returncode == 0:
+                _ZF.append(f)
+                return f
+    finally:
+        shutil.rmtree(t, True)
+    _ZF.append(['-lz'])
+    return _ZF[0]
 
 
 def build(src, out):
@@ -61,17 +121,17 @@ def build(src, out):
     c = out + '.c'
     open(c, 'w').write(code)
     flags = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined']   # no fallback without sanitizers (review 19 M1-new d)
-    r = subprocess.run([CC, '-O1', '-Wall', '-Werror=implicit-function-declaration', *flags, '-o', out, c], capture_output=True, text=True)
+    r = subprocess.run([CC, '-O1', '-Wall', '-Werror=implicit-function-declaration', *flags, '-o', out, c, *zlib_flags()], capture_output=True, text=True)
     return None if r.returncode == 0 else (r.stderr[-2000:] or 'sanitizer build failed')
 
 
 def py(blob):
     try:
-        ents = m.parse(blob)
+        ents = m.parse(blob, with_usize=True)
     except ValueError:
         return ['ERR', '--']
-    return ['E %s|%d|%d|%d|%d|%d|%d|%s|%s|%d|%s' % (m.path_check(p) or 'ok', mo, u, g, len(d), int(c), mkmin(p) if not m.path_check(p) else 0,
-            *(((p + '.sweettmp', p + '.sweetorig') if not m.path_check(p) else ('', ''))), int(len(p) + 10 >= 40 and not m.path_check(p)), shown(p)) for p, mo, u, g, d, c in ents] + ['--']
+    return ['E %s|%d|%d|%d|%d|%d|%d|%s|%s|%d|%s' % (m.path_check(p) or 'ok', mo, u, g, us, int(c), mkmin(p) if not m.path_check(p) else 0,
+            *(((p + '.sweettmp', p + '.sweetorig') if not m.path_check(p) else ('', ''))), int(len(p) + 10 >= 40 and not m.path_check(p)), shown(p)) for p, mo, u, g, d, c, us in ents] + ['--']
 
 
 def mkmin(p):
@@ -98,6 +158,60 @@ def hdr(count, ver=1):
     return b'SWEETDEV' + struct.pack('<II', ver, count)
 
 
+def raw2(path, body, usize, crc, flags=1, zero=0, plen=None, size=None):
+    e = struct.pack('<HHIIIQQII', len(path) if plen is None else plen, 0o644, 0, 0, crc, len(body) if size is None else size, usize, flags, zero) + path
+    e += b'\0' * (-len(e) % 16)
+    e = e + body
+    return e + b'\0' * (-len(e) % 16)
+
+
+def zcases():
+    """version 2 / zlib cases (patch 0163): good, truncated, wrong crc, bomb, caps, bad fields, trailing data."""
+    p, data = b'/usr/lib/z', bytes(range(256)) * 64 + b'tail'          # 16388 bytes: several 4096-byte sink pieces
+    z, crc = zlib.compress(data, 9), zlib.crc32(data)
+    big = b'\0' * (3 << 20); zb = zlib.compress(big, 9)
+    out = [hdr(1, 2) + raw2(p, z, len(data), crc),                       # good
+           hdr(2, 2) + raw2(p, z, len(data), crc) + raw2(b'/usr/lib/s', b'abc', 3, zlib.crc32(b'abc'), flags=0),   # good + stored
+           hdr(1, 2) + raw2(p, z[:-7], len(data), crc),                  # truncated stream
+           hdr(1, 2) + raw2(p, z[:len(z) // 2], len(data), crc),
+           hdr(1, 2) + raw2(p, z, len(data), crc ^ 1),                   # wrong crc
+           hdr(1, 2) + raw2(p, z, len(data) + 1, crc),                   # declared one byte too long
+           hdr(1, 2) + raw2(p, z, len(data) - 1, crc),                   # declared one byte short
+           hdr(1, 2) + raw2(p, zb, 4096, zlib.crc32(big[:4096])),        # bomb: declared 4 KiB, inflates to 3 MiB
+           hdr(1, 2) + raw2(p, zb, 0, 0),                                # bomb: declared 0
+           hdr(1, 2) + raw2(p, z + b'X', len(data), crc),                # data after the stream
+           hdr(1, 2) + raw2(p, z + zlib.compress(b'x'), len(data), crc),
+           hdr(1, 2) + raw2(p, b'not zlib at all', len(data), crc),
+           hdr(1, 2) + raw2(p, b'', 0, 0),                               # empty zlib body
+           hdr(1, 2) + raw2(p, zlib.compress(b''), 0, 0),                # empty file, zlib
+           hdr(1, 2) + raw2(p, z, (40 << 20) + 1, crc),                  # usize over the cap: archive refused
+           hdr(1, 2) + raw2(p, z, 40 << 20, crc),                        # at the cap: structure ok, length mismatch
+           hdr(2, 2) + raw2(p, z, 30 << 20, crc) + raw2(b'/usr/lib/y', z, 30 << 20, crc),   # total over the cap
+           hdr(1, 2) + raw2(p, z, 2 ** 64 - 1, crc),
+           hdr(2, 2) + raw2(p, z, 2 ** 64 - 1, crc) + raw2(b"/usr/lib/y", z, 2, crc),   # per-entry cap keeps the total from wrapping
+           hdr(1, 2) + raw2(p, z, len(data), crc, flags=2),
+           hdr(1, 2) + raw2(p, z, len(data), crc, zero=1),
+           hdr(1, 2) + raw2(p, b'abc', 4, zlib.crc32(b'abc'), flags=0),  # stored with usize != size
+           hdr(1, 2) + raw2(p, z, len(data), crc, size=2 ** 64 - 1),
+           hdr(1, 2) + raw2(b'/etc/z', z, len(data), crc),               # bad path, stream still checked
+           hdr(1, 3) + raw2(p, z, len(data), crc),
+           hdr(1, 1) + raw2(p, z, len(data), crc)]                       # v2 header bytes under version 1
+    good = out[0]
+    for cut in (17, 40, 55, 56, len(good) - 1, len(good) - 16):
+        out.append(good[:cut])
+    R = random.Random(163)
+    for _ in range(400):
+        ents = [(R.choice(['/usr/lib/a', '/usr/local/b/c', '/etc/x']), 0o644, 0, 0,
+                 bytes(R.randrange(4) for _ in range(R.randrange(0, 9000)))) for _ in range(R.randrange(1, 3))]
+        blob = bytearray(m.pack(ents, zlib_above=R.choice([0, 100, 5000])))
+        for _ in range(R.randrange(0, 3)):
+            blob[R.randrange(len(blob))] = R.randrange(256)
+        if R.random() < 0.3:
+            blob = blob[:R.randrange(len(blob) + 1)]
+        out.append(bytes(blob))
+    return out
+
+
 def corpus():
     R = random.Random(18)
     paths = ['/usr/lib/a', '/usr/lib/../x', '/usr/lib//x', '/usr/libx', '/usr/local/a/b', '/private/var/dev/h', '/etc/x',
@@ -116,7 +230,7 @@ def corpus():
     out.append(hdr(1) + raw(1001, 0o644, 0, 0, 0, 0, b'/usr/lib/' + b'a' * 992) + b'\0' * 64)   # 1001-byte path with room
     out.append(hdr(4097) + b''.join(raw(len(p), 0o644, 0, 0, 0, 0, p) for _ in range(4097)))
     out.append(hdr(4096) + b''.join(raw(len(p), 0o644, 0, 0, 0, 0, p) for _ in range(4096)))
-    out.append(hdr(0xffffffff)); out.append(hdr(1, 2)); out.append(b'SWEETDEV'); out.append(b'')
+    out.append(hdr(0xffffffff)); out.append(hdr(1, 2)); out.append(hdr(1, 3)); out.append(b'SWEETDEV'); out.append(b'')
     good = m.pack([('/usr/lib/a', 0o644, 0, 0, b'abc')])
     out.append(good[:-1]); out.append(good[:-16]); out.append(good[:40])
     for q in paths:                                           # every path alone, with and without the final padding
@@ -133,12 +247,15 @@ def corpus():
         if R.random() < 0.2:
             blob += bytes(R.randrange(40))
         out.append(bytes(blob))
-    return out
+    return out + zcases()
 
 
 def run_c(exe, blobs):
     data = b''.join(struct.pack('<I', len(b)) + b for b in blobs)
-    r = subprocess.run([exe], input=data, capture_output=True, timeout=120)
+    try:
+        r = subprocess.run([exe], input=data, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:                         # a mutant that loops forever (e.g. no-progress inflate) counts as caught
+        return -1, [], "timeout"
     return r.returncode, r.stdout.decode('utf-8', 'surrogateescape').split('\n')[:-1], r.stderr.decode(errors='replace')[:400]
 
 
@@ -164,7 +281,19 @@ MUTANTS = [
     ('final padding check', 'if (off > len) {\n\t\treturn EINVAL;\n\t}\n\t*offp', '*offp'),
     ('count max', 'rd32(b + 12) > SD_MAXCOUNT', 'rd32(b + 12) > 0x7fffffffu'),
     ('header len', 'len < SD_HDR || ', ''),
-    ('version', 'rd32(b + 8) != SD_VERSION', '0'),
+    ('version', '(rd32(b + 8) != SD_VERSION && rd32(b + 8) != SD_VERSION2)', '0'),
+    # patch 0163: inflate driver and version 2 fields
+    ('v2 reserved', 'rd32(p + 36) != 0 || ', ''),
+    ('v2 flags', 'e->flags > SD_F_ZLIB', '0'),
+    ('v2 stored usize', '(e->flags == 0 && e->usize != e->size) || ', ''),
+    ('v2 usize cap', 'e->usize > SD_MAXUSIZE)', '0)'),
+    ('v2 total cap', 'total > SD_MAXUSIZE', 'total > SD_MAXUSIZE * 2'),
+    ('bomb cut-off', 'got > e->usize - out', '0'),
+    ('length check', 'if (out != e->usize) {', 'if (0) {'),
+    ('crc check', 'if (~c != e->crc) {', 'if (0) {'),
+    ('trailing data', 'in != e->size || z.avail_in != 0', '0'),
+    ('zlib error', 'if (zr != Z_OK && zr != Z_STREAM_END) {', 'if (zr < Z_BUF_ERROR) {'),
+    ('crc of inflated', 'c = sd_crc_upd(c, buf, got);', ''),
     ('control byte', 'c < 0x20 ||', 'c < 0x1f ||'),
     ('NAME slash', "memchr(out + pl, '/', n - pl)", '0'),
     ('dotdot', "len == 2 && out[comp + 1] == '.' && out[comp + 2] == '.'", '0'),

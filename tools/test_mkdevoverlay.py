@@ -51,7 +51,9 @@ class Rejects(unittest.TestCase):
             m.parse(blob)
 
     def test_magic(self): self.bad(b'SWEETDEX' + self.good[8:])
-    def test_version(self): self.bad(self.good[:8] + struct.pack('<I', 2) + self.good[12:])
+    def test_version(self):
+        self.bad(self.good[:8] + struct.pack('<I', 3) + self.good[12:])
+        self.bad(self.good[:8] + struct.pack('<I', 2) + self.good[12:])   # a v1 entry read with the 40-byte v2 header runs past the end
     def test_count_too_big(self): self.bad(self.good[:12] + struct.pack('<I', 5000) + self.good[16:])
     def test_count_past_end(self): self.bad(self.good[:12] + struct.pack('<I', 2) + self.good[16:])
     def test_truncated(self):
@@ -128,6 +130,61 @@ class Rejects(unittest.TestCase):
         d = tree({'usr/lib/a': b'x'})
         r = run(d, os.path.join(d, '..', 'o.bin'), '--owner', '501:501')
         self.assertEqual(r.returncode, 0); self.assertIn('WARNING', r.stderr)
+
+
+class Zlib(unittest.TestCase):
+    # Version 2 archives (xnu patch 0163): compressed entries, verified like the kernel sd_stream.
+    ents = [('/usr/lib/big', 0o755, 0, 0, b'abcd' * 5000), ('/usr/lib/small', 0o644, 0, 0, b'xy')]
+
+    def ent(self, body, usize, crc, flags=1, zero=0):
+        p = b'/usr/lib/z'
+        e = struct.pack('<HHIIIQQII', len(p), 0o644, 0, 0, crc, len(body), usize, flags, zero) + p
+        e += b'\0' * (-len(e) % 16) + body
+        return b'SWEETDEV' + struct.pack('<II', 2, 1) + e + b'\0' * (-len(e) % 16)
+
+    def test_unused_feature_keeps_v1_bytes(self):
+        a = m.pack(self.ents)
+        self.assertEqual(m.pack(self.ents, None), a)
+        self.assertEqual(m.pack(self.ents, 10 ** 9), a)            # nothing above the threshold: still version 1
+        self.assertEqual(struct.unpack_from('<I', a, 8)[0], 1)
+        incompressible = [('/usr/lib/r', 0o644, 0, 0, os.urandom(4000))]
+        self.assertEqual(m.pack(incompressible, 0), m.pack(incompressible))   # compression not smaller: stored, version 1
+
+    def test_round_trip(self):
+        blob = m.pack(self.ents, zlib_above=1000)
+        self.assertEqual(struct.unpack_from('<I', blob, 8)[0], 2)
+        self.assertLess(len(blob), 1000)
+        ents = m.parse(blob, with_usize=True)
+        self.assertEqual([(e[0], e[4], e[5], e[6]) for e in ents], [(p, d, True, len(d)) for p, _, _, _, d in self.ents])
+
+    def test_good_truncated_crc_bomb(self):
+        data = bytes(range(256)) * 40
+        z, crc = zlib.compress(data, 9), zlib.crc32(data)
+        self.assertTrue(m.parse(self.ent(z, len(data), crc))[0][5])
+        self.assertFalse(m.parse(self.ent(z[:-5], len(data), crc))[0][5])          # truncated stream
+        self.assertFalse(m.parse(self.ent(z, len(data), crc ^ 1))[0][5])           # wrong crc
+        self.assertFalse(m.parse(self.ent(z + b'X', len(data), crc))[0][5])        # data after the stream
+        self.assertFalse(m.parse(self.ent(z, len(data) - 1, crc))[0][5])
+        zb = zlib.compress(b'\0' * (4 << 20), 9)                                   # bomb: declared 100 bytes
+        e = m.parse(self.ent(zb, 100, zlib.crc32(b'\0' * 100)))[0]
+        self.assertFalse(e[5]); self.assertLessEqual(len(e[4]), 101)
+
+    def test_caps_and_fields(self):
+        z = zlib.compress(b'x', 9)
+        for blob in (self.ent(z, (40 << 20) + 1, 0), self.ent(z, 1, 0, flags=2), self.ent(z, 1, 0, zero=1),
+                     self.ent(b'abc', 4, 0, flags=0)):
+            with self.assertRaises(ValueError):
+                m.parse(blob)
+        with self.assertRaises(ValueError):
+            m.pack([('/usr/lib/a', 0o644, 0, 0, b'\0' * (21 << 20)), ('/usr/lib/b', 0o644, 0, 0, b'\0' * (20 << 20))], 0)
+
+    def test_cli_flag(self):
+        d = tree({'usr/lib/libx.dylib': b'x' * 100000, 'usr/local/bin/t': b'tt'})
+        o = os.path.join(d, '..', 'oz.bin')
+        r = run(d, o, '--zlib-above', '4096'); self.assertEqual(r.returncode, 0, r.stderr)
+        blob = open(o, 'rb').read()
+        self.assertLess(len(blob), 2000)
+        self.assertEqual([(e[0], len(e[4]), e[5]) for e in m.parse(blob)], [('/usr/lib/libx.dylib', 100000, True), ('/usr/local/bin/t', 2, True)])
 
 
 if __name__ == '__main__':

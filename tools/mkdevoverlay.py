@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack a directory into a SWEETDEV archive for the dev overlay (xnu patch 0117, bsd/dev/sweet_devoverlay.c).
 
-  tools/mkdevoverlay.py DIR OUT.bin [--owner UID:GID]
+  tools/mkdevoverlay.py DIR OUT.bin [--owner UID:GID] [--zlib-above BYTES]
 
 File DIR/usr/lib/x becomes /usr/lib/x on the phone. Only paths the kernel allowlist accepts are packed (anything
 else is an error, not a silent skip); symlinks are refused; total data is capped at 40 MiB. Output is deterministic
@@ -9,11 +9,17 @@ else is an error, not a silent skip); symlinks are refused; total data is capped
   header: "SWEETDEV" | u32 version=1 | u32 count
   entry (16-byte aligned): u16 pathlen | u16 mode | u32 uid | u32 gid | u32 crc32(data) | u64 size
                            | path | pad16 | data | pad16
+  version 2 (xnu patch 0163; written only when --zlib-above compresses some file, so archives without it are
+  byte-identical to before): entry header is 40 bytes, the 24 above with crc32 of the UNCOMPRESSED data and size =
+  stored length, then u64 usize | u32 flags (0 stored, 1 zlib) | u32 0; usize <= 40 MiB per entry and in total.
+  A zlib entry is valid only if the stream ends exactly at the end of the stored bytes, inflates to exactly usize
+  bytes and matches the crc (the kernel checks this before the rename).
 parse() / path_check() below are the Python twins of the kernel checks (used by the tests).
 """
 import argparse, os, stat, struct, sys, zlib
 
 MAGIC, VERSION, HDR, ENT = b'SWEETDEV', 1, 16, 24
+VERSION2, ENT2, F_ZLIB = 2, 40, 1
 MAX_COUNT, MAX_PATH, MAX_TOTAL = 4096, 1000, 40 << 20   # 40 MiB: the AVB boot image is 64 MiB and holds ~16 MiB already
 # (prefix, kind): D = directory prefix, X = exact path, N = file name prefix in one directory
 ALLOW = [('/usr/lib/', 'D'), ('/usr/local/', 'D'), ('/private/var/dev/', 'D'),
@@ -53,38 +59,67 @@ def _pad(n):
     return (n + 15) & ~15
 
 
-def pack(entries):
-    """entries: list of (path:str, mode, uid, gid, data) -> archive bytes."""
+def pack(entries, zlib_above=None):
+    """entries: list of (path:str, mode, uid, gid, data) -> archive bytes. zlib_above: compress (zlib level 9) every file
+    larger than this many bytes when that makes it smaller; if no file ends up compressed the archive is version 1,
+    byte-identical to what this function wrote before compression existed."""
     if len(entries) > MAX_COUNT:
         raise ValueError('too many files (%d > %d)' % (len(entries), MAX_COUNT))
-    out = bytearray(MAGIC + struct.pack('<II', VERSION, len(entries)))
+    stored = []
     for path, mode, uid, gid, data in entries:
+        z = zlib.compress(data, 9) if zlib_above is not None and len(data) > zlib_above else None
+        stored.append((z, F_ZLIB) if z is not None and len(z) < len(data) else (data, 0))
+    v2 = any(f for _, f in stored)
+    if v2 and sum(len(e[4]) for e in entries) > MAX_TOTAL:
+        raise ValueError('more than 40 MiB uncompressed')
+    out = bytearray(MAGIC + struct.pack('<II', VERSION2 if v2 else VERSION, len(entries)))
+    for (path, mode, uid, gid, data), (body, flags) in zip(entries, stored):
         pb = path.encode('utf-8', 'surrogateescape')
         if len(pb) > MAX_PATH:
             raise ValueError('path too long: ' + path)
-        out += struct.pack('<HHIIIQ', len(pb), mode, uid, gid, zlib.crc32(data) & 0xffffffff, len(data)) + pb
-        out += b'\0' * (_pad(len(out)) - len(out)) + data
+        out += struct.pack('<HHIIIQ', len(pb), mode, uid, gid, zlib.crc32(data) & 0xffffffff, len(body))
+        if v2:
+            out += struct.pack('<QII', len(data), flags, 0)
+        out += pb
+        out += b'\0' * (_pad(len(out)) - len(out)) + body
         out += b'\0' * (_pad(len(out)) - len(out))
     return bytes(out)
 
 
-def parse(buf):
-    """Validate exactly like the kernel; returns [(path, mode, uid, gid, data, crc_ok)] or raises ValueError (a bad crc only
-    flags that entry, as in the kernel)."""
+def _inflate(body, usize):
+    """Twin of the kernel's sd_stream for a zlib entry: (data, ok)."""
+    d = zlib.decompressobj()
+    try:
+        out = d.decompress(body, usize + 1)               # never more than usize + 1 bytes: a bomb stops here
+    except zlib.error:
+        return b'', False
+    return out, d.eof and not d.unused_data and not d.unconsumed_tail and len(out) == usize
+
+
+def parse(buf, with_usize=False):
+    """Validate exactly like the kernel; returns [(path, mode, uid, gid, data, crc_ok)] (+ usize if with_usize) or raises
+    ValueError (a bad crc or zlib stream only flags that entry, as in the kernel). data is the uncompressed bytes."""
     n = len(buf)
     if n < HDR or buf[:8] != MAGIC:
         raise ValueError('bad magic')
     ver, count = struct.unpack_from('<II', buf, 8)
-    if ver != VERSION:
+    if ver not in (VERSION, VERSION2):
         raise ValueError('bad version')
+    hl = ENT2 if ver == VERSION2 else ENT
     if count > MAX_COUNT:
         raise ValueError('bad count')
-    off, ents = HDR, []
+    off, ents, total = HDR, [], 0
     for i in range(count):
-        if off > n or n - off < ENT:
+        if off > n or n - off < hl:
             raise ValueError('truncated entry header')
         plen, mode, uid, gid, crc, size = struct.unpack_from('<HHIIIQ', buf, off)
-        off += ENT
+        usize, flags = size, 0
+        if ver == VERSION2:
+            usize, flags, zero = struct.unpack_from('<QII', buf, off + ENT)
+            if zero or flags > F_ZLIB or (flags == 0 and usize != size) or usize > MAX_TOTAL:
+                raise ValueError('bad version 2 entry fields')
+        total += usize
+        off += hl
         if plen == 0 or plen > MAX_PATH or plen > n - off:
             raise ValueError('bad pathlen')
         path = bytes(buf[off:off + plen])
@@ -95,7 +130,13 @@ def parse(buf):
         off = _pad(off + size)
         if off > n:
             raise ValueError('truncated padding')
-        ents.append((path.decode('utf-8', 'surrogateescape'), mode, uid, gid, data, zlib.crc32(data) & 0xffffffff == crc))
+        ok = True
+        if flags:
+            data, ok = _inflate(data, usize)
+        e = (path.decode('utf-8', 'surrogateescape'), mode, uid, gid, data, ok and zlib.crc32(data) & 0xffffffff == crc)
+        ents.append(e + (usize,) if with_usize else e)
+    if ver == VERSION2 and total > MAX_TOTAL:
+        raise ValueError('more than 40 MiB uncompressed')
     return ents
 
 
@@ -136,6 +177,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('dir'); ap.add_argument('out')
     ap.add_argument('--owner', default='0:0', help='UID:GID of every file (default 0:0)')
+    ap.add_argument('--zlib-above', type=int, metavar='BYTES',
+                    help='zlib-compress files larger than BYTES (needs kernel patch 0163; off: version 1 archive as before)')
     a = ap.parse_args()
     try:
         uid, gid = (int(x) for x in a.owner.split(':'))
@@ -148,12 +191,12 @@ def main():
     if not entries:
         sys.exit('mkdevoverlay: no files in %s' % a.dir)
     try:
-        blob = pack(entries)
+        blob = pack(entries, a.zlib_above)
         parse(blob)                                        # the packer's own output must pass the kernel checks
     except ValueError as e:
         sys.exit('mkdevoverlay: %s' % e)
     open(a.out, 'wb').write(blob)
-    print('mkdevoverlay: %d files, %d bytes -> %s' % (len(entries), len(blob), a.out))
+    print('mkdevoverlay: %d files, %d bytes (version %d) -> %s' % (len(entries), len(blob), struct.unpack_from('<I', blob, 8)[0], a.out))
 
 
 if __name__ == '__main__':

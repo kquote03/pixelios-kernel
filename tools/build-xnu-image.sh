@@ -17,6 +17,7 @@
 #   --wlanfw FILE  BCM4389 firmware container (tools/pack_wlanfw.py) appended to the payload as /chosen/memory-map WLANFW (needs --wlan-hold; xnu patch 0121 only checks it)
 #   --gpujob FILE  Mali job captures (tools/pack_gpujob.py) appended to the payload as /chosen/memory-map GPUJOB (needs --gpu-handover; replayed with boot-arg sweetmali bit 0x100, xnu patch 0155)
 #   --overlay DIR  dev overlay (docs/AUTOMATION.md): pack DIR with tools/mkdevoverlay.py, add it as the payload RAM disk and sweetdev=1 (xnu patch 0117)
+#                  (env SWEETDEV_ZLIB_ABOVE=BYTES: zlib-compress files above BYTES, archive version 2, needs xnu patch 0163)
 #   --board B    device codename (tools/pix devices); without --adt the ADT is generated for it with tools/mkadt.py
 #   --rw         ufsrw=1 rootrw=1 (UFS writes inside userdata, needed to initialise the HFS journal)
 # Never use --pstore-fast here: this bootloader silently rejects the lz4 image (docs/HANDOFF.md).
@@ -52,7 +53,7 @@ if [ "$dvfs" = read ]; then words="${words:+$words,}dvfsr"
 elif [ -n "$dvfs" ]; then words="${words:+$words,}dvfs"; dvfsarg=(--dvfs "$dvfs"); fi
 [ -z "$words" ] || railsarg=(--touch-probe="$words")
 p=$(mktemp /tmp/payload.XXXXXX.bin); ov=""; genadt=""; rdarg=(); trap 'rm -f "$p" "$ov" "$genadt"' EXIT
-if [ -n "$overlay" ]; then ov=$(mktemp /tmp/devoverlay.XXXXXX.bin); python3 -I tools/mkdevoverlay.py "$overlay" "$ov" >&2 || exit 2; rdarg=(--ramdisk "$ov"); fi
+if [ -n "$overlay" ]; then ov=$(mktemp /tmp/devoverlay.XXXXXX.bin); python3 -I tools/mkdevoverlay.py ${SWEETDEV_ZLIB_ABOVE:+--zlib-above "$SWEETDEV_ZLIB_ABOVE"} "$overlay" "$ov" >&2 || exit 2; rdarg=(--ramdisk "$ov"); fi
 args=$(python3 -I tools/mkpayload.py --board-cmdline "$board" "$args") || exit 2   # board.json xnu_bootargs_default (oriole touch recipe), shown in the report
 [ -z "${XNU_IMAGE_ARGS_ONLY:-}" ] || { echo "boot-args: $args"; exit 0; }   # test hook (tools/test_build_overlay_args.py)
 if [ "$adt_given" = 0 ]; then genadt=$(mktemp /tmp/adt.XXXXXX.adt); python3 -I tools/mkadt.py "$genadt" --board "$board" >/dev/null || exit 2; adt=$genadt; fi

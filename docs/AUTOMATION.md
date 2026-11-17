@@ -759,11 +759,25 @@ payload (kernel 15936688 B + overlay archive, `tools/mkpayload.py` size) boots a
 until the dylib shrinks by ~13 MB or the limit is found and moved (cause unread: the loader message goes to screen/pstore only [guess]).
 `llvm-strip` refuses the dylib (load command 0x1e); `__LINKEDIT` is only 2.03 MB, so stripping cannot close the gap [obs].
 | `ov-st1` | `/usr/local/bin/sweetgl_once` 0755 (`cf7a9376…`), `/usr/local/bin/sweetgl_selftest` 0755 (`67733d40…`), `/usr/local/lib/libsweetgl.dylib` 0755 (`f2b31a68…`), copies of `$A/gpu/out/` | 21056832 | 21057040 | `69ced5a3bf7c0a0cd3d97c51816d18356678125079e83a0d51ddcba9e9a18795` |
+| `ov-st1z` | same three files as `ov-st1` (2026-11-17); packed with `--zlib-above 1048576`: archive version 2, the dylib is a zlib stream of 4719242 B (from 20920496), the two binaries stay stored; needs xnu patch 0163 | 21056832 | 4855840 | `65a76f3fc7d61010a45decce1306b3604426b6ec166e82483f3a0b1be91b2171` |
 | `ov-st2` | `/System/Library/xpc/launchd.plist` 0644 = `tools/mk_launchd_job.py $A/gpu/g5/root-ro/launchd.plist OUT --sha256 7aab4ecb…` (523 -> 524 jobs; the job has no UserName key, launchd's default for a LaunchDaemon is root [guess]; file sha256 `7c764fd52774ca0dd3f471ceee565bc812a3f8069c03d023c857dde71d5b24a4`) | 792710 | 792800 | `011ac014b8ef063b65855b5da96920abb92587ccafd2646f16a04602d3adc904` |
 | `ov-st2orig` | `/System/Library/xpc/launchd.plist` 0644 = the root's own cache (`7aab4ecb…`): pre-check and restore read-back | 792460 | 792544 | `60fe4a3454ae976e1cb9fbf8dfa39fa2a4013f852087e6c33dd479bb938ec484` |
 
 All paths are inside the 0117 allowlist (`/private/var/dev/`, `/usr/local/`, exactly `/System/Library/xpc/launchd.plist`); every archive is under
 the 40 MiB cap; `mkdevoverlay.parse` reads all back with crc ok [obs]. The 24 MiB ramp covers `ov-st1` (21.06 MB archive), the largest RAM disk of G5.
+**ov-st1z (2026-11-17, PREPARED, UNRUN):** the way around the payload limit. Patch 0163 (on top of 0117) adds archive version 2: per entry
+the stored length, the uncompressed length (<= 40 MiB per entry and in total) and the crc32 of the uncompressed bytes; a zlib entry is inflated by the
+kernel's own zlib (`libkern/zlib.h`) in 1 MiB pieces into `<path>.sweettmp`, cut off at the declared length, and renamed only after the stream ended
+exactly at the stored length and length + crc match (else the tmp is removed, the target untouched, the entry `refused`); identical-skip compares the
+inflated bytes. Version 1 archives (every row above) are byte-identical and behave as before (`ov-st1` re-packs to `69ced5a3…` [obs]). Payload for
+g5-st0a with ov-st1z: kernel 16000992 + archive 4855840 + 80 = 20856912 B [calc, as ramp8: 24325456 = 15936688 + 8388688 + 80], under the
+24325456 B that booted. Kernel: `$A/xnu-local-g5z/kernel.development.sweet` (sha256 `5ef80d62…`), integrated `wip/oriole-next` (55b547d) + 0163,
+label `main`: it holds 0048, 0104/0105, 0117 and 0155 as the 63384af kernel did, the later patches are inert without their boot-args. Host tests:
+`tools/test_mkdevoverlay.py`, `tools/test_devoverlay_kernel.py` (sd_stream against host zlib: good, truncated, wrong crc, bomb, caps; 35 mutants caught) [obs].
+Runs: the same st order and expects as below, with `K=$A/xnu-local-g5z/kernel.development.sweet`, `--overlay $A/gpu/g5/ov-st1z` in place of
+`ov-st1` for st0a/st0b, and `SWEETDEV_ZLIB_ABOVE=1048576` in the environment of every `xrun` (build-xnu-image.sh then packs with `--zlib-above`;
+re-pack check: `tools/mkdevoverlay.py --zlib-above 1048576 $A/gpu/g5/ov-st1z OUT` = `65a76f3f…`). The `wrote`/`skipped` lines print the
+uncompressed size (20920496), so the st0a/st0b expects are unchanged. The ov-st2/st2orig archives stay version 1 (no file above 1 MiB).
 Boot-args of g5-st1b (args-only hook of build-xnu-image.sh, with xrun's `--rw` and remote/usblog args): 520 bytes of the 607-byte budget [obs review].
 
 ```bash
