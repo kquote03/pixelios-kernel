@@ -8,6 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PATCH = ROOT / "xnu/patches/0158-sweet-amp-init.patch"
 PATCH_A9 = ROOT / "xnu/patches/0166-aoc-audio.patch"	# patch 0166 (A9b) extends sweet_amp.h: its hunk is applied on top
 PATCH_PLAY = ROOT / "xnu/patches/0167-aoc-playback.patch"	# patch 0167 (sweetaoc=5) extends sweet_amp.h and sweet_audio.h again
+PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
 TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
@@ -138,7 +139,7 @@ def sweep(good: str, mutants, runner, d: pathlib.Path):
 
 def main() -> int:
     good = header_a9()
-    good_audio = apply(header("sweet_audio.h", PATCH_A9), "sweet_audio.h", [PATCH_PLAY])
+    good_audio = apply(header("sweet_audio.h", PATCH_A9), "sweet_audio.h", [PATCH_PLAY, PATCH_MATCH])
     with tempfile.TemporaryDirectory() as td:
         d = pathlib.Path(td)
         if not run(good, d) or not run_audio(good_audio, d):

@@ -6,7 +6,9 @@
  * a full DOWN queue (nothing written), counters corrupt.
  * Patch 0167 (sweetaoc=5): the play open (audio_playback0 ring zeroed + reset, EP_SETUP 206 and SOURCE 201 bytes), zero feeds (exact amount, cap,
  * wrap, push-ring doorbell), the close order (SOURCE on 0, then BIND2 0), each stop inside the play open (SOURCE rejected or unanswered: stop sent;
- * EP_SETUP or BIND2 rejected: no SOURCE, bind undone) and the refusals (queue type, size, window, counters, indexes, overlaps: no zero write). */
+ * EP_SETUP or BIND2 rejected: no SOURCE, bind undone) and the refusals (queue type, size, window, counters, indexes, overlaps: no zero write).
+ * Patch 0168: a reply with another id but type 0 and the sent length is accepted (stock never reads the id); EP_SETUP answered with id 288 as
+ * on the phone (run a9c): SOURCE on sent, then SOURCE off + BIND2 0. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +82,7 @@ peer(void)
 		if (mode == 2 && id == 233u) { uint8_t e[4] = { 0xEA, 0xFF, 0xFF, 0xFF }; up_push(e, 4); continue; }
 		if (mode == 1 && id == 271u && m[10] == 1u) { m[6] = 0xEA; m[7] = 0xFF; }
 		if (mode == 4) { m[4] = 0x99; }
+		if (mode == 9 && id == 206u) { m[4] = 0x20; m[5] = 0x01; }   /* id 288, as observed on hardware (run a9c) */
 		if (id == 233u) m[8] = 1u;      /* mode PLAYBACK */
 		up_push(m, mode == 5 ? len + 1u : len);
 	}
@@ -377,7 +380,7 @@ main(void)
 	t_stop(1, SWAU_E_REJECTED, 1, 3u, "BIND2 rejected (reply -22): stop, undo sent");
 	t_stop(2, SWAU_E_AOCERR, 0, 1u, "4-byte AOC error on GET_DSP_STATE: stop, no BIND2");
 	t_stop(3, SWAU_E_TIMEOUT, 0, 1u, "no reply: timeout after 500 ms, no BIND2");
-	t_stop(4, SWAU_E_UNKNOWN, 0, 1u, "reply with another id: unknown, stop");
+	t_stop(4, SWAU_OK, 1, 3u, "reply with another id, same type + length: accepted as stock (0168), bind undone on close");
 	t_stop(5, SWAU_E_UNKNOWN, 0, 1u, "reply of another length: unknown, stop");
 	t_refuse();
 	t_play_good(0x10000u);
@@ -385,6 +388,7 @@ main(void)
 	t_play_stop(7, SWAU_E_REJECTED, 1u, 6u, "SOURCE on rejected: stop, SOURCE off + BIND2 0 sent");
 	t_play_stop(6, SWAU_E_TIMEOUT, 1u, 6u, "SOURCE on unanswered (500 ms): stop, SOURCE off + BIND2 0 sent");
 	t_play_stop(8, SWAU_E_REJECTED, 0u, 4u, "EP_SETUP rejected: no SOURCE, BIND2 0 sent");
+	t_play_stop(9, SWAU_OK, 1u, 6u, "EP_SETUP answered with id 288 (run a9c): accepted, SOURCE on sent, then SOURCE off + BIND2 0");
 	t_play_stop(1, SWAU_E_REJECTED, 0u, 3u, "BIND2 rejected in the play open: no EP_SETUP, BIND2 0 sent");
 	t_play_refuse();
 	t_parser_synthetic();

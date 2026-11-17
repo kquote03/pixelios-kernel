@@ -627,14 +627,14 @@ else
 	# a 4th field names a later patch whose hunk for the same file is applied on top (0165 extends sweet_tipc.h); 0165 adds the A8 start (bsd/dev/sweet_aoc_start.h)
 	# 0166 (A9) changes sweet_aoc_start.h (the ssmt kept count) and adds sweet_audio.h (AOC queue I/O + commands) and sweet_cs_dsp.h (HALO file parser, read by aoc_audio_host_test)
 	awk '$0=="+++ b/bsd/dev/sweet_cs_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0166-aoc-audio.patch > $O/sweet_cs_dsp.h
-	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test:0165-aoc-start" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0165-aoc-start:sweet_aoc_start.h:aoc_start_host_test:0166-aoc-audio" "0166-aoc-audio:sweet_audio.h:aoc_audio_host_test:0167-aoc-playback"; do
+	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test:0165-aoc-start" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0165-aoc-start:sweet_aoc_start.h:aoc_start_host_test:0166-aoc-audio" "0166-aoc-audio:sweet_audio.h:aoc_audio_host_test:0167-aoc-playback+0168-aoc-reply-match"; do
 		IFS=: read -r hpp hph hpt hpx <<<"$hp"
 		awk -v f="+++ b/bsd/dev/$hph" '$0==f{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/$hpp.patch > $O/$hph
-		if [ -n "$hpx" ]; then
+		for px in ${hpx//+/ }; do     # several later patches joined by + are applied in order (0168 ../xnu/patches/0168-aoc-reply-match.patch on top of 0167)
 			rm -rf $O/hpx && mkdir -p $O/hpx/bsd/dev && cp $O/$hph $O/hpx/bsd/dev/$hph
-			awk -v f="diff --git a/bsd/dev/$hph b/bsd/dev/$hph" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$hpx.patch > $O/hpx/p.diff
-			chk "$hpt: $hpx applied to $hph" sh -c "cd $O/hpx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/$hph ../$hph"
-		fi
+			awk -v f="diff --git a/bsd/dev/$hph b/bsd/dev/$hph" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$px.patch > $O/hpx/p.diff
+			chk "$hpt: $px applied to $hph" sh -c "cd $O/hpx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/$hph ../$hph"
+		done
 		chk "$hpt (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/$hpt $hpt.c
 		chk "$hpt" $O/$hpt
 		chk "${hpt}_asan (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/${hpt}_asan $hpt.c

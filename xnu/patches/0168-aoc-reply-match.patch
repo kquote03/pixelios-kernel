@@ -1,0 +1,32 @@
+SWEET AUDIO REPLY MATCH (patch 0168, plan A9 continued), on top of 0166/0167. Reply matching only: swau_cmd (bsd/dev/sweet_audio.h) no longer
+compares the reply id with the command id, as stock aoc_audio_control (google-modules/aoc ac69293 alsa/aoc_alsa_hw.c:196-311) never reads it.
+Observed on hardware (run a9c, 2026-11-17): EP_SETUP 206 (28 bytes) was answered by a 28-byte type-0 message with id 288, reply 0; 0167 stopped
+with rc 10 (unknown-reply) and never sent SOURCE. Still required: type 0, length == the sent length, reply 0; a 4-byte message is still an AOC
+error; every wait unchanged. No command, id or payload byte changes. Host test: shim/aoc_audio_host_test.c. BUILT, UNRUN.
+
+diff --git a/bsd/dev/sweet_audio.h b/bsd/dev/sweet_audio.h
+--- a/bsd/dev/sweet_audio.h
++++ b/bsd/dev/sweet_audio.h
+@@ -52,6 +52,9 @@
+  *   undo, on every path after a SOURCE on = 1 was written: SOURCE source 0 on = 0 (trigger STOP :2711-2727), then the 0166 BIND2 bind = 0.
+  * Not sent (the stock playback path never sends them): CMD_AUDIO_OUTPUT_SINK 200 / SINK2 270 (SINK2 only from a mixer control,
+  * alsa:aoc_alsa_ctl.c:1724), no TDM / BE command (be_prepare alsa:aoc_alsa_path.c:960-990 sends nothing for TDM_0_RX), no gain.
++ *
++ * Patch 0168: reply matching only (swau_cmd); no command, id or payload byte changes. The reply id is no longer compared with the
++ * command id, as in stock (see swau_cmd).
+  */
+ #ifndef SWEET_AUDIO_H
+ #define SWEET_AUDIO_H
+@@ -361,7 +364,11 @@
+ 	x->reply_id = (uint16_t)(rb[4] | rb[5] << 8);
+ 	x->reply = (int16_t)(uint16_t)(rb[6] | rb[7] << 8);
+ 	x->payload0 = rl > 8u ? rb[8] : 0u;
+-	if (x->reply_type != 0u || x->reply_id != x->id || rl != len) {
++	/* patch 0168: the reply id is NOT compared. Stock aoc_audio_control (alsa:aoc_alsa_hw.c:196-311) drains, writes, then takes the next
++	 * message of >= 1 byte as the reply without reading its id (it copies cmd_size bytes only when the caller asks, :301-302; EP_SETUP
++	 * passes NULL, :1800-1801). Observed on hardware (run a9c, 2026-11-17): EP_SETUP 206 answered by a 28-byte type-0 message with id 288.
++	 * Kept stricter than stock: type 0 and the sent length (an echo of the command), and reply 0. */
++	if (x->reply_type != 0u || rl != len) {
+ 		return x->rc = SWAU_E_UNKNOWN;
+ 	}
+ 	if (x->reply != 0) {
