@@ -623,8 +623,8 @@ else
 	chk "trusty_host_test" $O/trusty_host_test
 	chk "trusty_asan_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/trusty_asan_host_test trusty_host_test.c
 	chk "trusty_asan_host_test" $O/trusty_asan_host_test
-	# AOC pre-load probe of xnu patch 0161 (bsd/dev/sweet_aoc.h, reads only) and Trusty TIPC GET_STATE of patch 0162 (bsd/dev/sweet_tipc.h) against fakes
-	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test"; do
+	# AOC pre-load probe of xnu patch 0161 (bsd/dev/sweet_aoc.h, reads only), Trusty TIPC GET_STATE of patch 0162 (bsd/dev/sweet_tipc.h) and the AOC firmware load of patch 0164 (bsd/dev/sweet_aoc_load.h) against fakes
+	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test"; do
 		IFS=: read -r hpp hph hpt <<<"$hp"
 		awk -v f="+++ b/bsd/dev/$hph" '$0==f{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/$hpp.patch > $O/$hph
 		chk "$hpt (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/$hpt $hpt.c

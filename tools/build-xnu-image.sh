@@ -16,6 +16,7 @@
 #   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, private notes) and boot-arg sweetwlan=1 (xnu patch 0124: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
 #   --wlanfw FILE  BCM4389 firmware container (tools/pack_wlanfw.py) appended to the payload as /chosen/memory-map WLANFW (needs --wlan-hold; xnu patch 0121 only checks it)
 #   --gpujob FILE  Mali job captures (tools/pack_gpujob.py) appended to the payload as /chosen/memory-map GPUJOB (needs --gpu-handover; replayed with boot-arg sweetmali bit 0x100, xnu patch 0155)
+#   --aocfw FILE   stock aoc.bin zlib container (tools/pack_aocfw.py) appended to the payload as /chosen/memory-map AOCFW (used with boot-arg sweetaoc=2, xnu patch 0164)
 #   --overlay DIR  dev overlay (docs/AUTOMATION.md): pack DIR with tools/mkdevoverlay.py, add it as the payload RAM disk and sweetdev=1 (xnu patch 0117)
 #                  (env SWEETDEV_ZLIB_ABOVE=BYTES: zlib-compress files above BYTES, archive version 2, needs xnu patch 0163)
 #   --board B    device codename (tools/pix devices); without --adt the ADT is generated for it with tools/mkadt.py
@@ -24,10 +25,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
-kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; dvfs=""; restart=""; cpus=1; extra=""; out=""; overlay=""; wlanfw=""; gpujob=""; wlan=0; wlanlvl=1; board=""; adt_given=0
+kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; dvfs=""; restart=""; cpus=1; extra=""; out=""; overlay=""; wlanfw=""; gpujob=""; aocfw=""; wlan=0; wlanlvl=1; board=""; adt_given=0
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; adt_given=1; shift 2 ;; --board) board=$2; shift 2 ;; --qr) qr=$2; shift 2 ;;
-	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --wlan-hold) wlan=1; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --gpu-handover) handover=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --wlanfw) wlanfw=$2; shift 2 ;; --gpujob) gpujob=$2; shift 2 ;;
+	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --wlan-hold) wlan=1; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --gpu-handover) handover=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --wlanfw) wlanfw=$2; shift 2 ;; --gpujob) gpujob=$2; shift 2 ;; --aocfw) aocfw=$2; shift 2 ;;
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
 export BOARD=${board:-${BOARD:-}}; board=$(python3 -I tools/boards.py --target) || exit 2
 [ -z "$wlanfw" ] || [ "$wlan" = 1 ] || { echo "--wlanfw needs --wlan-hold" >&2; exit 2; }
@@ -57,7 +58,7 @@ if [ -n "$overlay" ]; then ov=$(mktemp /tmp/devoverlay.XXXXXX.bin); python3 -I t
 args=$(python3 -I tools/mkpayload.py --board-cmdline "$board" "$args") || exit 2   # board.json xnu_bootargs_default (oriole touch recipe), shown in the report
 [ -z "${XNU_IMAGE_ARGS_ONLY:-}" ] || { echo "boot-args: $args"; exit 0; }   # test hook (tools/test_build_overlay_args.py)
 if [ "$adt_given" = 0 ]; then genadt=$(mktemp /tmp/adt.XXXXXX.adt); python3 -I tools/mkadt.py "$genadt" --board "$board" >/dev/null || exit 2; adt=$genadt; fi
-python3 -I tools/mkpayload.py "$kernel" "$adt" "$p" --board "$board" --cmdline "$args" "${rdarg[@]}" ${wlanfw:+--wlanfw "$wlanfw"} ${gpujob:+--gpujob "$gpujob"} >/dev/null
+python3 -I tools/mkpayload.py "$kernel" "$adt" "$p" --board "$board" --cmdline "$args" "${rdarg[@]}" ${wlanfw:+--wlanfw "$wlanfw"} ${gpujob:+--gpujob "$gpujob"} ${aocfw:+--aocfw "$aocfw"} >/dev/null
 META_ARGS="$args" XNU_UFS=1 shim/build.sh --board "$board" --avb --boot-xnu "$p" "${railsarg[@]}" "${dvfsarg[@]}" "${hoarg[@]}" >/dev/null
 [ -z "$out" ] || cp shim/out/shim-boot-avb.img "$out"
 echo "boot-args: $args"; echo "image: ${out:-shim/out/shim-boot-avb.img}"
