@@ -26,6 +26,8 @@ static uint8_t chunk[5000];
 static struct { int w; uint32_t off, v; } wl[MAXW];
 static int nw, nreads, gsa_mode, gsa_err, corrupt, flushed, synced, flushed_at_bell, synced_at_bell, bell_ok, hdr_ok_at_bell;
 static uint64_t cwrites, cwrite_bytes, cwrite_max;
+static int mapped, maps, unmaps, map_fail, probe_bad, hdr_prog, unmapped_at_bell;
+static uint64_t map_len;
 
 static int
 f_open(void *c) { (void)c; pos = 0; return 0; }
@@ -77,6 +79,7 @@ f_w32(void *c, int w, uint32_t off, uint32_t v)
 		bell_ok = g[SWAL_SR(0) / 4] == 90u && g[SWAL_SR(1) / 4] == 4u && g[SWAL_SR(2) / 4] == 0x8a0000000ull % (1ull << 32) &&
 		    g[SWAL_SR(3) / 4] == 8u && g[SWAL_SR(4) / 4] == 0x94000000u && g[SWAL_SR(5) / 4] == 0u && !(g[SWAL_INTMR0 / 4] & 1u);
 		flushed_at_bell = flushed;
+		unmapped_at_bell = !mapped && unmaps == 1;
 		synced_at_bell = synced;
 		hdr_ok_at_bell = memcmp(hdrbuf, img, 4096) == 0 && memcmp(carve, img + 4096, img_len - 4096) == 0;
 		if (gsa_mode != GSA_SILENT) {
@@ -93,10 +96,34 @@ f_w32(void *c, int w, uint32_t off, uint32_t v)
 static uint64_t carve_len_cfg;
 
 static int
+f_map(void *c, uint64_t len)
+{
+	(void)c;
+	if (mapped || map_fail) {
+		return 0;
+	}
+	mapped = 1;
+	maps++;
+	map_len = len;
+	return 1;
+}
+
+static void f_unmap(void *c) { (void)c; if (mapped) { unmaps++; } mapped = 0; }
+
+static void
+f_prog(void *c, const char *w, uint64_t a, uint64_t b)
+{
+	(void)c; (void)a; (void)b;
+	if (strncmp(w, "header buffer written", 21) == 0) {
+		hdr_prog++;
+	}
+}
+
+static int
 f_cw(void *c, uint64_t off, const uint8_t *p, uint32_t n)
 {
 	(void)c;
-	if (off + n > carve_len_cfg || off + n > sizeof(carve)) {
+	if (!mapped || off + n > map_len || off + n > carve_len_cfg || off + n > sizeof(carve)) {
 		fails++;
 		printf("FAIL carveout write outside %#llx+%u\n", (unsigned long long)off, n);
 		return 0;
@@ -118,7 +145,15 @@ f_cr(void *c, uint64_t off, uint8_t *p, uint32_t n)
 		return 0;
 	}
 	memcpy(p, carve + off, n);
-	if (corrupt && off == 0) {
+	if (!mapped) {
+		fails++;
+		printf("FAIL carveout read while unmapped\n");
+		return 0;
+	}
+	if (probe_bad && off == 0 && n == 4) {
+		p[0] ^= 1;
+	}
+	if (corrupt && off == 0 && n > 100) {
 		p[100] ^= 1;
 	}
 	return 1;
@@ -174,9 +209,10 @@ run(int mode, uint32_t req0, uint32_t pmu, uint64_t carve_len, const uint8_t *sh
 	win[SWAL_W_GSA][SWAL_INTMR0 / 4] = 0xFFFF;               /* gsa_mbox.c:234-235 init state */
 	nw = nreads = 0; cwrites = cwrite_bytes = cwrite_max = 0; flushed = synced = 0; bell_ok = -1; slept = 0;
 	flushed_at_bell = synced_at_bell = hdr_ok_at_bell = -1;
+	mapped = maps = unmaps = hdr_prog = 0; map_len = 0; unmapped_at_bell = -1;
 	gsa_mode = mode;
 	carve_len_cfg = carve_len;
-	bus = (struct swal_bus){ f_open, f_next, f_r32, f_w32, f_cw, f_cr, f_sync, f_flush, f_sleep, f_say, hdrbuf, 0x8a0000000ull,
+	bus = (struct swal_bus){ f_open, f_next, f_r32, f_w32, f_cw, f_cr, f_map, f_unmap, f_prog, f_sync, f_flush, f_sleep, f_say, hdrbuf, 0x8a0000000ull,
 		                 chunk, sizeof(chunk), carve_len, IMG_LEN, sha, 0 };
 	return swal_run(&bus, &res);
 }
@@ -287,8 +323,10 @@ main(void)
 	rc = run(GSA_OK, 1, 1, 0x40000, idsha);
 	CHECK(rc == SWAL_OK && res.stage == SWAL_OK, "good: rc %d", rc);
 	CHECK(nw == 12 && is_w(0, 1, 0, 1) && gsa_seq(1) && is_w(10, 2, 0x24, 1) && is_w(11, 2, 0x28, 0xFFFF), "good: writes (%d)", nw);
-	CHECK(bell_ok == 1 && flushed_at_bell == 1 && synced_at_bell == 1 && hdr_ok_at_bell == 1, "good: state at the doorbell");
-	CHECK(cwrite_bytes == IMG_LEN - 4096 && cwrite_max == IMG_LEN - 4096, "good: carveout bytes %llu", (unsigned long long)cwrite_bytes);
+	CHECK(bell_ok == 1 && flushed_at_bell == 1 && synced_at_bell == 2 && hdr_ok_at_bell == 1, "good: state at the doorbell");
+	CHECK(cwrite_bytes == IMG_LEN - 4096 + 4 && cwrite_max == IMG_LEN - 4096, "good: carveout bytes %llu", (unsigned long long)cwrite_bytes);
+	CHECK(maps == 1 && map_len == IMG_LEN - 4096 && unmapped_at_bell == 1 && unmaps == 1 && hdr_prog == 1, "good: map %d len %llu unmapped at bell %d hdr prog %d",
+	    maps, (unsigned long long)map_len, unmapped_at_bell, hdr_prog);
 	CHECK(res.len1 == IMG_LEN && res.len2 == IMG_LEN && res.req_found == 1 && res.rsp_err == 0 && res.auth_gen == 1 &&
 	    res.sb_image_size == 0x01400000u, "good: results");
 
@@ -345,6 +383,23 @@ main(void)
 	corrupt = 1;
 	rc = run(GSA_OK, 0, 1, 0x40000, idsha);
 	CHECK(rc == SWAL_E_READBACK && nw == 2 && is_w(0, 1, 0, 1) && is_w(1, 1, 0, 0), "readback: rc %d nw %d", rc, nw);
+	corrupt = 0;
+
+	/* 6b. carveout map fails: no carveout write, no GSA write, aoc_req restored when found 0 */
+	map_fail = 1;
+	rc = run(GSA_OK, 0, 1, 0x40000, idsha);
+	CHECK(rc == SWAL_E_MAP && nw == 2 && is_w(1, 1, 0, 0) && cwrites == 0, "map fail: rc %d nw %d", rc, nw);
+	map_fail = 0;
+	/* 6c. the one probe word reads back wrong: one 4-byte write, then unmapped, no GSA write */
+	probe_bad = 1;
+	rc = run(GSA_OK, 1, 1, 0x40000, idsha);
+	CHECK(rc == SWAL_E_PROBE && nw == 1 && cwrites == 1 && cwrite_bytes == 4 && unmaps == 1 && !mapped, "probe: rc %d nw %d cw %llu", rc, nw,
+	    (unsigned long long)cwrites);
+	probe_bad = 0;
+	/* 6d. every stop after the map leaves it unmapped */
+	corrupt = 1;
+	run(GSA_OK, 1, 1, 0x40000, idsha);
+	CHECK(!mapped && unmaps == 1, "readback stop leaves the carveout mapped");
 	corrupt = 0;
 
 	/* 7. GSA error codes: the full sequence once, the stock post-response clear/mask, then nothing */
