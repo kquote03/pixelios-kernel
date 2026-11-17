@@ -397,3 +397,51 @@ Same commands as 11.3 (ninja -j4 under `heavy.lock`, 0 compiler warnings in the 
 2. Dirty tracking assumes CA leaves or flushes the FBO it drew to; a surface drawn and handed on without a bind/flush/fence is not copied.
 3. w30r bit order is from the header comment by analogy with 'l10r' (no device check yet); fmt 0x0 surfaces are unidentified until the new log line.
 4. The take-back still lets two threads alternate one context (as before); safe only if CA serialises them.
+
+## 13. G6-b follow-up: why only one frame (2026-11-17, host only; nothing ran on the phone)
+
+Input: run `20261117T122415Z-g6-b` [obs]: 0 skipped calls, w30r copy fallback active, `SWEET FPS: swaps 6 distinct 1`, no lock screen.
+
+### 13.1 What CA was doing [obs log]
+* CA was **not stalled on a fence**: it kept swapping (`SWEET FB: swap 1 .. 44+`, layer 0, alternating **surface 2 and 3**). Both are the
+  scanout buffers, created by backboardd as `fmt 0x62336138 ('b3a8') bpe 4 bpr 4544 planes 2 size 13893632` (`SWEET SURF`), and both were
+  **refused at attachImage** (`'b3a8' 1125x2436: no import and no copy conversion`). So every swap shows buffers CA could never render into:
+  one distinct frame. The w30r surfaces (48, 50, 54; SpringBoard creates w30r too) are layer/backing stores, not the scanout.
+* Thread samples (`SMP backboardd t*`, slide 0x36a6c000, symbolised against `$A/gpu/dsc/cache` with gli_slots.py's cache reader): the
+  waiting threads sit in `___ulock_wait` / `_semaphore_timedwait_trap` under libdispatch, CFRunLoopRun and QuartzCore frames (names `<redacted>`);
+  none is inside libsweetgl or a GL call.
+* Second cause, independent of the scanout: slots 591 595 596 598 599 600 625 630 were called and returned 0. By Apple's `GLIFunctionDispatch`
+  member order (`MacOSX14.0.sdk/.../OpenGL.framework/Headers/gliDispatch.h`; index = slot, it reproduces every cited slot: 98 gen_textures,
+  104 get_integerv, 117 get_string, 463 gen_fences_APPLE, 470 finish_object_APPLE, 594 create_shader_object_ARB, 597 create_program_object_ARB,
+  672 bind_framebuffer_EXT, 779 fence_sync, 781 delete_sync; 323 of 336 thunk-named slots < 968 agree, the 13 others are aliases or the
+  iOS-only tail >= 968) they are **DeleteObjectARB, ShaderSourceARB, CompileShaderARB, AttachObjectARB, LinkProgramARB, UseProgramObjectARB,
+  GetUniformLocationARB, BindAttribLocationARB**: CA's shaders were never given source, compiled, linked or used [src header + obs log].
+
+### 13.2 Changes (Mesa patch 0008 `gpu/mesa-patches/0008-sweetgl-apple-fence-ca-format-upload-slot-args.patch`, on 0007)
+* Map `$A/gpu/gli-slots.txt` (sha256 `12e23dc9…`, previous kept as `gli-slots.g6b.txt`): slots 591-633 missing from the thunk map added from
+  `gliDispatch.h` (22 lines, tagged `# gliDispatch.h member ...`); the shim's existing ARB specials (doc 52 s.11.5) now get called; the others
+  resolve by suffix strip; 593 DetachObjectARB, 621 GetObjectParameterfvARB, 633 ClampColorARB stay traps.
+* GL_APPLE_fence (`sweetgl_fence.h`) over ES 3 sync objects, semantics quoted from the Khronos registry `APPLE_fence.txt` s.5.X/6.1.11: a name
+  never set tests TRUE and does not block, SetFence = new `glFenceSync`, TestFence = `glClientWaitSync(FLUSH, 0)`, FinishFence bounded at 2 s
+  (then logged, reported done), IsFence only after Set, unused names ignored on delete; `Test/FinishObjectAPPLE(GL_FENCE_APPLE 0x8A0B)` forward.
+  SetFence also writes the copy-fallback surfaces (hand-off point, like FenceSync).
+* `glVertexAttrib{1..4}f[v]`, `glVertexAttribI4i`: the lookup now also tries the name + `ARB`/`EXT` (Mesa's dispatch.h names
+  `VertexAttrib1fARB`, `VertexAttribI4iEXT`); `glMultiTexCoord4f` (ES 1 only): no-op, logged once. Unmapped slots log x1..x4 once.
+* Surfaces [obs g6-b: which ones reached attachImage vs only texImageIOSurface]:
+  - render targets: 'w30r' copy fallback (s.12); fmt 0x0 bpe 4 one plane (97x76, 101x101, 103x103): copy fallback as **BGRA8 [guess]**
+    (no format is stored; logged with "BGRA8 assumed").
+  - texture sources only (fmt 0x0 600x600, 1105x1160, 375x812, 1380x1812 bpe 4; 256x1 bpe 2; 'LA08' bpe 2): uploaded from the locked surface
+    with CA's own (internalFormat, format, type) from texImageIOSurface, accepted only if the format/type size equals bytes per element and
+    divides bytes per row (`sgl_upload_params`; unsized internal = format for byte/packed types as ES requires); logged once per shape with
+    CA's enums.
+  - **'b3a8' stays refused**: not defined in the iOS 16.5 SDK headers (CoreVideo/IOSurface/Metal searched) [obs]; its plane layout
+    (per-plane size, bpr, bpe, offset) is now logged once. This is the scanout format, so the screen stays unchanged until it is identified
+    (next: the plane log, or RE of CA's CPU-renderer writer for 'b3a8').
+* Host test 44/44 PASS (adds upload parameters for the g6-b shapes and the fence table: never-set TRUE, set FALSE until signalled, re-set,
+  delete, table full).
+
+### 13.3 Build [obs]
+ninja -j4 under `heavy.lock`, no compiler warnings, `check-sdk-symbols.py` PASS. `$A/gpu/out/libsweetgl.dylib` 20940832 B, sha256
+`d3ebb69f3e0dc5343c644b753aba1ea50396334a3936231694598e09b49f30d0` (g6-b build kept in `$A/gpu/out/g6b-prev/`). Overlay `$A/gpu/g5/ov-g6c`:
+dylib 0755 + `/usr/local/gli-slots.txt` 0644; archive (`--zlib-above 1048576`) 4740720 B, sha256
+`02fb5a1db8b0e6872eed76ea9c81404ba739d72f08f4b604b30c284f83b54978` (re-pack identical).

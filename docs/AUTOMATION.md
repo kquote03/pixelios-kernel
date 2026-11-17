@@ -855,6 +855,12 @@ context take-back fix). Send with `SWEETDEV_ZLIB_ABOVE=1048576`: `tools/mkdevove
 (< 8 MB), sha256 `ca2e3a5536fb1cd60ed4b7456b624bab5db5af6a18fa2a86e2d9b84a08869bbb` [obs, re-pack identical]. Boot-args as g6-a (the GLI map
 stays at `/usr/local/gli-slots.txt` from `ov-g6map`). Expect in backboardd: no `without a usable context` flood; `copy fallback` once per w30r
 shape; one `not importable ... planes` line per fmt 0x0/b3a8/LA08 shape.
+### G6-b fix overlay `ov-g6c` (2026-11-17, PREPARED, UNRUN; docs/research/52 s.13)
+`$A/gpu/g5/ov-g6c`: `/usr/local/lib/libsweetgl.dylib` 0755 (20940832 B, sha256 `d3ebb69f…`, Mesa patch 0008: APPLE_fence, CA-format uploads,
+shader-object slots 591-633 named) and `/usr/local/gli-slots.txt` 0644 (sha256 `12e23dc9…`). Send with `SWEETDEV_ZLIB_ABOVE=1048576`:
+`tools/mkdevoverlay.py --zlib-above 1048576 $A/gpu/g5/ov-g6c OUT` = 4740720 B (< 8 MB), sha256
+`02fb5a1db8b0e6872eed76ea9c81404ba739d72f08f4b604b30c284f83b54978` [obs, re-pack identical]. Boot-args as g6-b. Expect: no `slot 595/596/599`
+trap lines, one `plane N` line pair for 'b3a8'; the scanout ('b3a8') is still refused, so the screen is not expected to change yet.
 ## XNU `sweettrusty=1`: Trusty version probe (patch 0156, plan step A3)
 
 Two version fastcalls only (`SMC_FC_GET_VERSION_STR`, `SMC_FC_API_VERSION` with 5), as the stock driver's probe does first; no std-call, no
