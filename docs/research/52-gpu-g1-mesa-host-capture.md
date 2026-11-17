@@ -445,3 +445,27 @@ ninja -j4 under `heavy.lock`, no compiler warnings, `check-sdk-symbols.py` PASS.
 `d3ebb69f3e0dc5343c644b753aba1ea50396334a3936231694598e09b49f30d0` (g6-b build kept in `$A/gpu/out/g6b-prev/`). Overlay `$A/gpu/g5/ov-g6c`:
 dylib 0755 + `/usr/local/gli-slots.txt` 0644; archive (`--zlib-above 1048576`) 4740720 B, sha256
 `02fb5a1db8b0e6872eed76ea9c81404ba739d72f08f4b604b30c284f83b54978` (re-pack identical).
+
+## 14. G6-c follow-up: 'b3a8' scanout copy fallback (2026-11-17, host only; nothing ran on the phone)
+
+Input: run g6-c [obs]: shaders compile, 405 slots mapped, 8 jobs, no faults, small fmt-0 targets on the copy fallback, still 1 distinct frame:
+the scanout surfaces 2/3 are 'b3a8'. Logged layout: `plane 0: 1125x2436 bpr 0 bpe 4 offset 0x0`, `plane 1: 1125x2436 bpr 0 bpe 1 offset 0xa8f000`;
+surface bpr 4544, alloc 13893632.
+* The `bpr 0` came from `IOSurfaceGetBytesPerRowOfPlane` (the API, not the plane dictionary) [src 0008 log_planes_once]. Cross-check [calc]:
+  4544 x 2436 = 11069184 = 0xa8e800, rounded up to 4 KiB = 0xa8f000 = plane-1 offset; (13893632 - 0xa8f000) / 2436 = 1158 -> 1152 at 64-byte
+  alignment, >= 1125; plane 1 ends at 0xa8f000 + 1152 x 2435 + 1125 = 13877733 <= alloc.
+* **ASSUMPTION** (the format is not in the SDK headers): plane 0 = 4-byte 10-bit pixels encoded like 'w30r' (XR 384..895, B in bits 9:0,
+  R in 29:20), plane 1 = 8-bit alpha. Basis: the FourCC ('b3' next to 'w30r'/'l10r' naming, 'a8') and the per-plane bytes per element 4 / 1.
+  Worst case: wrong colours on a tethered boot. The shim logs the assumption with the layout once per shape.
+* Copy fallback (patch 0009 `gpu/mesa-patches/0009-sweetgl-b3a8-two-plane-copy-fallback.patch`): CA's texture gets a GPU `GL_RGBA8` buffer
+  (8-bit alpha; RGB10_A2 has 2 alpha bits); on Flush/FinishObjectAPPLE/FenceSync/SetFenceAPPLE it is read back and written: colour 8 -> 10
+  bits by bit replication, then XR, into plane 0 with its bpr; alpha into plane 1 with its bpr. Plane bpr: the API value if it covers the row,
+  else plane 0 = surface bpr (4544), plane 1 = (alloc - offset) / height & ~63 (1152, logged as "derived"). Refused (logged) unless both
+  planes have bpe 4 / 1, fit inside the alloc size and do not overlap; the copy also re-checks the alloc size. `attachImage` carries no internal
+  format (it has only the texture and the surface, doc 33 s.2.1), so there is no CA format to contradict this.
+* Host test 60/60 PASS (cc -fsanitize=address,undefined): plane-1 offset rule, bpr derivation (1152, API wins, refusal when it does not cover
+  the width), full 1125x2436 write with 64 guard bytes past alloc untouched, last plane-0 pixel and last alpha byte, row padding untouched,
+  exact-fit accepted, one byte short / overlapping planes / plane past alloc refused with nothing written.
+* Build [obs]: no compiler warnings, check-sdk-symbols PASS; `libsweetgl.dylib` 20940976 B, sha256
+  `82c4ebf8455245cceb7f196b1176793c14c5bc5df1435799955f0caadd433b7c` (g6-c build in `$A/gpu/out/g6c-prev/`).
+  Overlay `$A/gpu/g5/ov-g6d` (dylib only, 0755): archive 4729968 B, sha256 `edd73fc9f84da1e2b0fd8d38cac707bde1f380e0ac200643a1bef402ce175848`.

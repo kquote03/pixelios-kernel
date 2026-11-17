@@ -861,6 +861,12 @@ shader-object slots 591-633 named) and `/usr/local/gli-slots.txt` 0644 (sha256 `
 `tools/mkdevoverlay.py --zlib-above 1048576 $A/gpu/g5/ov-g6c OUT` = 4740720 B (< 8 MB), sha256
 `02fb5a1db8b0e6872eed76ea9c81404ba739d72f08f4b604b30c284f83b54978` [obs, re-pack identical]. Boot-args as g6-b. Expect: no `slot 595/596/599`
 trap lines, one `plane N` line pair for 'b3a8'; the scanout ('b3a8') is still refused, so the screen is not expected to change yet.
+### G6-c fix overlay `ov-g6d` (2026-11-17, PREPARED, UNRUN; docs/research/52 s.14)
+`$A/gpu/g5/ov-g6d`: `/usr/local/lib/libsweetgl.dylib` 0755 only (20940976 B, sha256 `82c4ebf8…`, Mesa patch 0009: 'b3a8' scanout copy fallback,
+plane 0 = w30r encoding ASSUMED). The map stays `/usr/local/gli-slots.txt` from ov-g6c. Send with `SWEETDEV_ZLIB_ABOVE=1048576`:
+`tools/mkdevoverlay.py --zlib-above 1048576 $A/gpu/g5/ov-g6d OUT` = 4729968 B (< 8 MB), sha256
+`edd73fc9f84da1e2b0fd8d38cac707bde1f380e0ac200643a1bef402ce175848` [obs, re-pack identical]. Expect one `'b3a8' surface ... -> copy fallback`
+line with `plane1 ... bpr 1152 (derived ...)`, and `SWEET FPS ... distinct` > 1 if CA's frames now reach the scanout; colours may be wrong.
 ## XNU `sweettrusty=1`: Trusty version probe (patch 0156, plan step A3)
 
 Two version fastcalls only (`SMC_FC_GET_VERSION_STR`, `SMC_FC_API_VERSION` with 5), as the stock driver's probe does first; no std-call, no
