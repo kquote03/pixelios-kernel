@@ -111,6 +111,44 @@ class Report(unittest.TestCase):
         self.assertNotIn("the phone reset", r["reason"])
         self.assertIn("phone-state", r["reason"])
 
+    def test_waitbl_waits_for_the_bootloader_timer(self):
+        # B (2026-11-18): an early stop with --restart S,bootloader waits for the phone on the Google vendor, bounded by S + slack; no timer -> NOTIMER
+        import io, contextlib
+        t = {"v": T0}
+        seen = {"at": None}
+
+        def fake_now():
+            return t["v"]
+
+        def fake_sleep(x):
+            t["v"] += x
+
+        def fake_present():
+            return seen["at"] is not None and t["v"] >= seen["at"]
+
+        def run(restart, at):
+            d = self.run_dir("20260101T00%04dZ-b" % (at or 0), snaps=[], run={"restart": restart, "t_boot": str(T0), "duration": "300"})
+            t["v"] = T0 + 160; seen["at"] = at
+            old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present, xrun_report.usb_ids)
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = fake_now, fake_sleep, fake_present
+            xrun_report.usb_ids = lambda vid="18d1": "18d1:4ee0"
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    xrun_report.waitbl(str(d))
+            finally:
+                xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present, xrun_report.usb_ids = old
+            return out.getvalue().strip(), t["v"] - T0
+        how, el = run("300,bootloader", T0 + 420)
+        self.assertEqual(how, "BACK 18d1:4ee0")
+        self.assertLess(el, 425)
+        how, el = run("300,bootloader", None)          # never back: bounded at restart + 300 s slack
+        self.assertEqual(how, "NONE")
+        self.assertLessEqual(el, 602)
+        how, el = run("600", T0 + 200)                  # no bootloader timer: nothing waited
+        self.assertEqual(how, "NOTIMER")
+        self.assertEqual(el, 160)
+
     def test_waitusb_grace_only_when_reset_due(self):
         import io, contextlib
         calls = {"n": 0}

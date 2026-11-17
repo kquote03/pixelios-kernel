@@ -176,6 +176,38 @@ def waitusb(d):
     print("TIMEOUT" if timed_out else "DONE")
 
 
+def bl_timer_due(run):
+    """Seconds after t_boot by which a --restart S,bootloader timer must have reset the phone (S plus the kernel's arm delay, observed
+    ~+110 s in run a9d, plus slack), or None when the image carries no bootloader timer."""
+    m = re.match(r"(\d+),bootloader$", str(run.get("restart") or ""))
+    if not m:
+        return None
+    try:
+        slack = float(os.environ.get("XRUN_BL_SLACK") or 300)
+    except ValueError:
+        slack = 300.0
+    return float(m.group(1)) + slack
+
+
+def waitbl(d):
+    """Early stop without the UDP reset (B, 2026-11-18): wait for the image's own sweetrestart=S,bootloader timer to put the phone on the Google
+    USB vendor (fastboot, or recovery if the bootloader mode was not honoured). Prints BACK <vid:pid> / NONE / NOTIMER; touches nothing."""
+    run = load(os.path.join(d, "run.json"), {})
+    due = bl_timer_due(run)
+    if due is None:
+        print("NOTIMER")
+        return
+    end = float(run.get("t_boot", now())) + due
+    while now() < end:
+        if usb_present():
+            mark(d, ["usb_back=%f" % now(), "usb_back_id=%s" % usb_ids(), "bl_timer=1"])
+            print("BACK " + usb_ids())
+            return
+        time.sleep(2)
+    mark(d, ["bl_timer=0"])
+    print("NONE")
+
+
 def prune(d):
     fr = sorted(glob.glob(os.path.join(d, "frames", "*.jpg")), key=os.path.getmtime)
     keep = set(fr[::4]) | set(fr[-20:])
@@ -532,6 +564,8 @@ def main(a):
         mark(d, a[2:])
     elif cmd == "waitusb":
         waitusb(d)
+    elif cmd == "waitbl":
+        waitbl(d)
     elif cmd == "error":
         mark(d, ["error=" + " ".join(a[2:])])
         return report(d)
