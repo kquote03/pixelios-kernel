@@ -18,6 +18,7 @@ struct fake {
 	/* injections */
 	uint32_t api, ffa_ver, getdescr_ret_neg, num_vdev, dfeat, conn_status, herr, state, never_online, share_fail_at;
 	uint32_t intr_descr, fiq_start, busy_reset, nopint, msgmax, cpu_idle_start, reclaim_deny, reset_idle_fail, reply_src, reply_dst;
+	uint32_t seq, seq_st[4], seq_err[4], subs[4];   /* patch 0165: hwmgr sequence replies, subs received */
 	/* state */
 	uint64_t now;
 	uint32_t mapped, unmapped, nsh, started, stopped, resets, online_sent, conn, got_req, got_disc, errors, pending;
@@ -161,12 +162,13 @@ tx_process(void)
 			uint32_t w[7] = { 4, 20, 1024, F.conn_status, 5000, 4096, 32 };
 			rx_put(53, 53, w, 7);
 		} else if (dst == 5000 && plen == 8) {
-			if (rd32(b + 16) != 1 || rd32(b + 20) != 0) {
+			if (rd32(b + 16) != 1 || rd32(b + 20) > (F.seq ? 1u : 0u) || F.got_req >= 4) {
 				ERR("hwmgr req bad %u %u", rd32(b + 16), rd32(b + 20));
 				return;
 			}
-			F.got_req++;
-			uint32_t w[3] = { 0x80000001u, F.herr, F.state };
+			uint32_t k = F.got_req++;
+			F.subs[k] = rd32(b + 20);
+			uint32_t w[3] = { 0x80000001u, F.seq ? F.seq_err[k] : F.herr, F.seq ? F.seq_st[k] : F.state };
 			rx_put(F.reply_src ? F.reply_src : 5000, F.reply_dst ? F.reply_dst : 1024, w, 3);
 		} else if (dst == 53 && rd32(b + 16) == 5) {
 			if (plen != 12 || rd32(b + 20) != 4 || rd32(b + 24) != 5000) {
@@ -340,7 +342,7 @@ check_log(const char *name)
 static int
 run(struct swtp_res *r)
 {
-	struct swtp_bus b = { fsmc, fnow, fdelay, NULL, arena, PA0 };
+	struct swtp_bus b = { fsmc, fnow, fdelay, NULL, arena, PA0, NULL, 0 };
 	uint64_t t0 = F.now;
 	int rc = swtp_run(&b, r);
 
@@ -442,9 +444,40 @@ main(void)
 	CHECK(rc != SWTP_OK, "nop forever: rc %s", swtp_ename(rc));
 
 	{
-		struct swtp_bus bad = { fsmc, fnow, fdelay, NULL, arena + 8, PA0 };
+		struct swtp_bus bad = { fsmc, fnow, fdelay, NULL, arena + 8, PA0, NULL, 0 };
 		reset();
 		CHECK(swtp_run(&bad, &r) == SWTP_E_ARG && F.nc == 0, "misaligned arena refused");
+	}
+	/* patch 0165: GET_STATE, START, GET_STATE (gated on LOADED) */
+	{
+		static const uint8_t seq[3] = { 0, 1, 0 }, bad[2] = { 0, 4 }, twice[3] = { 0, 1, 1 }, first[1] = { 1 };
+		struct swtp_bus sb = { fsmc, fnow, fdelay, NULL, arena, PA0, seq, 3 };
+
+		reset(); F.seq = 1; F.seq_st[0] = 1; F.seq_st[1] = 2; F.seq_st[2] = 2;
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_OK && r.nst == 3 && r.sts[0] == 1 && r.sts[2] == 2 && r.start_sent && r.start_replied && F.got_req == 3 &&
+		    F.subs[0] == 0 && F.subs[1] == 1 && F.subs[2] == 0 && F.got_disc == 1 && live() == 0 && F.errors == 0, "seq: rc %s", swtp_ename(rc));
+		check_log("seq");
+		reset(); F.seq = 1; F.seq_st[0] = 0;             /* INACTIVE: START must not be sent */
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_E_GATE && F.got_req == 1 && !r.start_sent && F.got_disc == 1 && live() == 0, "gate: rc %s", swtp_ename(rc));
+		reset(); F.seq = 1; F.seq_st[0] = 1; F.seq_err[1] = 5;   /* START error code: stop, no third request */
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_E_HWMGR && F.got_req == 2 && r.start_sent && r.start_replied && r.herrs[1] == 5 && live() == 0, "start err: rc %s",
+		    swtp_ename(rc));
+		reset(); F.seq = 1; F.seq_st[0] = 1; F.seq_st[1] = 1;
+		sb.subs = twice;
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_E_GATE && F.got_req == 2, "start twice: rc %s", swtp_ename(rc));
+		reset(); F.seq = 1; sb.subs = first; sb.nsubs = 1;
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_E_GATE && F.got_req == 0, "start first: rc %s", swtp_ename(rc));
+		reset(); F.seq = 1; sb.subs = bad; sb.nsubs = 2;
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_E_ALLOW && F.got_req == 1, "sub 4 refused: rc %s", swtp_ename(rc));
+		reset(); sb.subs = seq; sb.nsubs = 4;
+		rc = swtp_run(&sb, &r);
+		CHECK(rc == SWTP_E_ARG && F.got_req == 0, "4 subs refused: rc %s", swtp_ename(rc));
 	}
 	printf("RESULT: %s tipc_host_test (%d failures)\n", fails ? "FAIL" : "PASS", fails);
 	return fails != 0;
