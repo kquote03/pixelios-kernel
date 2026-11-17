@@ -326,6 +326,10 @@ static uint32_t a9_st3(int a)
 	return m->st3;
 }
 static int cb_open(void *ctx) { (void)ctx; a9_opens++; sclk_on = a9_open_ret; return a9_open_ret; }
+/* patch 0167 (sweetaoc=5) model: the open starts the stream but SCLK only runs after tick_need ticks (0 = never); a tick outside open..close is a violation */
+static int a9_ticks, tick_need, tick_bad;
+static int cb_open5(void *ctx) { (void)ctx; a9_opens++; a9_ticks = 0; sclk_on = 0; return a9_open_ret; }
+static void cb_tick(void *ctx) { (void)ctx; if (a9_opens != 1 || a9_closes) tick_bad++; a9_ticks++; sclk_on = tick_need && a9_ticks >= tick_need; }
 static void cb_close(void *ctx) { (void)ctx; a9_closes++; sclk_on = 0; }
 
 /* an A7 write after the 12 init writes: the test-key order, OTP row registers only while unlocked, only bits of its rows */
@@ -1050,7 +1054,7 @@ int main(void)
 		CHECK(!amp_write_ok(0x3810u, 0x32u) && !amp_write_ok(0x2C04u, 0x510u), "unarmed A9 register refused");
 		printf("ok: A9 allowlist (rows armed one at a time, PWR_CTRL1 0x2014 never writable)\n");
 
-		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
 		a9ok = rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && amp_a9_res.opened && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked;
 		CHECK(a9ok, "A9 good: run passes, opened once, closed once, PLL locked l,r");
 		CHECK(violations == 0, why_v);
@@ -1066,23 +1070,49 @@ int main(void)
 		CHECK(restored_exact(), "A9: the same restore (resets low, every word back)");
 		printf("ok: A9 good: %u / %u A9 writes, PLL locked l,r, AOC open + close once, restore exact\n", amp[0].a9_nwr, amp[1].a9_nwr);
 
-		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !amp_a9_res.a[0].locked && !amp_a9_res.a[1].locked && amp_a9_res.a[0].polls == 100u &&
 		      amp_a9_res.a[1].polls == 100u && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "PLL never locks: 100 polls each, closed, restored");
 		printf("ok: A9 PLL never locks (bounded 100 x 1 ms per amp, AOC closed, restore exact)\n");
 
-		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !amp_a9_res.opened && amp_a9_res.a[0].polls == 0u && a9_closes == 1 && restored_exact(), "AOC open refused: no PLL poll, close called, restored");
 		printf("ok: A9 AOC open refused (no PLL poll, close still called)\n");
 
-		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
 		CHECK(violations == 0 && amp_a9_res.a[0].cfg && !amp_a9_res.a[1].cfg && amp[1].a9_nwr == 0 && a9_opens == 0 && restored_exact(), "GLOBAL_EN found set on R: no R write, no AOC open");
 		printf("ok: A9 GLOBAL_EN found set: no write to that amp, no AOC open\n");
 
-		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL }; rc = amp_init_run();
+		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
 		CHECK(violations == 0 && amp[0].a9_nwr == 0 && amp[1].a9_nwr == 0 && a9_opens == 0, "error bit (H8): no A9 write, no open");
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 		printf("ok: A9 amp error bit: no TDM config, no AOC open\n");
+	}
+	/* ---- patch 0167 (sweetaoc=5): joint L/R poll <= 500 x 1 ms with a tick per ms, st3 snapshots, close on every path ---- */
+	{
+		reset_hw(); tick_need = 20; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u }; rc = amp_init_run();
+		CHECK(rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && !tick_bad && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked,
+		      "A9 play: locked l,r after the stream clocks, opened once, closed once, ticks inside");
+		CHECK(a9_ticks == 20 && amp_a9_res.a[0].polls == 20u && amp_a9_res.a[1].polls == 20u, "joint poll stops at the lock (20 ticks, 20 polls each)");
+		CHECK(!(amp_a9_res.a[0].snap[0] & 2u) && (amp_a9_res.a[0].snap[1] & 2u) == 0u && amp_a9_res.a[0].snap[2] == 0u, "snapshots @1 / @10 unlocked, @100 not reached");
+		CHECK(has("L a9 st3 @1=") && has("R a9 pll locked") && restored_exact() && amp[0].a9v[10] == a9v0[0][10] && amp[1].a9v[10] == a9v0[1][10],
+		      "st3 line, PLL lines, restore exact, PWR_CTRL1 untouched");
+		printf("ok: A9 play: joint poll locks at tick 20, AOC closed once, restore exact\n");
+
+		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u }; rc = amp_init_run();
+		CHECK(rc == 0 && violations == 0 && !tick_bad && a9_ticks == 500 && amp_a9_res.a[0].polls == 500u && amp_a9_res.a[1].polls == 500u &&
+		      !amp_a9_res.a[0].locked && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "never clocks: 500 joint polls, closed, restored");
+		CHECK(amp_a9_res.a[1].snap[4] == amp_a9_res.a[1].st3 && amp_a9_res.a[1].snap[0] == amp_a9_res.a[1].st3, "snapshots @1 and @500 taken");
+		printf("ok: A9 play: never clocks (bounded 500 x 1 ms joint, AOC closed, restore exact)\n");
+
+		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 9999u }; rc = amp_init_run();
+		CHECK(a9_ticks == 500 && amp_a9_res.a[0].polls == 500u && a9_closes == 1, "polls above 500 clamped to 500");
+		printf("ok: A9 play: poll bound clamped to 500\n");
+
+		reset_hw(); tick_need = 1; tick_bad = 0; a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u }; rc = amp_init_run();
+		CHECK(rc == 0 && violations == 0 && a9_ticks == 0 && !amp_a9_res.opened && a9_closes == 1 && restored_exact(), "play open failed: no tick, close called");
+		printf("ok: A9 play: open failed (no tick, close still called)\n");
+		amp_a9_cb = (struct amp_a9_cb){ 0 };
 	}
 	if (fails) {
 		printf("amp_xnu_host_test: %u FAILED\n", fails);

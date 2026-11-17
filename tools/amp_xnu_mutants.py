@@ -7,6 +7,8 @@ import pathlib, subprocess, sys, tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PATCH = ROOT / "xnu/patches/0158-sweet-amp-init.patch"
 PATCH_A9 = ROOT / "xnu/patches/0166-aoc-audio.patch"	# patch 0166 (A9b) extends sweet_amp.h: its hunk is applied on top
+PATCH_PLAY = ROOT / "xnu/patches/0167-aoc-playback.patch"	# patch 0167 (sweetaoc=5) extends sweet_amp.h and sweet_audio.h again
+TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
 MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 m13) + the round-2 fixes
@@ -46,10 +48,17 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("A9: PLL poll does not stop at the lock", "d->polls < AMP_A9_PLL_POLLS && !d->locked", "d->polls < AMP_A9_PLL_POLLS"),
 ]
 
+# patch 0167: the new stop path of sweet_audio.h (SOURCE on 0 before the BIND2 undo), killed by shim/aoc_audio_host_test.c
+MUTANTS_AUDIO = [
+    ("play: SOURCE off never sent", "\tif (r->started && !r->stopped) {", "\tif (0) {"),
+    ("play: started only on a good reply (no stop after a timeout / reject)", "r->started = r->x[r->nx - 1u].written;", "r->started = rc == SWAU_OK;"),
+    ("play: stop not marked (SOURCE off sent again)", "\t\tr->stopped = 1;\n", ""),
+]
 
-def header(name: str = "sweet_amp.h") -> str:
+
+def header(name: str = "sweet_amp.h", patch: pathlib.Path = PATCH) -> str:
     out, on = [], False
-    for ln in PATCH.read_text().splitlines():
+    for ln in patch.read_text().splitlines():
         if ln == f"+++ b/bsd/dev/{name}":
             on = True
             continue
@@ -62,27 +71,37 @@ def header(name: str = "sweet_amp.h") -> str:
     return "\n".join(out) + "\n"
 
 
-def header_a9() -> str:
-    """The 0158 header with the sweet_amp.h hunk of patch 0166 applied on top (as shim/build.sh does)."""
+def hunk(patch: pathlib.Path, name: str) -> str:
     diff, on = [], False
-    for ln in PATCH_A9.read_text().splitlines(keepends=True):
-        if ln.rstrip("\n") == "diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h":
+    for ln in patch.read_text().splitlines(keepends=True):
+        if ln.rstrip("\n") == f"diff --git a/bsd/dev/{name} b/bsd/dev/{name}":
             on = True
         elif on and ln.startswith("diff --git"):
             break
         if on:
             diff.append(ln)
     if not diff:
-        raise SystemExit("RESULT: FAIL no sweet_amp.h hunk in " + PATCH_A9.name)
+        raise SystemExit(f"RESULT: FAIL no {name} hunk in " + patch.name)
+    return "".join(diff)
+
+
+def apply(base: str, name: str, patches) -> str:
+    """base with the `name` hunks of the later patches applied on top, in order (as shim/build.sh does)."""
     with tempfile.TemporaryDirectory() as td:
         d = pathlib.Path(td)
         (d / "bsd/dev").mkdir(parents=True)
-        (d / "bsd/dev/sweet_amp.h").write_text(header())
-        (d / "p.diff").write_text("".join(diff))
-        c = subprocess.run(["patch", "-s", "-p1", "--no-backup-if-mismatch", "-i", "p.diff"], cwd=d, capture_output=True, text=True)
-        if c.returncode:
-            raise SystemExit("RESULT: FAIL 0166 does not apply to sweet_amp.h: " + c.stdout + c.stderr)
-        return (d / "bsd/dev/sweet_amp.h").read_text()
+        (d / f"bsd/dev/{name}").write_text(base)
+        for p in patches:
+            (d / "p.diff").write_text(hunk(p, name))
+            c = subprocess.run(["patch", "-s", "-p1", "--no-backup-if-mismatch", "-i", "p.diff"], cwd=d, capture_output=True, text=True)
+            if c.returncode:
+                raise SystemExit(f"RESULT: FAIL {p.name} does not apply to {name}: " + c.stdout + c.stderr)
+        return (d / f"bsd/dev/{name}").read_text()
+
+
+def header_a9() -> str:
+    """The 0158 header with the sweet_amp.h hunks of patches 0166 and 0167 applied on top."""
+    return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY])
 
 
 def run(hdr: str, d: pathlib.Path) -> bool:
@@ -94,25 +113,44 @@ def run(hdr: str, d: pathlib.Path) -> bool:
     return subprocess.run([str(d / "t")], capture_output=True, text=True).returncode == 0
 
 
+def run_audio(hdr: str, d: pathlib.Path) -> bool:
+    (d / "sweet_audio.h").write_text(hdr)
+    (d / "sweet_cs_dsp.h").write_text(header("sweet_cs_dsp.h", PATCH_A9))
+    c = subprocess.run(["gcc", "-O1", "-w", f"-I{d}", "-o", str(d / "ta"), str(TEST_AUDIO)], capture_output=True, text=True)
+    if c.returncode:
+        return False
+    return subprocess.run([str(d / "ta")], capture_output=True, text=True).returncode == 0
+
+
+def sweep(good: str, mutants, runner, d: pathlib.Path):
+    killed = 0
+    for label, old, new in mutants:
+        if good.count(old) != 1:
+            print(f"RESULT: FAIL mutant '{label}': pattern found {good.count(old)} times")
+            return None
+        if runner(good.replace(old, new), d):
+            print(f"SURVIVED: {label}")
+        else:
+            killed += 1
+            print(f"killed: {label}")
+    return killed
+
+
 def main() -> int:
     good = header_a9()
+    good_audio = apply(header("sweet_audio.h", PATCH_A9), "sweet_audio.h", [PATCH_PLAY])
     with tempfile.TemporaryDirectory() as td:
         d = pathlib.Path(td)
-        if not run(good, d):
-            print("RESULT: FAIL the unmutated header does not pass the host test")
+        if not run(good, d) or not run_audio(good_audio, d):
+            print("RESULT: FAIL the unmutated headers do not pass the host tests")
             return 1
-        killed = 0
-        for label, old, new in MUTANTS:
-            if good.count(old) != 1:
-                print(f"RESULT: FAIL mutant '{label}': pattern found {good.count(old)} times")
-                return 1
-            if run(good.replace(old, new), d):
-                print(f"SURVIVED: {label}")
-            else:
-                killed += 1
-                print(f"killed: {label}")
-    ok = killed == len(MUTANTS)
-    print(f"RESULT: {'PASS' if ok else 'FAIL'} {killed}/{len(MUTANTS)} mutants killed")
+        k1 = sweep(good, MUTANTS, run, d)
+        k2 = sweep(good_audio, MUTANTS_AUDIO, run_audio, d)
+        if k1 is None or k2 is None:
+            return 1
+    n = len(MUTANTS) + len(MUTANTS_AUDIO)
+    ok = k1 + k2 == n
+    print(f"RESULT: {'PASS' if ok else 'FAIL'} {k1 + k2}/{n} mutants killed")
     return 0 if ok else 1
 
 

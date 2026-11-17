@@ -3,7 +3,10 @@
  * files in $SWEET_CS35L41_FW (default ~/pixelios-artifacts/aoc/cs35l41; skipped if absent, never in git).
  * AOC cases: good open + close (exact bytes, ids 233 / 271 / 271, cntr 0..2, one doorbell per message, counters), a stale reply drained,
  * BIND2 rejected (reply != 0: stop, undo sent), a 4-byte AOC error code, a timeout (<= 500 ms), an unknown reply id, a ring service refused,
- * a full DOWN queue (nothing written), counters corrupt. */
+ * a full DOWN queue (nothing written), counters corrupt.
+ * Patch 0167 (sweetaoc=5): the play open (audio_playback0 ring zeroed + reset, EP_SETUP 206 and SOURCE 201 bytes), zero feeds (exact amount, cap,
+ * wrap, push-ring doorbell), the close order (SOURCE on 0, then BIND2 0), each stop inside the play open (SOURCE rejected or unanswered: stop sent;
+ * EP_SETUP or BIND2 rejected: no SOURCE, bind undone) and the refusals (queue type, size, window, counters, indexes, overlaps: no zero write). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,9 +31,10 @@ static void w32(uint32_t o, uint32_t v) { ipc[o] = (uint8_t)v; ipc[o + 1] = (uin
 static uint32_t r32(uint32_t o) { return ipc[o] | ipc[o + 1] << 8 | ipc[o + 2] << 16 | (uint32_t)ipc[o + 3] << 24; }
 #define RG(d, f) (HDR + 36u + 28u * (d) + 4u * (f))      /* f: 0 offset 1 size 2 slots 3 tx 4 rx 5 wp 6 rp */
 
-static int mode;            /* peer: 0 echo reply 0, 1 reject BIND2 bind 1, 2 error code on 233, 3 silent, 4 wrong id, 5 reply len differs */
+static int mode;            /* peer: 0 echo reply 0, 1 reject BIND2 bind 1, 2 error code on 233, 3 silent, 4 wrong id, 5 reply len differs,
+                             * 0167: 6 silent on SOURCE on 1, 7 reject SOURCE on 1, 8 reject EP_SETUP */
 static int nbell, nsync, nwrite_bad, stale;
-static uint8_t sent[8][16];
+static uint8_t sent[8][32];
 static uint32_t sent_len[8], nsent, now;
 
 static void
@@ -66,11 +70,13 @@ peer(void)
 
 		if (r32(slot + 4u) != 0u) nwrite_bad++;
 		memcpy(m, ipc + slot + 8u, len);
-		if (nsent < 8u) { memcpy(sent[nsent], m, len < 16u ? len : 16u); sent_len[nsent++] = len; }
+		if (nsent < 8u) { memcpy(sent[nsent], m, len < 32u ? len : 32u); sent_len[nsent++] = len; }
 		w32(RG(1, 4), rx + 1u);
 		w32(RG(1, 6), (r32(RG(1, 6)) + 1u) % SLOT);
 		uint16_t id = (uint16_t)(m[4] | m[5] << 8);
 		if (mode == 3) continue;
+		if (mode == 6 && id == 201u && m[9] == 1u) continue;
+		if ((mode == 7 && id == 201u && m[9] == 1u) || (mode == 8 && id == 206u)) { m[6] = 0xEA; m[7] = 0xFF; }
 		if (mode == 2 && id == 233u) { uint8_t e[4] = { 0xEA, 0xFF, 0xFF, 0xFF }; up_push(e, 4); continue; }
 		if (mode == 1 && id == 271u && m[10] == 1u) { m[6] = 0xEA; m[7] = 0xFF; }
 		if (mode == 4) { m[4] = 0x99; }
@@ -150,6 +156,132 @@ t_refuse(void)
 	w32(RG(1, 0), SWAU_IPC_LEN - 64u);
 	CHECK(swau_open(&B, &r, SO, SS, IDX) == SWAU_E_SVC && nbell == 0, "region outside the window refused");
 	printf("ok: refusals (ring, full, corrupt, outside)\n");
+}
+
+/* ---- patch 0167 (sweetaoc=5): audio_playback0 ring + EP_SETUP + SOURCE on / off ---- */
+#define PBI   8u                                /* audio_playback0 index in the fake table */
+#define NSVC  12u
+#define PHDR  (SO + PBI * SS)
+#define PG(f) (PHDR + 36u + 28u * 1u + 4u * (f))  /* its AOC_DOWN region: 0 offset 1 size 2 slots 3 tx 4 rx 5 wp 6 rp */
+#define PBO   0x40000u
+#define PBS   0x800u
+
+static void
+pb_setup(uint32_t flags, uint32_t wp)
+{
+	memcpy(ipc + PHDR, "audio_playback0", 15);
+	w32(PHDR + 32u, flags);
+	w32(PG(0), PBO); w32(PG(1), PBS); w32(PG(2), 1u);
+	w32(PG(3), 1000u + wp); w32(PG(4), 1000u + wp); w32(PG(5), wp);   /* drained ring, earlier use */
+	memset(ipc + PBO, 0xAA, PBS);           /* stale non-zero samples */
+	memset(ipc + PBO + PBS, 0x55, 64);      /* the bytes right after the ring: never touched */
+}
+
+static int
+pb_all_zero(void)
+{
+	for (uint32_t i = 0; i < PBS; i++)
+		if (ipc[PBO + i]) return 0;
+	for (uint32_t i = 0; i < 64u; i++)
+		if (ipc[PBO + PBS + i] != 0x55u) return 0;
+	return 1;
+}
+
+static void
+t_play_good(uint32_t flags)
+{
+	struct swau_res r;
+	int rc, bells;
+	uint32_t tx0;
+
+	setup(0);
+	pb_setup(flags, 0x100u);
+	rc = swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC);
+	CHECK(rc == SWAU_OK && r.started && r.ep_set && r.bound && r.nx == 4u, "play open rc %d started %u", rc, r.started);
+	CHECK(pb_all_zero() && r.pb.zeroed && r.pb.reset, "ring zeroed (stale 0xAA gone), bytes after it untouched");
+	CHECK(r32(PG(3)) == 1000u + 0x100u + (PBS - 0x100u) && r32(PG(5)) == 0u, "stock reset: tx += size - wp, wp = 0 (tx %u wp %u)", r32(PG(3)), r32(PG(5)));
+	{
+		static const uint8_t ep[28] = { 0, 2, 28, 0, 206, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xBB, 0, 0, 0, 0, 0, 0, 2, 1, 5, 1, 0, 0, 1, 0 };
+		static const uint8_t s1[10] = { 0, 3, 10, 0, 201, 0, 0, 0, 0, 1 };
+		CHECK(sent_len[2] == 28u && !memcmp(sent[2], ep, 28), "EP_SETUP bytes");
+		CHECK(sent_len[3] == 10u && !memcmp(sent[3], s1, 10), "SOURCE on bytes");
+	}
+	/* the reset published size - wp; the AOC consumed 300 more: one feed fills the 256 + 300 free bytes with zeros */
+	tx0 = r32(PG(3));
+	w32(PG(4), r32(PG(4)) + 300u);
+	memset(ipc + PBO, 0x11, 4);             /* would only be overwritten by a zero */
+	bells = nbell;
+	swau_feed(&B, &r);
+	CHECK(r32(PG(3)) == tx0 + 556u && r32(PG(5)) == 556u && r.pb.fed == 556u && r.pb.feed_err == 0u, "feed: the 256 never-published + 300 consumed: tx +556, wp 556 (fed %u)", r.pb.fed);
+	CHECK(pb_all_zero(), "feed writes zeros only");
+	CHECK(nbell - bells == ((flags & SWAU_RING_PUSH) ? 1 : 0), "doorbell only for a push ring");
+	swau_feed(&B, &r);
+	CHECK(r.pb.fed == 556u, "nothing consumed: nothing fed");
+	w32(PG(4), r32(PG(4)) + 1500u);         /* 1500 free: capped */
+	swau_feed(&B, &r);
+	CHECK(r.pb.fed == 556u + SWAU_FEED_MAX && r32(PG(5)) == 556u + SWAU_FEED_MAX && pb_all_zero(), "feed capped at SWAU_FEED_MAX, zeros");
+	swau_feed(&B, &r);                      /* the remaining 476 free bytes: wraps to wp 8 */
+	CHECK(r.pb.fed == 556u + SWAU_FEED_MAX + 476u && r32(PG(5)) == 8u && r32(PG(3)) - r32(PG(4)) == PBS && pb_all_zero(), "feed wraps (wp %u), ring full, zeros", r32(PG(5)));
+	rc = swau_close(&B, &r);
+	CHECK(rc == SWAU_OK && r.stopped && r.unbound && nsent == 6u, "close: SOURCE off + BIND2 0 (%u messages)", nsent);
+	{
+		static const uint8_t s0[10] = { 0, 4, 10, 0, 201, 0, 0, 0, 0, 0 }, b0[11] = { 0, 5, 11, 0, 0x0F, 0x01, 0, 0, 0, 0, 0 };
+		CHECK(!memcmp(sent[4], s0, 10) && !memcmp(sent[5], b0, 11), "SOURCE on 0 then BIND2 bind 0, in that order");
+	}
+	CHECK(r.consumed == 1800u, "consumed %u", r.consumed);
+	tx0 = r32(PG(3));
+	swau_feed(&B, &r);
+	CHECK(r32(PG(3)) == tx0 && swau_close(&B, &r) == SWAU_OK && nsent == 6u, "after the stop: no feed, close twice sends nothing");
+	printf("ok: play open / feed / close%s (zeros only, SOURCE off then BIND2 0)\n", (flags & SWAU_RING_PUSH) ? " (push ring)" : "");
+}
+
+/* a stop inside the play open: what was sent, what the close undoes */
+static void
+t_play_stop(int m, int expect, uint32_t started, uint32_t nmsg, const char *what)
+{
+	struct swau_res r;
+	int rc;
+
+	setup(0);
+	pb_setup(0x10000u, 0u);
+	mode = m;
+	rc = swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC);
+	CHECK(rc == expect && r.started == started, "%s: rc %d want %d started %u", what, rc, expect, r.started);
+	mode = 0;
+	swau_close(&B, &r);
+	CHECK(nsent == nmsg, "%s: %u messages (want %u)", what, nsent, nmsg);
+	if (started)
+		CHECK(sent_len[4] == 10u && sent[4][4] == 201u && sent[4][9] == 0u && sent[5][4] == 0x0Fu && sent[5][10] == 0u, "%s: SOURCE off then BIND2 0", what);
+	else
+		CHECK(sent[nmsg - 1u][4] == 0x0Fu && sent[nmsg - 1u][10] == 0u, "%s: BIND2 0 last, no SOURCE off", what);
+	if (m != 1)
+		CHECK(pb_all_zero(), "%s: ring zeros", what);
+	printf("ok: %s\n", what);
+}
+
+static void
+t_play_refuse(void)
+{
+	struct swau_res r;
+
+	setup(0); pb_setup(0u, 0u);             /* a queue, not a ring */
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC) == SWAU_E_SVC && nsent == 0u && nbell == 0 && ipc[PBO] == 0xAAu, "queue-type playback0 refused, nothing sent");
+	setup(0); pb_setup(0x10000u, 0u); w32(PG(1), SWAU_RING_MAX + 4u);
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC) == SWAU_E_SVC && nsent == 0u, "ring bigger than SWAU_RING_MAX refused");
+	setup(0); pb_setup(0x10000u, 0u); w32(PG(0), SWAU_IPC_LEN - 0x400u);
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC) == SWAU_E_SVC && nsent == 0u, "ring past the window refused");
+	setup(0); pb_setup(0x10000u, 0u); w32(PG(3), 1000u + PBS + 4u);
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC) == SWAU_E_CORRUPT && nsent == 0u, "ring counters corrupt refused");
+	setup(0); pb_setup(0x10000u, 0u);
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, IDX, NSVC) == SWAU_E_ARGS && nsent == 0u, "playback index = control index refused");
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, PBI) == SWAU_E_ARGS && nsent == 0u, "playback index outside the table refused");
+	setup(0); pb_setup(0x10000u, 0u); w32(PG(0), DNO);      /* the ring over the control DOWN queue */
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC) == SWAU_E_SVC && !r.pb.zeroed && r.bound, "ring over the control queue: refused before any zero write");
+	swau_close(&B, &r);
+	CHECK(nsent == 3u && sent[2][10] == 0u && !r.stopped, "  ... and the bind is undone, no SOURCE off");
+	setup(0); pb_setup(0x10000u, 0u); w32(PG(0), SO + 4u * SS);   /* over the service headers */
+	CHECK(swau_play_open(&B, &r, SO, SS, IDX, PBI, NSVC) == SWAU_E_SVC && !r.pb.zeroed, "ring over the service headers refused");
+	printf("ok: play refusals (queue type, size, window, counters, indexes, overlaps)\n");
 }
 
 /* ---- the HALO file parser ---- */
@@ -248,6 +380,13 @@ main(void)
 	t_stop(4, SWAU_E_UNKNOWN, 0, 1u, "reply with another id: unknown, stop");
 	t_stop(5, SWAU_E_UNKNOWN, 0, 1u, "reply of another length: unknown, stop");
 	t_refuse();
+	t_play_good(0x10000u);
+	t_play_good(0x10000u | SWAU_RING_PUSH);
+	t_play_stop(7, SWAU_E_REJECTED, 1u, 6u, "SOURCE on rejected: stop, SOURCE off + BIND2 0 sent");
+	t_play_stop(6, SWAU_E_TIMEOUT, 1u, 6u, "SOURCE on unanswered (500 ms): stop, SOURCE off + BIND2 0 sent");
+	t_play_stop(8, SWAU_E_REJECTED, 0u, 4u, "EP_SETUP rejected: no SOURCE, BIND2 0 sent");
+	t_play_stop(1, SWAU_E_REJECTED, 0u, 3u, "BIND2 rejected in the play open: no EP_SETUP, BIND2 0 sent");
+	t_play_refuse();
 	t_parser_synthetic();
 	t_parser_stock();
 	printf("%s: %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
