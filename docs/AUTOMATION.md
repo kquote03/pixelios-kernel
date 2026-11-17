@@ -750,6 +750,14 @@ retries every `clear=SKIP tri=SKIP` result without a renderer line, also a perma
 | `ov-ramp1` | `/private/var/dev/ramp-1m.bin` 0644 (bytes 0..255 repeated) | 1048576 | 1048656 | `3dfafca0ab5933740b0b4d92bbcaa6fd6816f83a67f2f41b0b0b1070e4e1e1c2` |
 | `ov-ramp8` | `/private/var/dev/ramp-8m.bin` 0644 | 8388608 | 8388688 | `78a4ea7eb532818d0d48766404d013a30a3e233d07212905942caa73e73d0452` |
 | `ov-ramp24` | `/private/var/dev/ramp-24m.bin` 0644 | 25165824 | 25165904 | `87c8950075161254e8eb4e88f23f07dd7b8ac373d7c1d5091f589be7c4e2fa02` |
+| `ov-ramp21` | `/private/var/dev/ramp-21m.bin` 0644 (2026-11-17; archive = ov-st1 size) | 21056960 | 21057040 | `f909f3fb21064c60657c3b1395a84a39ee6f46ccf5619f694734d745da901b16` |
+| `ov-ramp16` | `/private/var/dev/ramp-16m.bin` 0644 (2026-11-17; bisect) | 16777216 | 16777296 | `d51233466e19cc4f8b8557d99ca99af2418eea27bc12a3fecfc234056cd706ad` |
+
+**Result 2026-11-17 [obs, PORT.md]:** ramp1/ramp8 PASS; ramp16, ramp21, ramp24 return to fastboot at +7 s with no log. The SWEETXNU
+payload (kernel 15936688 B + overlay archive, `tools/mkpayload.py` size) boots at 24325456 B (ramp8) and fails at >= 32714064 B (ramp16).
+`libsweetgl.dylib` alone (archive 20920576 B, payload 36857344 B) is over that, so no split of `ov-st1` fits one boot: G5 st is blocked
+until the dylib shrinks by ~13 MB or the limit is found and moved (cause unread: the loader message goes to screen/pstore only [guess]).
+`llvm-strip` refuses the dylib (load command 0x1e); `__LINKEDIT` is only 2.03 MB, so stripping cannot close the gap [obs].
 | `ov-st1` | `/usr/local/bin/sweetgl_once` 0755 (`cf7a9376…`), `/usr/local/bin/sweetgl_selftest` 0755 (`67733d40…`), `/usr/local/lib/libsweetgl.dylib` 0755 (`f2b31a68…`), copies of `$A/gpu/out/` | 21056832 | 21057040 | `69ced5a3bf7c0a0cd3d97c51816d18356678125079e83a0d51ddcba9e9a18795` |
 | `ov-st2` | `/System/Library/xpc/launchd.plist` 0644 = `tools/mk_launchd_job.py $A/gpu/g5/root-ro/launchd.plist OUT --sha256 7aab4ecb…` (523 -> 524 jobs; the job has no UserName key, launchd's default for a LaunchDaemon is root [guess]; file sha256 `7c764fd52774ca0dd3f471ceee565bc812a3f8069c03d023c857dde71d5b24a4`) | 792710 | 792800 | `011ac014b8ef063b65855b5da96920abb92587ccafd2646f16a04602d3adc904` |
 | `ov-st2orig` | `/System/Library/xpc/launchd.plist` 0644 = the root's own cache (`7aab4ecb…`): pre-check and restore read-back | 792460 | 792544 | `60fe4a3454ae976e1cb9fbf8dfa39fa2a4013f852087e6c33dd479bb938ec484` |
