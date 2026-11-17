@@ -849,6 +849,12 @@ Unknowns (U4), each with its evidence:
 Leftovers after the series (F11; permanent, `restore` removes nothing the overlay created; tell the owner of the root): `/private/var/dev/ramp-{1m,8m,24m}.bin`
 (33 MiB), `/usr/local/bin/sweetgl_once`, `/usr/local/bin/sweetgl_selftest`, `/usr/local/lib/libsweetgl.dylib` (21 MB), directories `/usr/local/bin`,
 `/usr/local/lib` (plus the dev-run leftovers listed above). The launchd cache is the original again after st-restore (checked by st-check).
+### G6-a fix overlay `ov-g6a` (2026-11-17, PREPARED, UNRUN; docs/research/52 s.12)
+`$A/gpu/g5/ov-g6a`: `/usr/local/lib/libsweetgl.dylib` 0755 (20938912 B, sha256 `11f6b32c…`, Mesa patch 0007: w30r attachImage copy fallback,
+context take-back fix). Send with `SWEETDEV_ZLIB_ABOVE=1048576`: `tools/mkdevoverlay.py --zlib-above 1048576 $A/gpu/g5/ov-g6a OUT` = 4725360 B
+(< 8 MB), sha256 `ca2e3a5536fb1cd60ed4b7456b624bab5db5af6a18fa2a86e2d9b84a08869bbb` [obs, re-pack identical]. Boot-args as g6-a (the GLI map
+stays at `/usr/local/gli-slots.txt` from `ov-g6map`). Expect in backboardd: no `without a usable context` flood; `copy fallback` once per w30r
+shape; one `not importable ... planes` line per fmt 0x0/b3a8/LA08 shape.
 ## XNU `sweettrusty=1`: Trusty version probe (patch 0156, plan step A3)
 
 Two version fastcalls only (`SMC_FC_GET_VERSION_STR`, `SMC_FC_API_VERSION` with 5), as the stock driver's probe does first; no std-call, no

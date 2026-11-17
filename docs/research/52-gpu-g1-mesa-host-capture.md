@@ -348,3 +348,52 @@ slots 0..1032; tools `gpu/tools/hfs_extract.py` + `gpu/tools/gli_slots.py` (stdl
   conditional; the full 1036-slot coverage is still unknown.
 * Not in the map [obs]: desktop/ARB names the shim special-cases and CA uses (`glAttachObjectARB`, `glGetInfoLogARB`, `glGetHandleARB`,
   `glBindFramebufferEXT`, `glGetIntegerIndexedv`, ...): OpenGLES does not export them, so their slots are not named by this method.
+
+## 12. G6-a follow-up: IOSurface render targets and the lost context (2026-11-17, host only; nothing ran on the phone)
+
+Input: run `20261117T114625Z-g6-a` (`logs/runs/*-g6-a/merged.log`, every line twice: two log sinks) [obs]. The shim installed in backboardd (364
+GLI slots), created an ES 3.1 context on `Mali-G78 MC20 (Panfrost)`, then refused every CA IOSurface and skipped ~9000 GL calls; no crash.
+
+### 12.1 Causes [obs log + src]
+* **-22**: not the kernel. Selector 5 mapped the surfaces (the frontend's `surface N refused: fmt 0x77333072 1125x2436 bpr 4608 len 11239424`
+  line comes after the import); `format_from_iosurface()` in `sweetgl_frontend.c` knew only `'BGRA'`/`'RGBA'` and returned `-EINVAL` for
+  `'w30r'` (48 refusals, bpr **4608**), `0x0` (51; 600x600, 1105x1160, 375x812, 1380x1812, ...), `'b3a8'` (4; 1125x2436 bpr 4544, len 13893632,
+  more than bpr*h: a second plane or metadata [guess]) and `'LA08'` (2). `attachImage` had no fallback, so CA's display FBOs had no storage.
+* **The skipped calls**: not caused by the refusal. `bind_locked()` (frontend) on a take-back: thread A's Mesa TLS still names the context, so the
+  early `return 0` ran without setting `owner = A`/`bound`; `sweetgl_get_current()` then returned NULL on A for ever, so `sweetgl_gli_ensure()`
+  logged `make_current 0` and skipped every call. Order in the log: `taken over` (l.1558) -> first refusal (l.1563) -> skips.
+
+### 12.2 Changes (Mesa patch 0007 `gpu/mesa-patches/0007-sweetgl-w30r-attach-copy-fallback-context-steal.patch`, on 0006)
+* `bind_locked`: the take-back path re-marks owner/bound; the `taken over` line is logged 8 times at most.
+* `'w30r'` = `kCVPixelFormatType_30RGBLEPackedWideGamut`, "little-endian RGB101010, 2 MSB are zero, wide-gamut (384-895)" [src SDK 16.5
+  `CoreVideo.framework/Headers/CVPixelBuffer.h:87`]; bit order read like the neighbouring `'l10r'` ARGB2101010LE (`:88`): R 29:20, G 19:10, B 9:0
+  [src, by analogy; Metal twin `MTLPixelFormatBGR10_XR`, `MTLPixelFormat.h:78`]. Memory layout = `PIPE_FORMAT_B10G10R10X2_UNORM` (`u_format.yaml`
+  UN10,UN10,UN10,X2 from the LSB, swizzle Z,Y,X,1), renderable on Panfrost incl. v9 (`pan_format.c` `FMT(B10G10R10X2_UNORM, RGB10_A2_UNORM, BGR1,
+  L, VTR_IB)`, `_R` = render target; blend `BFMT(B10G10R10X2_UNORM, R10G10B10A2)`) [src Mesa 26.2.5]. **Not imported zero-copy** all the same: the
+  codes are extended range (384 = 0.0, 895 = 1.0), a UNORM target writes 0..1023, so blacks/whites would land outside the display range.
+* Copy fallback (`sweetgl_eagl.c`, conversion in `sweetgl_convert.h`): `attachImage` of a non-importable `'w30r'`/`'BGRA'`/`'RGBA'` surface gives
+  CA's texture GPU storage (`GL_RGB10_A2` for w30r, `GL_RGBA8` else), remembered per (context, texture) in 16 slots (a newer texture for the same
+  surface replaces the entry; `glDeleteTextures` and context dealloc drop it). The FBO bound when CA calls `glBindFramebuffer`/`glFlush`/
+  `glFinishObjectAPPLE`/`glFenceSync` marks its colour texture dirty; on Flush/FinishObjectAPPLE/FenceSync each dirty one is read back
+  (`glReadPixels` RGBA/`UNSIGNED_INT_2_10_10_10_REV`, allowed for RGB10_A2 by ES 3.0, Mesa `readpix.c:953`), `IOSurfaceLock(0)`, converted row by
+  row into the surface's bytes per row (c -> 384 + round(c*511/1023), padding untouched), `IOSurfaceUnlock`. GL state touched (read FBO, pack
+  buffer, pack alignment/row length, texture binding) is restored. Sampled w30r surfaces (texImageIOSurface fallback) convert the other way.
+* `0x0`, `'b3a8'`, `'LA08'`: no import (the kernel is no longer asked for formats the frontend cannot use), one log line per distinct
+  (format, w, h, bpr) with plane count, bytes/element, element size and alloc size; `attachImage` returns NO, logged once per shape; the context
+  stays current, so only that FBO is incomplete and other draws run.
+* Host test `sweetgl_convert_host_test.c` (cc -fsanitize=address,undefined): mapping for w30r/BGRA/RGBA and none for 0/b3a8/LA08, XR end points,
+  monotonic, round trip within 1 code, channel placement, the g6-a shape 1125x2436 bpr 4608 (padding untouched, last pixel offset), short-bpr
+  refusal: **24/24 PASS** [obs].
+
+### 12.3 Build [obs]
+Same commands as 11.3 (ninja -j4 under `heavy.lock`, 0 compiler warnings in the target, ld static-initializer warnings as before), `ldid -S`,
+`check-sdk-symbols.py` RESULT PASS. `$A/gpu/out/libsweetgl.dylib` 20938912 B, sha256 `11f6b32ce0a2bd86a43d0c14e8a650cd06b643c0cb832fab88c8e67e1944c976`
+(previous build kept in `$A/gpu/out/g6a-prev/`). Overlay `$A/gpu/g5/ov-g6a` (`/usr/local/lib/libsweetgl.dylib` 0755); archive with
+`--zlib-above 1048576` 4725360 B, sha256 `ca2e3a5536fb1cd60ed4b7456b624bab5db5af6a18fa2a86e2d9b84a08869bbb` (re-pack identical).
+
+### 12.4 Open [guess]
+1. Cost: one 1125x2436 readback + CPU conversion (~11 MB each way) per dirty display surface per flush; a GPU pass into a zero-copy
+   `B10G10R10X2_UNORM` import with the XR mapping in the shader would remove it.
+2. Dirty tracking assumes CA leaves or flushes the FBO it drew to; a surface drawn and handed on without a bind/flush/fence is not copied.
+3. w30r bit order is from the header comment by analogy with 'l10r' (no device check yet); fmt 0x0 surfaces are unidentified until the new log line.
+4. The take-back still lets two threads alternate one context (as before); safe only if CA serialises them.
