@@ -660,6 +660,10 @@ else
 	# patch 0167 (sweetaoc=5) extends it again: the joint L/R poll with the AOC tick
 	awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0167-aoc-playback.patch > $O/ampx/p2.diff
 	chk "amp_xnu_host_test: 0167-aoc-playback applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p2.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
+	# patch 0169 (sweetaoc=6) extends it again (DSP allowlist, bursts, the A9e hook) and adds sweet_amp_dsp.h (HALO load / start / stop; needs sweet_cs_dsp.h of 0166, extracted above)
+	awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0169-amp-dsp-load.patch > $O/ampx/p3.diff
+	chk "amp_xnu_host_test: 0169-amp-dsp-load applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p3.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
+	awk '$0=="+++ b/bsd/dev/sweet_amp_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0169-amp-dsp-load.patch > $O/sweet_amp_dsp.h
 	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
 	chk "amp_xnu_host_test" $O/amp_xnu_host_test
 	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c

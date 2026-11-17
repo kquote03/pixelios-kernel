@@ -8,7 +8,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PATCH = ROOT / "xnu/patches/0158-sweet-amp-init.patch"
 PATCH_A9 = ROOT / "xnu/patches/0166-aoc-audio.patch"	# patch 0166 (A9b) extends sweet_amp.h: its hunk is applied on top
 PATCH_PLAY = ROOT / "xnu/patches/0167-aoc-playback.patch"	# patch 0167 (sweetaoc=5) extends sweet_amp.h and sweet_audio.h again
-PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
+PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"
+PATCH_DSP = ROOT / "xnu/patches/0169-amp-dsp-load.patch"	# patch 0169 (sweetaoc=6): sweet_amp.h hunk + the new sweet_amp_dsp.h	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
 TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
@@ -47,6 +48,18 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("A9: GLOBAL_EN before the config not checked", "((d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))", "(d->st1 & AMP_ERR_BITS)"),
     ("A9: AOC close skipped", "\tamp_a9_cb.close(amp_a9_cb.ctx);", "\tif (0) amp_a9_cb.close(amp_a9_cb.ctx);"),
     ("A9: PLL poll does not stop at the lock", "d->polls < AMP_A9_PLL_POLLS && !d->locked", "d->polls < AMP_A9_PLL_POLLS"),
+]
+
+# patch 0169 A9e: the new stop / restore path of sweet_amp_dsp.h and its hook in sweet_amp.h (killed by the A9e cases of amp_xnu_host_test)
+MUTANTS_DSP = [
+    ("A9e: started core never stopped", "\tif (!d->started || d->stopped)\n\t\treturn;\n\td->stopped = 1;", "\tif (1)\n\t\treturn;\n\td->stopped = 1;"),
+    ("A9e: started marked only after the CCM write", "\td->started = 1;\n\te = amp_dsp_rmw(", "\te = amp_dsp_rmw("),
+    ("A9e: error bit after the start not checked", "(d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))\n\t\t\td->stage = DS_ERR;", "0)\n\t\t\td->stage = DS_ERR;"),
+    ("A9e: read-back not compared", "if ((!unp24 || (i & 3u)) && amp_dsp_rb[i] != d[off + i])", "if (0)"),
+]
+MUTANTS_HOOK = [
+    ("A9e: start with only L loaded", "amp_dsp_res.a[0].stage == DS_LOADED && amp_dsp_res.a[1].stage == DS_LOADED", "amp_dsp_res.a[0].stage == DS_LOADED"),
+    ("A9e: R loaded after a failed L", "if (amp_dsp_load(s, 0, &amp_dsp_res.a[0]) == AMP_OK)\n\t\t\t(void)", "(void)amp_dsp_load(s, 0, &amp_dsp_res.a[0]);\n\t\t\t(void)"),
 ]
 
 # patch 0167: the new stop path of sweet_audio.h (SOURCE on 0 before the BIND2 undo), killed by shim/aoc_audio_host_test.c
@@ -102,12 +115,15 @@ def apply(base: str, name: str, patches) -> str:
 
 def header_a9() -> str:
     """The 0158 header with the sweet_amp.h hunks of patches 0166 and 0167 applied on top."""
-    return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY])
+    return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY, PATCH_DSP])
 
 
 def run(hdr: str, d: pathlib.Path) -> bool:
     (d / "sweet_amp.h").write_text(hdr)
     (d / "sweet_amp_otp.h").write_text(header("sweet_amp_otp.h"))
+    (d / "sweet_cs_dsp.h").write_text(header("sweet_cs_dsp.h", PATCH_A9))
+    if not (d / "sweet_amp_dsp.h").exists() or not getattr(run, "dsp_mut", False):
+        (d / "sweet_amp_dsp.h").write_text(header("sweet_amp_dsp.h", PATCH_DSP))
     c = subprocess.run(["gcc", "-O1", "-w", f"-I{d}", "-o", str(d / "t"), str(TEST)], capture_output=True, text=True)
     if c.returncode:
         return False	# a mutant that does not compile counts as killed
@@ -147,9 +163,21 @@ def main() -> int:
             return 1
         k1 = sweep(good, MUTANTS, run, d)
         k2 = sweep(good_audio, MUTANTS_AUDIO, run_audio, d)
-        if k1 is None or k2 is None:
+        k3 = sweep(good, MUTANTS_HOOK, run, d)
+        good_dsp = header("sweet_amp_dsp.h", PATCH_DSP)
+
+        def run_dsp(hdr, dd):
+            (dd / "sweet_amp_dsp.h").write_text(hdr)
+            run.dsp_mut = True
+            try:
+                return run(good, dd)
+            finally:
+                run.dsp_mut = False
+        k4 = sweep(good_dsp, MUTANTS_DSP, run_dsp, d)
+        if k1 is None or k2 is None or k3 is None or k4 is None:
             return 1
-    n = len(MUTANTS) + len(MUTANTS_AUDIO)
+    n = len(MUTANTS) + len(MUTANTS_AUDIO) + len(MUTANTS_HOOK) + len(MUTANTS_DSP)
+    k1 = k1 + k3 + k4
     ok = k1 + k2 == n
     print(f"RESULT: {'PASS' if ok else 'FAIL'} {k1 + k2}/{n} mutants killed")
     return 0 if ok else 1

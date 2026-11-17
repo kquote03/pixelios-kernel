@@ -1,0 +1,1058 @@
+SWEET AMP DSP (patch 0169, plan A9e), boot-arg sweetaoc=6 + sweetamp=1: sweetaoc=5 plus the CS35L41 HALO DSP firmware load of both amps.
+New bsd/dev/sweet_amp_dsp.h (sequence + cites in its header); sweet_amp.h: DSP allowlist, CS-held bursts, A9 hook; sweet_amp.c:
+sweet_amp_dsp_arm (/chosen/memory-map AMPFW, tools/pack_ampfw.py, lengths + sha256 pinned); sweet_aoc.c / sweet_aoc_start.c: mode 6.
+Per amp (L, then R): pre-check, cs35l41_dsp_init writes (RX/TX RATE := 1, RX5..8 SRC), the 6 wmfw regions, the HALO id header +
+algorithm list, the .bin blocks (L / R- file), every byte read back; 0166 TDM config; MPU config, CCM_CORE_CTRL start (0x201); heartbeat
+window 1, 0167 stream + PLL poll, window 2; WDT off, CCM EN off (read back); AOC close; 0158 restore. PWR_CTRL1 never written; no
+SOFT_RESET, no mailbox write, no amp enable. Pass "SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r", else
+"SWEET AMP DSP: stopped l=<stage> r=<stage> ...". No Linux code or table copied. Host test shim/amp_xnu_host_test.c. BUILT, UNRUN.
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+index 8dda9f9..ed7f26c 100644
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -151,6 +151,45 @@ sweet_amp_init(void)
+  * 5/6 PLL locked L/R, 7 bits: 1 L error, 2 R error, 4 L GLOBAL_EN, 8 R GLOBAL_EN, 16 L PLL_UNLOCK, 32 R PLL_UNLOCK. */
+ /* patch 0167 (sweetaoc=5): + tick (once per poll ms, may be NULL) and polls (0 = the 0166 per-amp poll; else the joint poll, <= 500) */
+ int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx, uint32_t out[8]);
++
++/* patch 0169 (plan A9e, sweetaoc=6): arm the HALO DSP firmware load for the next sweet_amp_audio_run. The files come from /chosen/memory-map
++ * AMPFW <pa, size> (tools/mkpayload.py --ampfw, container tools/pack_ampfw.py), read through ml_static_ptovirt as AOCFW (patch 0164); the
++ * container layout, every length and every sha256 are checked (sweet_amp_dsp.h amp_dsp_container) before any amp is touched. Missing or
++ * wrong files: the DSP stage reports no-fw and writes nothing; the sweetaoc=5 part still runs. */
++static int sa_dsp;
++void sweet_amp_dsp_arm(void);
++void
++sweet_amp_dsp_arm(void)
++{
++	DTEntry mm;
++	void const *p = NULL;
++	unsigned int psize = 0;
++	uint64_t pa = 0, len = 0;
++	int rc;
++
++	sa_dsp = 1;
++	amp_dsp_fw_in = (struct amp_dsp_fw){ { 0 }, { 0 } };
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess || SecureDTGetProperty(mm, "AMPFW", &p, &psize) != kSuccess ||
++	    psize != 2 * sizeof(uint64_t)) {
++		printf("SWEET AMP DSP: no AMPFW (xrun --ampfw): no DSP write\n");
++		return;
++	}
++	memcpy(&pa, p, sizeof(pa));
++	memcpy(&len, (uint8_t const *)p + sizeof(pa), sizeof(len));
++	if (pa == 0 || len < 64u || len > 0x100000u || pa + len < pa) {
++		printf("SWEET AMP DSP: AMPFW <%#llx, %#llx> out of bounds: no DSP write\n", pa, len);
++		return;
++	}
++	rc = amp_dsp_container((const uint8_t *)ml_static_ptovirt((vm_offset_t)pa), (size_t)len, &amp_dsp_fw_in);
++	if (rc != 0) {
++		amp_dsp_fw_in = (struct amp_dsp_fw){ { 0 }, { 0 } };
++		printf("SWEET AMP DSP: AMPFW container code %d (layout / length / sha256 not the pinned files): no DSP write\n", rc);
++		return;
++	}
++	printf("SWEET AMP DSP: AMPFW at %#llx, %llu bytes: wmfw %u, bin L %u, bin R %u bytes, sha256 pinned\n", pa, len, amp_dsp_fw_in.n[0],
++	    amp_dsp_fw_in.n[1], amp_dsp_fw_in.n[2]);
++}
++
+ int
+ sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx, uint32_t out[8])
+ {
+@@ -166,9 +205,10 @@ sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(voi
+ 			return -1;
+ 		}
+ 	}
+-	printf("SWEET AMP: a9 run (sweetaoc=%s): identify, init, TDM config, AOC open%s, PLL lock, AOC close, restore\n", polls ? "5" : "4",
+-	    polls ? " + stream start (silence)" : "");
+-	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx, tick, polls };
++	printf("SWEET AMP: a9 run (sweetaoc=%s): identify, init, %sTDM config, %sAOC open%s, PLL lock, %sAOC close, restore\n",
++	    sa_dsp ? "6" : polls ? "5" : "4", sa_dsp ? "DSP load, " : "", sa_dsp ? "DSP start + heartbeat, " : "", polls ? " + stream start (silence)" : "",
++	    sa_dsp ? "heartbeat, DSP stop, " : "");
++	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx, tick, polls, sa_dsp };	/* patch 0169: sa_dsp from sweet_amp_dsp_arm */
+ 	rc = amp_init_run();
+ 	amp_a9_cb = (struct amp_a9_cb){ 0 };
+ 	out[0] = (uint32_t)rc;
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+index 816f4a9..076c29b 100644
+--- a/bsd/dev/sweet_amp.h
++++ b/bsd/dev/sweet_amp.h
+@@ -266,6 +266,83 @@ static inline __attribute__((always_inline)) int amp_a9_read_ok(uint32_t reg)
+ 	       reg == 0x2C04u || reg == 0x2C0Cu || reg == 0x4840u || reg == AMP_REG_PWR_CTRL1;
+ }
+ 
++/* ---- patch 0169 (A9e, sweetaoc=6): the HALO DSP register allowlist (logic in sweet_amp_dsp.h). Addresses: Linux v6.18 include/sound/cs35l41.h
++ * (= AMP cs35l41.h). Memory, [first register, end): XM packed 0x2000000..0x2002FF0 (:216-217), XM unpacked24 0x2800000..0x2803FF4 (:253-254),
++ * YM packed 0x2C00000..0x2C017F0 (:486-487), YM unpacked24 0x3400000..0x3401FF4 (:490-491), PM 0x3800000..0x3804FE8 (:492-493); all readable
++ * (AMP cs35l41-tables.c:592-598). Only these five ranges take a burst (one CS-low transaction, regmap_raw_write / raw_read as wm_adsp). ---- */
++#define AMP_DSP_NMEM		5u
++static const uint32_t amp_dsp_mem[AMP_DSP_NMEM][2] = {
++	{ 0x02000000u, 0x02002FF4u }, { 0x02800000u, 0x02803FF8u }, { 0x02C00000u, 0x02C017F4u }, { 0x03400000u, 0x03401FF8u }, { 0x03800000u, 0x03804FECu },
++};
++#define AMP_DSP_CCM		0x02BC1000u	/* DSP1_CCM_CORE_CTRL = CTRL_BASE 0x2B80000 + HALO_CCM_CORE_CONTROL 0x41000 (AMP wm_adsp.c:239, cs35l41.h:318) */
++#define AMP_DSP_CORE_EN		0x1u		/* HALO_CORE_EN (AMP wm_adsp.c:285) */
++#define AMP_DSP_CORE_RESET	0x200u		/* HALO_CORE_RESET (AMP wm_adsp.c:284) */
++#define AMP_DSP_WDT		0x02BC7000u	/* CTRL_BASE + HALO_WDT_CONTROL 0x47000 (AMP wm_adsp.c:241); EN mask 0x1 (:295) */
++#define AMP_DSP_MPU_LOCK	0x02BC3140u	/* CTRL_BASE + HALO_MPU_LOCK_CONFIG 0x43140 (AMP wm_adsp.c:272) */
++#define AMP_DSP_MBOX2		0x00013004u	/* DSP_MBOX_2 = CSPL_MBOX_STS (AMP cs35l41.h:179, :793): read only, no mailbox command is sent */
++#define AMP_DSP_CLK_CTRL	0x00002C08u	/* DSP_CLK_CTRL (AMP cs35l41.h:54), default 0x3 (AMP cs35l41-tables.c:38): read only */
++#define AMP_DSP_SCRATCH1	0x02B805C0u	/* CTRL_BASE + HALO_SCRATCH1..4 0x5c0/0x5c8/0x5d0/0x5d8 (AMP wm_adsp.c:235-238): read only */
++/* the 20 MPU access words of wm_halo_configure_mpu (AMP wm_adsp.c:3098-3126): CTRL_BASE + 0x43000.. per block n: XMEM, YMEM, WINDOW, XREG, YREG */
++static const uint16_t amp_dsp_mpu_off[20] = { 0x000, 0x004, 0x008, 0x00C, 0x014, 0x018, 0x01C, 0x020, 0x024, 0x02C,
++					      0x030, 0x034, 0x038, 0x03C, 0x044, 0x048, 0x04C, 0x050, 0x054, 0x05C };
++#define AMP_DSP_MPU_BASE	0x02BC3000u
++/* the DSP RX sources of cs35l41_dsp_init (AMP cs35l41.c:3743-3766; cs35l41.h:103-106, :639-643): RX5 VPMON, RX6 CLASSH, RX7 TEMPMON, RX8 RSVD */
++#define AMP_DSP_RXSRC(X) X(0x4C50u, 0x28u) X(0x4C54u, 0x21u) X(0x4C58u, 0x3Au) X(0x4C5Cu, 0x3Bu)
++/* cs35l41_fs_errata_patch (AMP cs35l41.c:3688-3705, applied by cs35l41_dsp_init :3730-3732): DSP1_RX1..8_RATE 0x2B80080 + 8 * i and
++ * DSP1_TX1..8_RATE 0x2B80280 + 8 * i := 1 (= Linux v6.18 cs35l41-lib.c:680-697 by name) */
++static inline __attribute__((always_inline)) int amp_dsp_errata_reg(uint32_t reg)
++{
++	return ((reg >= 0x02B80080u && reg <= 0x02B800B8u) || (reg >= 0x02B80280u && reg <= 0x02B802B8u)) && !(reg & 7u);
++}
++static inline __attribute__((always_inline)) int amp_dsp_mpu_reg(uint32_t reg)
++{
++	for (unsigned i = 0; i < 20u; i++)
++		if (reg == AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i])
++			return 1;
++	return 0;
++}
++/* [reg, reg + n) inside ONE memory range, word aligned, n a non-zero multiple of 4 */
++static inline __attribute__((always_inline)) int amp_dsp_mem_ok(uint32_t reg, uint32_t n)
++{
++	if (n == 0u || (n & 3u) || (reg & 3u))
++		return 0;
++	for (unsigned i = 0; i < AMP_DSP_NMEM; i++)
++		if (reg >= amp_dsp_mem[i][0] && reg < amp_dsp_mem[i][1] && n <= amp_dsp_mem[i][1] - reg)
++			return 1;
++	return 0;
++}
++/* the armed DSP read-modify-write row (CCM start / stop, WDT stop): set by amp_dsp_rmw for exactly one amp_write; old = the word read just before */
++static struct { int on; uint32_t reg, mask, field, old; } amp_dsp_row;
++_Static_assert(AMP_DSP_CCM != AMP_REG_PWR_CTRL1 && AMP_DSP_WDT != AMP_REG_PWR_CTRL1 && AMP_DSP_MPU_LOCK != AMP_REG_PWR_CTRL1, "never PWR_CTRL1");
++_Static_assert(AMP_REG_PWR_CTRL1 < 0x02000000u && AMP_REG_PWR_CTRL1 != 0x4C50u && AMP_REG_PWR_CTRL1 != 0x4C54u && AMP_REG_PWR_CTRL1 != 0x4C58u &&
++	       AMP_REG_PWR_CTRL1 != 0x4C5Cu, "PWR_CTRL1 is outside every DSP range and is no RX source");
++/* a single DSP control write: the errata words := 1, the four RX sources := their stock value, the MPU access words := lock_regions 0xFFFFFFFF
++ * (AMP cs35l41.c:3725, all-ones also for the X/YMEM words), LOCK_CONFIG := 0x5555, 0xAAAA, 0, or the armed CCM / WDT row. Never PWR_CTRL1. */
++static inline __attribute__((always_inline)) int amp_dsp_ctl_ok(uint32_t reg, uint32_t val)
++{
++	int ok = 0;
++
++	if (reg == AMP_REG_PWR_CTRL1)
++		return 0;
++#define AMP_DSP_RX_OK(r, v) ok |= (reg == (r) && val == (v));
++	AMP_DSP_RXSRC(AMP_DSP_RX_OK)
++#undef AMP_DSP_RX_OK
++	ok |= amp_dsp_errata_reg(reg) && val == 1u;
++	ok |= amp_dsp_mpu_reg(reg) && val == 0xFFFFFFFFu;
++	ok |= reg == AMP_DSP_MPU_LOCK && (val == 0x5555u || val == 0xAAAAu || val == 0u);
++	ok |= amp_dsp_row.on && (reg == AMP_DSP_CCM || reg == AMP_DSP_WDT) && reg == amp_dsp_row.reg && (val & amp_dsp_row.mask) == amp_dsp_row.field &&
++	      (val & ~amp_dsp_row.mask) == (amp_dsp_row.old & ~amp_dsp_row.mask);
++	return ok;
++}
++/* a register the DSP part reads (single read or the start of a burst): memory, the control words above, the MPU violation words
++ * 0x2BC3100..0x2BC3114 (AMP wm_adsp.c:266-271), MBOX_2, DSP_CLK_CTRL, SCRATCH1..4 */
++static inline __attribute__((always_inline)) int amp_dsp_rd_ok(uint32_t reg)
++{
++	return amp_dsp_mem_ok(reg, 4u) || amp_dsp_errata_reg(reg) || amp_dsp_mpu_reg(reg) || reg == AMP_DSP_MPU_LOCK || reg == AMP_DSP_CCM ||
++	       reg == AMP_DSP_WDT || (reg >= 0x02BC3100u && reg <= 0x02BC3114u && !(reg & 3u)) || reg == AMP_DSP_MBOX2 || reg == AMP_DSP_CLK_CTRL ||
++	       (reg >= AMP_DSP_SCRATCH1 && reg <= AMP_DSP_SCRATCH1 + 0x18u && !(reg & 7u)) || (reg >= 0x4C50u && reg <= 0x4C5Cu && !(reg & 3u));
++}
++
+ /* a (register, value) pair the init may write: the 12 of AMP_INIT_SEQ, the four OTP test-key words, a register an OTP map row names; never PWR_CTRL1 */
+ static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint32_t val)
+ {
+@@ -277,7 +354,7 @@ static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint
+ 	AMP_INIT_SEQ(AMP_W_OK)
+ #undef AMP_W_OK
+ 	ok |= reg == AMP_REG_TEST_KEY && (val == AMP_OTP_KEY_UNLOCK1 || val == AMP_OTP_KEY_UNLOCK2 || val == AMP_OTP_KEY_LOCK1 || val == AMP_OTP_KEY_LOCK2);
+-	return ok || amp_otp_reg_ok(reg) || amp_a9_ok(reg, val);	/* patch 0166: + the armed A9 row */
++	return ok || amp_otp_reg_ok(reg) || amp_a9_ok(reg, val) || amp_dsp_ctl_ok(reg, val);	/* patch 0166: + the armed A9 row; 0169: + DSP */
+ }
+ 
+ /* a register an armed read may name: the seven of the A1 / A7 reads, OTPID, OTP_MEM0..31, a register an OTP map row names */
+@@ -285,7 +362,8 @@ static inline __attribute__((always_inline)) int amp_read_ok(uint32_t reg)
+ {
+ 	return reg == AMP_REG_IRQ1_STATUS4 || reg == AMP_REG_IRQ1_STATUS3 || reg == AMP_REG_DEVID || reg == AMP_REG_REVID || reg == AMP_REG_IRQ1_STATUS1 ||
+ 	       reg == AMP_REG_IRQ1_MASK1 || reg == AMP_REG_CCM_CORE || reg == AMP_OTP_REG_OTPID ||
+-	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg) || amp_a9_read_ok(reg);
++	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg) || amp_a9_read_ok(reg) ||
++	       amp_dsp_rd_ok(reg);	/* patch 0169 */
+ }
+ 
+ /* byte `pos` of the 10-byte write frame of (reg, val): the address with bit 31 clear, 2 pad bytes 0, the value, all big endian */
+@@ -297,8 +375,24 @@ static inline __attribute__((always_inline)) uint32_t wframe_byte(uint32_t reg,
+ 
+ /* the armed transfer: on = 1 a write (set only by amp_write() after amp_write_ok), on = 2 a read (amp_read(), its address frame only); cleared right
+  * after its frame; read by w32 only */
+-struct amp_arm { int on; uint32_t reg, val; };
++/* patch 0169: on = 3 one FIFO fill of a DSP burst write (amp_wburst), on = 4 one RX fill of a DSP burst read (amp_rburst): bd / bn = the armed
++ * source bytes and their count, boff = the bytes of it sent before this fill, fill = the bytes of this fill, hdr = 1 if it starts with the 6
++ * address / pad bytes */
++struct amp_arm { int on; uint32_t reg, val; const uint8_t *bd; uint32_t bn, boff, fill; int hdr; };
+ static struct amp_arm amp_arm;
++#define AMP_FILL_MAX	48u		/* bytes per FIFO fill of a burst (SPI_FIFO_BYTES 0x40 holds it); the first fill: 6 header + 40 data */
++#define AMP_FILL_HDR	40u
++
++/* patch 0169: byte `pos` of the armed burst fill: the write header (address bit 31 clear, 2 pad bytes 0), then the armed source bytes; 0x100 = none */
++static inline __attribute__((always_inline)) uint32_t amp_burst_byte(uint32_t pos)
++{
++	if (amp_arm.hdr) {
++		if (pos < AMP_ADDR_BYTES + AMP_PAD_BYTES)
++			return wframe_byte(amp_arm.reg, 0u, pos);
++		pos -= AMP_ADDR_BYTES + AMP_PAD_BYTES;
++	}
++	return amp_arm.bd && amp_arm.boff + pos < amp_arm.bn ? amp_arm.bd[amp_arm.boff + pos] : 0x100u;
++}
+ 
+ 
+ _Static_assert(AMP_SPI_BASE == PERI_SPI13_BASE, "the amps are on spi13 (tools/boards.py)");
+@@ -521,6 +615,11 @@ __attribute__((noipa)) static int w32_allowed(uintptr_t pa, uint32_t old, uint32
+ 			return 1;
+ 		if (arm == 1)	/* A7: one armed, allowed write frame queued in full */
+ 			return amp_write_ok(areg, aval) && (v & CH_RX) && !(v & CH_SWRST) && !(old & CH_TX) && TX_LVL(aux) == AMP_WTX_BYTES;
++		if (arm == 3)	/* patch 0169: one armed DSP burst fill queued in full */
++			return amp_dsp_mem_ok(areg, amp_arm.bn) && amp_arm.fill > 0u && amp_arm.fill <= AMP_FILL_MAX && (v & CH_RX) && !(v & CH_SWRST) &&
++			       !(old & CH_TX) && TX_LVL(aux) == amp_arm.fill;
++		if (arm == 4)	/* patch 0169: a burst RX fill never switches the transmitter on */
++			return 0;
+ 		return (v & CH_RX) && !(v & CH_SWRST) && !(old & CH_TX) && TX_LVL(aux) == AMP_TX_BYTES;
+ 	}
+ 	if (pa == A_MODECFG)	/* hwinit: 0, then the trailing count (SGS :1458-1478); byte width, no DMA / 4-burst / loopback */
+@@ -535,10 +634,16 @@ __attribute__((noipa)) static int w32_allowed(uintptr_t pa, uint32_t old, uint32
+ 		return v == SPI_PND_CLR_ALL || v == 0u;
+ 	if (pa == A_PKT)	/* enable_datapath: count & ~EN, count, count | EN (SGS :572-581); flush 0 (:268) */
+ 		return v == 0u || v == AMP_TX_BYTES || v == AMP_VAL_BYTES || v == (AMP_TX_BYTES | PKT_EN) || v == (AMP_VAL_BYTES | PKT_EN) ||
+-		       (v == rv && !(v & PKT_EN)) || (arm == 1 && amp_write_ok(areg, aval) && (v == AMP_WTX_BYTES || v == (AMP_WTX_BYTES | PKT_EN)));
++		       (v == rv && !(v & PKT_EN)) || (arm == 1 && amp_write_ok(areg, aval) && (v == AMP_WTX_BYTES || v == (AMP_WTX_BYTES | PKT_EN))) ||
++		       ((arm == 3 || arm == 4) && amp_dsp_mem_ok(areg, amp_arm.bn) && amp_arm.fill > 0u && amp_arm.fill <= AMP_FILL_MAX &&
++			(v == amp_arm.fill || v == (amp_arm.fill | PKT_EN)));	/* patch 0169: a DSP burst fill */
+ 	if (pa == A_TX) {	/* one byte per 32-bit write (writesb_32, SGS :519-529) */
+ 		if (arm == 1)	/* A7: exactly the armed write frame, byte by byte */
+ 			return !(aux & CH_TX) && amp_write_ok(areg, aval) && TX_LVL(old) < AMP_WTX_BYTES && v == wframe_byte(areg, aval, TX_LVL(old));
++		if (arm == 3)	/* patch 0169: exactly the armed DSP burst bytes (address header, then the source), byte by byte */
++			return !(aux & CH_TX) && amp_dsp_mem_ok(areg, amp_arm.bn) && TX_LVL(old) < amp_arm.fill && v <= 0xffu && v == amp_burst_byte(TX_LVL(old));
++		if (arm == 4)
++			return 0;
+ 		if (arm == 2)	/* A7: exactly the armed read address frame, byte by byte */
+ 			return !(aux & CH_TX) && amp_read_ok(areg) && TX_LVL(old) < AMP_TX_BYTES && v == frame_byte(areg, TX_LVL(old));
+ 		return !(aux & CH_TX) && tx_byte_ok(TX_LVL(old), v);
+@@ -763,6 +868,103 @@ static int amp_write(const struct amp_snap *s, int cs, uint32_t reg, uint32_t va
+ 	return e;
+ }
+ 
++/* ---- patch 0169 (A9e): DSP memory bursts. Stock wm_adsp_load / wm_adsp_load_coeff write a whole region with ONE regmap_raw_write (AMP
++ * wm_adsp.c:1987-2002, :2722-2738) and read the algorithm list with one regmap_raw_read (:2134-2181): on SPI one chip-select-low transaction,
++ * the address once (bit 31 clear = write, set = read), 2 pad bytes, then the words back to back (regmap-spi, AMP cs35l41-spi.c:33-46: 32-bit
++ * big-endian registers, stride 4, pad 16 bits). Here the same bytes go out with the chip select held low across FIFO fills of <= AMP_FILL_MAX
++ * bytes (the read path of amp_read already holds CS across two transfers); every fill is armed (on = 3 / 4) and its bytes checked by w32. ---- */
++
++/* one fill of the armed burst: tx = the armed bytes out (RX on, RX discarded, as xfer), else amp_arm.fill bytes in into buf */
++static int xferb(const struct amp_snap *s, int tx, uint8_t *buf)
++{
++	uint32_t ch = 0, pk = 0, b = 0, n = amp_arm.fill;
++	int e, f;
++
++	if (n == 0u || n > AMP_FILL_MAX || !r32(A_CH, &ch) || !r32(A_PKT, &pk))
++		return AMP_ERROR;
++	ch = (ch & ~CH_TX) | CH_RX;
++	if (w32(s, A_PKT, pk & ~PKT_EN) || w32(s, A_PKT, n) || w32(s, A_PKT, n | PKT_EN))
++		return AMP_ERROR;
++	for (uint32_t p = 0; tx && p < n; p++)
++		if (w32(s, A_TX, amp_burst_byte(p)))
++			return AMP_ERROR;
++	if (w32(s, A_CH, ch | (tx ? CH_TX : 0u)))
++		return AMP_ERROR;
++	e = wait_lvl(0, n);
++	for (uint32_t i = 0; e == AMP_OK && !tx && i < n; i++) {
++		if (!r32(A_RX, &b))
++			e = AMP_ERROR;
++		buf[i] = (uint8_t)b;
++	}
++	f = flush(s);
++	return e != AMP_OK ? e : f;
++}
++
++/* both chip selects read high, then this one low + SLAVE_SEL auto (as amp_write); 0 = selected */
++static int amp_cs_take(const struct amp_snap *s, int cs)
++{
++	uintptr_t dat = cs ? DAT(AMP_PIN_CS1_BANK) : DAT(AMP_PIN_CS0_BANK), odat = cs ? DAT(AMP_PIN_CS0_BANK) : DAT(AMP_PIN_CS1_BANK);
++	uint32_t nr = cs ? AMP_PIN_CS1_NR : AMP_PIN_CS0_NR, onr = cs ? AMP_PIN_CS0_NR : AMP_PIN_CS1_NR, o = 0;
++
++	if (!r32(odat, &o) || !peri_pin_bit(o, onr) || !r32(dat, &o) || !peri_pin_bit(o, nr))
++		return AMP_ERROR;
++	if (pad_put(s, dat, nr, 1u, 0u) || w32(s, A_SLAVE, V_SLAVE_AUTO))
++		return AMP_ERROR;
++	return AMP_OK;
++}
++
++static int amp_cs_give(const struct amp_snap *s, int cs)
++{
++	return pad_put(s, cs ? DAT(AMP_PIN_CS1_BANK) : DAT(AMP_PIN_CS0_BANK), cs ? AMP_PIN_CS1_NR : AMP_PIN_CS0_NR, 1u, 1u) ? AMP_ERROR : AMP_OK;
++}
++
++/* n bytes of d to the registers from reg on (one transaction); only inside one DSP memory range */
++static int amp_wburst(const struct amp_snap *s, int cs, uint32_t reg, const uint8_t *d, uint32_t n)
++{
++	uint32_t off = 0, k;
++	int e, first = 1;
++
++	if (!d || !amp_dsp_mem_ok(reg, n))
++		return AMP_ERROR;
++	e = amp_cs_take(s, cs);
++	while (e == AMP_OK && off < n) {
++		k = n - off < (first ? AMP_FILL_HDR : AMP_FILL_MAX) ? n - off : (first ? AMP_FILL_HDR : AMP_FILL_MAX);
++		amp_arm = (struct amp_arm){ 3, reg, 0u, d, n, off, k + (first ? AMP_TX_BYTES : 0u), first };
++		e = xferb(s, 1, 0);
++		off += k;
++		first = 0;
++	}
++	amp_arm = (struct amp_arm){ 0 };
++	if (amp_cs_give(s, cs) != AMP_OK)
++		e = AMP_ERROR;
++	return e;
++}
++
++/* n bytes from the registers from reg on into buf (one transaction: the 6-byte read address frame, then RX fills) */
++static int amp_rburst(const struct amp_snap *s, int cs, uint32_t reg, uint8_t *buf, uint32_t n)
++{
++	uint32_t off = 0, k, dummy = 0;
++	int e;
++
++	if (!buf || !amp_dsp_mem_ok(reg, n))
++		return AMP_ERROR;
++	e = amp_cs_take(s, cs);
++	if (e == AMP_OK) {
++		amp_arm = (struct amp_arm){ 2, reg, 0u, 0, 0u, 0u, 0u, 0 };
++		e = xfer(s, reg, 1, &dummy);
++	}
++	while (e == AMP_OK && off < n) {
++		k = n - off < AMP_FILL_MAX ? n - off : AMP_FILL_MAX;
++		amp_arm = (struct amp_arm){ 4, reg, 0u, 0, n, off, k, 0 };
++		e = xferb(s, 0, buf + off);
++		off += k;
++	}
++	amp_arm = (struct amp_arm){ 0 };
++	if (amp_cs_give(s, cs) != AMP_OK)
++		e = AMP_ERROR;
++	return e;
++}
++
+ /* identified as the stock probe requires before any write: the reads worked, OTP_BOOT_DONE seen, OTP_BOOT_ERR clear, DEVID / REVID = CS35L41 B2 */
+ #define AMP_ID_OK(ee, rr)	((ee) == AMP_OK && (rr).otp && !((rr).st3 & AMP_OTP_BOOT_ERR) && (rr).devid == AMP_DEVID && (rr).revid == AMP_REVID)
+ 
+@@ -1101,8 +1303,11 @@ static int bring_up(const struct amp_snap *s)
+ 
+ /* ---- A9b run (patch 0166): called by amp_init_run between the init of both amps and the restore, only when the AOC glue armed amp_a9_cb ---- */
+ /* patch 0167: polls != 0 selects the joint L/R poll (bound min(polls, AMP_A9_PLL_POLLS_MAX)); tick (may be NULL) runs once per poll ms */
+-struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; void (*tick)(void *ctx); unsigned polls; };
++/* patch 0169 (sweetaoc=6): dsp = 1 adds the HALO firmware load / start / heartbeat / stop of sweet_amp_dsp.h around the AOC open */
++struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; void (*tick)(void *ctx); unsigned polls; int dsp; };
+ static struct amp_a9_cb amp_a9_cb;
++#include "sweet_amp_dsp.h"
++
+ struct amp_a9_side { int cfg, locked, unlock, gen, err; unsigned writes, skipped, polls; uint32_t st1, st3, pwr1; uint32_t snap[AMP_A9_NSNAP]; };
+ /* patch 0167: IRQ1_STATUS3 as last read at these poll counts (0 = not reached) */
+ static const unsigned amp_a9_snap_at[AMP_A9_NSNAP] = { 1u, 10u, 100u, 250u, 500u };
+@@ -1266,13 +1471,25 @@ static void amp_a9_pll2(const struct amp_snap *s)
+ static void amp_a9_part(const struct amp_snap *s, int il, int ir)
+ {
+ 	amp_a9_res = (struct amp_a9_res){ 0 };
++	amp_dsp_res = (struct amp_dsp_res){ 0 };
+ 	amp_a9_res.ran = 1;
+ 	if (il != AMP_OK || ir != AMP_OK) {
+ 		say("a9: ", "init not ok on both amps: no TDM config, no AOC open");
+ 		return;
+ 	}
++	if (amp_a9_cb.dsp) {		/* patch 0169: load L, then R (no R write after a failed L, as the 0158 init) */
++		amp_dsp_res.ran = 1;
++		if (amp_dsp_load(s, 0, &amp_dsp_res.a[0]) == AMP_OK)
++			(void)amp_dsp_load(s, 1, &amp_dsp_res.a[1]);
++	}
+ 	if (amp_a9_cfg(s, 0, "L", &amp_a9_res.a[0]) != AMP_OK || amp_a9_cfg(s, 1, "R", &amp_a9_res.a[1]) != AMP_OK)
+-		return;
++		return;			/* no core was started: nothing to stop */
++	if (amp_a9_cb.dsp && amp_dsp_res.a[0].stage == DS_LOADED && amp_dsp_res.a[1].stage == DS_LOADED) {
++		/* patch 0169: start both (after the TDM / PLL config, as stock hw_params before the DAPM power-up), window 1 before the stream */
++		if (amp_dsp_start(s, 0, &amp_dsp_res.a[0]) == AMP_OK)
++			(void)amp_dsp_start(s, 1, &amp_dsp_res.a[1]);
++		amp_dsp_window(s, 1, 0, 0);
++	}
+ 	amp_a9_res.opened = amp_a9_cb.open(amp_a9_cb.ctx);
+ 	if (amp_a9_res.opened && amp_a9_cb.polls) {
+ 		amp_a9_pll2(s);			/* patch 0167 (sweetaoc=5): joint poll while the stream runs */
+@@ -1280,6 +1497,11 @@ static void amp_a9_part(const struct amp_snap *s, int il, int ir)
+ 		amp_a9_pll(s, 0, "L", &amp_a9_res.a[0]);
+ 		amp_a9_pll(s, 1, "R", &amp_a9_res.a[1]);
+ 	}
++	if (amp_a9_cb.dsp) {		/* patch 0169: window 2 with the stream (fed each ms), then stop every started core, before the AOC close */
++		amp_dsp_window(s, 2, amp_a9_res.opened ? amp_a9_cb.tick : 0, amp_a9_cb.ctx);
++		amp_dsp_stop(s, 0, &amp_dsp_res.a[0]);
++		amp_dsp_stop(s, 1, &amp_dsp_res.a[1]);
++	}
+ 	amp_a9_cb.close(amp_a9_cb.ctx);		/* undo the AOC bind on every path after an open attempt (the glue knows if it was sent) */
+ }
+ 
+@@ -1370,6 +1592,8 @@ static int amp_init_run(void)
+ 		say("!!! RESTORE FAILED: ", "a phone reset clears it (guess)");
+ 	}
+ 	result(&l, &r, restored ? "ok" : "FAILED");
++	if (amp_a9_cb.on && amp_a9_cb.dsp)
++		amp_dsp_verdict(restored);	/* patch 0169: SWEET AMP DSP: ... */
+ 	pass = e == AMP_OK && il == AMP_OK && ir == AMP_OK && AMP_ID_OK(el, l) && AMP_ID_OK(er, r) && restored;	/* review F1: ONE condition */
+ 	con_str("SWEET", pass ? "AMP: init ok (otp unpack) l,r devid 35a40 rev b2, errors=0" : "AMP: init FAILED (see the AMP lines)");
+ 	return pass ? 0 : 1;
+diff --git a/bsd/dev/sweet_amp_dsp.h b/bsd/dev/sweet_amp_dsp.h
+new file mode 100644
+index 0000000..0325734
+--- /dev/null
++++ b/bsd/dev/sweet_amp_dsp.h
+@@ -0,0 +1,570 @@
++/*
++ * bsd/dev/sweet_amp_dsp.h - xnu patch 0169 (plan step A9e, boot-arg sweetaoc=6 with sweetamp=1): the CS35L41 HALO DSP firmware load of both speaker
++ * amps, start of the core, a bounded check that it runs, then stop. Included by sweet_amp.h (after the SPI layer, before the A9 run); pure logic,
++ * also compiled by shim/amp_xnu_host_test.c against a fake amp with DSP memory. No Linux code or table is copied: register addresses, values and
++ * file-format constants only (as sweet_cs_dsp.h of patch 0166, which parses the files here).
++ *
++ * Files (vendor.img /vendor/firmware, docs/research/46 (a) 8; names: AMP wm_adsp.c:1848-1849 "%s-%s-%s.wmfw" = cs35l41-dsp1-spk-prot.wmfw for
++ * both amps; :2596-2602 "%s-%s-%s.bin", with the DT cirrus,tuning-has-prefix and sound-name-prefix "R" on cs35l41@1 only -> L cs35l41-dsp1-spk-prot.bin,
++ * R R-cs35l41-dsp1-spk-prot.bin), pinned by length + sha256 below and in tools/pack_ampfw.py; delivered as /chosen/memory-map AMPFW (container
++ * AMPFWV01 of tools/pack_ampfw.py, the pack_wlanfw layout). The blobs never go in git.
++ *
++ * Sequence, stock = Google amplifiers 33976d7 (AMP) cs35l41.c + snd_soc_wm_adsp/wm_adsp.c, Linux v6.18 where it differs:
++ *  probe   cs35l41_dsp_init (AMP cs35l41.c:3707-3766, after the CCM := 0 of :4401 that patch 0158 already writes): cs35l41_fs_errata_patch
++ *          DSP1_RX1..8_RATE / TX1..8_RATE := 1 (:3688-3705, :3730-3732; v6.18 cs35l41-lib.c:680-697, :1497-1508), DSP1_RX5..8_SRC := VPMON, CLASSH,
++ *          TEMPMON, RSVD (:3743-3766). Each written word is read back here.
++ *  load    DSP1 Preloader PRE_PMU -> wm_adsp_boot_work (wm_adsp.c:3041-3096; HALO has no enable_memory / enable_core, ops :4620-4634):
++ *          wm_adsp_load (:1826-2010): every memory region of the wmfw as one raw write to region_to_reg (:867-883); wm_halo_setup_algs
++ *          (:2517-2576): the id header (wmfw_halo_id_hdr, v6.18 wmfw.h:76-106) and the algorithm list (wmfw_halo_alg_hdr :126-132) read from XM
++ *          unpacked, terminator 0xbedead (:2153-2162; stock only warns, here a stop); wm_adsp_load_coeff (:2578-2760): each XM/YM block of the .bin
++ *          at region_to_reg(type, alg base) + offset (bytes), rev & 0xff == 1 only (:2625-2632). Every region / block is read back in full here
++ *          (unpacked24: the low 24 bits of each word); stock reads nothing back. wm_coeff_init_control_caches reads only; skipped.
++ *  run     DSP1 POST_PMU -> wm_adsp_event (:3266-3320): wm_coeff_sync_controls (no control was set: nothing), wm_halo_configure_mpu (:3098-3126,
++ *          lock_regions 0xFFFFFFFF AMP cs35l41.c:3725: LOCK_CONFIG 0x5555, 0xAAAA, 20 access words := 0xFFFFFFFF, LOCK_CONFIG 0), wm_halo_start_core
++ *          (:3367-3373: CCM_CORE_CTRL update_bits(RESET | EN, RESET | EN); v6.18 cs_dsp.c:2929-2941 clears RESET again afterwards, AMP does not:
++ *          not sent here, the read-back is logged). wm_adsp_buffer_init (num_caps of spk-prot, :592-596) only reads host-buffer controls; skipped.
++ *          cs35l41_dsp_load_ev then reads DSP_MBOX_2 (AMP cs35l41.c:282-284) and sends CSPL_MBOX_CMD_RESUME: here MBOX_2 is READ only, no mailbox
++ *          command is written (not needed for the core to run).
++ *  check   not stock: HALO_HEARTBEAT (coefficient offset 1 of algorithm 0x400a4 FIRMWARE_HALO_CSPL, XM; HALO_STATE offset 0; CSPL_STATE offset 2 of
++ *          algorithm 0xcd; read from the wmfw ALGORITHM_DATA region by the host test) at XM unpacked base + 4 * (alg xm_base + offset)
++ *          (cs_dsp_coeff_base_reg v6.18 cs_dsp.c:666-681), polled <= AMP_DSP_HB_POLLS x 1 ms; running = it changed.
++ *  stop    wm_adsp_event PRE_PMD (:3322-3346): wm_halo_stop_watchdog WDT_CONTROL update_bits(EN, 0) (:3205-3209), the SCRATCH1..4 reads of
++ *          wm_halo_show_fw_status, wm_halo_stop_core CCM update_bits(EN, 0) (:3375-3383). Its CORE_SOFT_RESET update_bits is NOT written: 0x2B80010
++ *          is not in the AMP readable list (cs35l41-tables.c:130-608), so the stock regmap_update_bits fails at its read (guess from regmap
++ *          semantics, regmap.c not pinned). Then the 0158 restore puts both resets low (the amps lose the firmware).
++ * GLOBAL_EN / PLL: stock starts the core from the DSP1 widget (out_drv, reg SND_SOC_NOPM) before Main AMP (out_drv, PWR_CTRL2) sets GLOBAL_EN in its
++ *  POST_PMU (AMP cs35l41.c:2279-2295; order: v6.18 soc-dapm.c:53-91 dapm_up_seq, :1739-1769 compare by reg, :1923-1924 separate groups), i.e.
++ *  with GLOBAL_EN = 0; whether the core needs the PLL lock is not in the sources. So: start after the TDM config (PLL enabled from SCLK), first
++ *  window before the AOC stream, second window after the stream + PLL poll. PWR_CTRL1 is never written (amp_write_ok refuses it by name).
++ * Calibration: stock writes CAL_R / CAL_STATUS / CAL_CHECKSUM etc. from userspace (persist) as ALSA controls; not in the kernel driver, not done
++ *  here; without them the firmware runs on the .bin defaults (what it then does with protection is not in the sources). No amp enable.
++ */
++#ifndef SWEET_AMP_DSP_H
++#define SWEET_AMP_DSP_H
++#include "sweet_cs_dsp.h"
++
++/* ---- the pinned files ---- */
++#define AMP_FW_N		3u
++static const uint32_t amp_fw_len[AMP_FW_N] = { 33988u, 3884u, 3820u };	/* cs35l41-dsp1-spk-prot.wmfw, .bin (L), R-...bin (R) */
++static const uint8_t amp_fw_sha[AMP_FW_N][32] = {
++	{ 0xcf, 0xee, 0x64, 0x4d, 0xb2, 0x28, 0x50, 0xbb, 0x4a, 0x6d, 0xda, 0xe9, 0x81, 0x44, 0xba, 0x73,
++	  0xc0, 0x75, 0x6f, 0x98, 0x93, 0x9d, 0x7b, 0xb5, 0xf9, 0x05, 0xae, 0x2b, 0x84, 0x68, 0xa5, 0x25  },
++	{ 0x4b, 0x23, 0x77, 0x95, 0xc8, 0x76, 0xd5, 0xa3, 0xdc, 0x67, 0x08, 0x22, 0x35, 0x25, 0x64, 0x78,
++	  0x21, 0x58, 0x7a, 0xcf, 0x67, 0x10, 0x04, 0x49, 0x21, 0x7b, 0x7b, 0xf2, 0x29, 0xf3, 0x62, 0x52  },
++	{ 0xd6, 0xbc, 0x07, 0xfb, 0xa5, 0x42, 0xc1, 0xc6, 0x82, 0x62, 0xc9, 0x53, 0xf6, 0xa3, 0x07, 0x0b,
++	  0xf4, 0x56, 0x1b, 0x1b, 0x76, 0xe6, 0xe1, 0xcb, 0xad, 0x1a, 0xf8, 0x68, 0x94, 0xc6, 0x51, 0x54  },
++};
++static const char amp_fw_tag[AMP_FW_N][5] = { "WMFW", "BINL", "BINR" };
++
++/* ---- SHA-256 (FIPS 180-4) ---- */
++struct amp_sha { uint32_t h[8]; uint64_t n; uint8_t b[64]; };
++static const uint32_t amp_sha_k[64] = {
++	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
++	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
++	0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
++	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++};
++#define AMP_ROR(x, r)	(((x) >> (r)) | ((x) << (32u - (r))))
++static void amp_sha_block(struct amp_sha *s, const uint8_t *p)
++{
++	uint32_t w[64], a, b, c, d, e, f, g, h, t1, t2;
++	unsigned i;
++
++	for (i = 0; i < 16u; i++)
++		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
++	for (; i < 64u; i++)
++		w[i] = w[i - 16] + (AMP_ROR(w[i - 15], 7u) ^ AMP_ROR(w[i - 15], 18u) ^ (w[i - 15] >> 3)) + w[i - 7] +
++		       (AMP_ROR(w[i - 2], 17u) ^ AMP_ROR(w[i - 2], 19u) ^ (w[i - 2] >> 10));
++	a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3]; e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
++	for (i = 0; i < 64u; i++) {
++		t1 = h + (AMP_ROR(e, 6u) ^ AMP_ROR(e, 11u) ^ AMP_ROR(e, 25u)) + ((e & f) ^ (~e & g)) + amp_sha_k[i] + w[i];
++		t2 = (AMP_ROR(a, 2u) ^ AMP_ROR(a, 13u) ^ AMP_ROR(a, 22u)) + ((a & b) ^ (a & c) ^ (b & c));
++		h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++	}
++	s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
++}
++static void amp_sha256(const uint8_t *p, size_t n, uint8_t out[32])
++{
++	static const uint32_t iv[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
++	struct amp_sha s;
++	size_t i, r;
++
++	for (i = 0; i < 8u; i++)
++		s.h[i] = iv[i];
++	s.n = (uint64_t)n * 8u;
++	for (i = 0; i + 64u <= n; i += 64u)
++		amp_sha_block(&s, p + i);
++	r = n - i;
++	for (size_t k = 0; k < 64u; k++)
++		s.b[k] = k < r ? p[i + k] : 0u;
++	s.b[r] = 0x80u;
++	if (r >= 56u) {
++		amp_sha_block(&s, s.b);
++		for (size_t k = 0; k < 64u; k++)
++			s.b[k] = 0u;
++	}
++	for (i = 0; i < 8u; i++)
++		s.b[56 + i] = (uint8_t)(s.n >> (56u - 8u * i));
++	amp_sha_block(&s, s.b);
++	for (i = 0; i < 32u; i++)
++		out[i] = (uint8_t)(s.h[i / 4u] >> (24u - 8u * (i % 4u)));
++}
++
++/* ---- the AMPFW container (tools/pack_ampfw.py; layout of tools/pack_wlanfw.py: "AMPFWV01", u32 version 1, u32 count 3, then
++ * { tag[4], u32 length, u32 offset (8-aligned), u32 crc32 } x 3 in the order WMFW, BINL, BINR) ---- */
++struct amp_dsp_fw { const uint8_t *d[AMP_FW_N]; uint32_t n[AMP_FW_N]; };
++static uint32_t amp_le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++/* 0 = every entry present with the pinned length and sha256; < 0 = the first problem */
++static int amp_dsp_container(const uint8_t *buf, size_t len, struct amp_dsp_fw *fw)
++{
++	static const uint8_t magic[8] = { 'A', 'M', 'P', 'F', 'W', 'V', '0', '1' };
++	uint8_t sha[32];
++	uint32_t i, k, l, o;
++
++	*fw = (struct amp_dsp_fw){ { 0 }, { 0 } };
++	if (!buf || len < 16u + 16u * AMP_FW_N || len > 0x100000u)
++		return -1;
++	for (k = 0; k < 8u; k++)
++		if (buf[k] != magic[k])
++			return -2;
++	if (amp_le32(buf + 8) != 1u || amp_le32(buf + 12) != AMP_FW_N)
++		return -3;
++	for (i = 0; i < AMP_FW_N; i++) {
++		const uint8_t *e = buf + 16u + 16u * i;
++
++		for (k = 0; k < 4u; k++)
++			if (e[k] != (uint8_t)amp_fw_tag[i][k])
++				return -4;
++		l = amp_le32(e + 4);
++		o = amp_le32(e + 8);
++		if ((o & 7u) || o < 16u + 16u * AMP_FW_N || o > len || l > len - o || l != amp_fw_len[i])
++			return -5;
++		amp_sha256(buf + o, l, sha);
++		for (k = 0; k < 32u; k++)
++			if (sha[k] != amp_fw_sha[i][k])
++				return -6;
++	}
++	for (i = 0; i < AMP_FW_N; i++) {
++		fw->d[i] = buf + amp_le32(buf + 24u + 16u * i);
++		fw->n[i] = amp_fw_len[i];
++	}
++	return 0;
++}
++
++/* ---- the loader ---- */
++#define AMP_DSP_XM_UNP		0x02800000u
++#define AMP_DSP_YM_UNP		0x03400000u
++#define AMP_DSP_XM_WORDS	4094u		/* XMEM_UNPACK24_0..4093 */
++#define AMP_DSP_YM_WORDS	2046u		/* YMEM_UNPACK24_0..2045 */
++#define AMP_DSP_FW_ID		0x400a4u	/* FIRMWARE_HALO_CSPL: the algorithm id of the wmfw ALGORITHM_DATA region = the id header id */
++#define AMP_DSP_CSPL_ALG	0xcdu		/* CSPL: the algorithm both .bin files address */
++#define AMP_DSP_HB_OFF		1u		/* HALO_HEARTBEAT, coefficient offset of FIRMWARE_HALO_CSPL (XM) */
++#define AMP_DSP_STATE_OFF	0u		/* HALO_STATE */
++#define AMP_DSP_CSPL_STATE_OFF	2u		/* CSPL_STATE of CSPL (XM) */
++#define AMP_DSP_MAXALG		8u
++#define AMP_DSP_TERM		0xbedeadu	/* AMP wm_adsp.c:2153-2162 */
++#define AMP_DSP_HB_POLLS	100u		/* x 1 ms per window */
++#define AMP_DSP_RB		1024u		/* read-back chunk */
++
++enum { DS_NOTRUN = 0, DS_NOFW, DS_PRE, DS_INIT, DS_WMFW, DS_HDR, DS_BIN, DS_LOADED, DS_MPU, DS_START, DS_NOHB, DS_RUN, DS_ERR, DS_N };
++static const char *const amp_dsp_stage_name[DS_N] = { "not-run", "no-fw", "pre-check", "init-writes", "wmfw-region", "alg-header", "bin-block",
++						      "loaded-not-started", "mpu", "start", "no-heartbeat", "running", "error-after-start" };
++struct amp_dsp_side {
++	int stage; unsigned item;			/* item: the failing wmfw region / bin block index */
++	uint32_t fw_id, fw_ver, n_algs, fw_xm, cd_xm, cd_ym, cd_ysz, hb_reg;
++	uint32_t regions, blocks, bytes;
++	uint32_t ccm, mbox2, clk, hb0, hb, hstate, cspl, st1, pwr1, wdt, scratch[4];
++	unsigned polls; int win;			/* win: 1 = moved before the AOC stream, 2 = after it, 0 = never */
++	int started, stopped, stop_ok;
++};
++static struct amp_dsp_res { int ran; struct amp_dsp_side a[2]; } amp_dsp_res;
++static struct amp_dsp_fw amp_dsp_fw_in;		/* set by the glue from AMPFW (container checked); all 0 = no files */
++static struct swcd_file amp_dsp_pf;
++static uint8_t amp_dsp_rb[AMP_DSP_RB];
++
++static uint32_t amp_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++
++/* one control write (an allowlisted pair) and its read-back */
++static int amp_dsp_w1(const struct amp_snap *s, int cs, uint32_t reg, uint32_t val, int check)
++{
++	uint32_t rb = 0;
++	int e = amp_write(s, cs, reg, val);
++
++	if (e == AMP_OK && check) {
++		e = amp_read(s, cs, reg, &rb);
++		if (e == AMP_OK && rb != val)
++			e = AMP_ERROR;
++	}
++	return e;
++}
++
++/* regmap_update_bits of the CCM / WDT row: read, write only if it changes, read back into *rb */
++static int amp_dsp_rmw(const struct amp_snap *s, int cs, uint32_t reg, uint32_t mask, uint32_t field, uint32_t *rb)
++{
++	uint32_t old = 0;
++	int e = amp_read(s, cs, reg, &old);
++
++	*rb = old;
++	if (e != AMP_OK || ((old & ~mask) | field) == old)
++		return e;
++	amp_dsp_row.on = 1;
++	amp_dsp_row.reg = reg;
++	amp_dsp_row.mask = mask;
++	amp_dsp_row.field = field;
++	amp_dsp_row.old = old;
++	e = amp_write(s, cs, reg, (old & ~mask) | field);
++	amp_dsp_row.on = 0;
++	amp_dsp_row.reg = amp_dsp_row.mask = amp_dsp_row.field = amp_dsp_row.old = 0;
++	if (e == AMP_OK)
++		e = amp_read(s, cs, reg, rb);
++	return e;
++}
++
++/* write n bytes at reg and read them all back (unp24: compare the low 24 bits of each word only) */
++static int amp_dsp_put(const struct amp_snap *s, int cs, uint32_t reg, const uint8_t *d, uint32_t n, int unp24)
++{
++	int e = amp_wburst(s, cs, reg, d, n);
++
++	for (uint32_t off = 0; e == AMP_OK && off < n; off += AMP_DSP_RB) {
++		uint32_t k = n - off < AMP_DSP_RB ? n - off : AMP_DSP_RB;
++
++		e = amp_rburst(s, cs, reg + off, amp_dsp_rb, k);
++		for (uint32_t i = 0; e == AMP_OK && i < k; i++)
++			if ((!unp24 || (i & 3u)) && amp_dsp_rb[i] != d[off + i])
++				e = AMP_ERROR;
++	}
++	return e;
++}
++
++/* the register of an algorithm-relative .bin block (AMP wm_adsp.c:2690-2712): region_to_reg(type, base) + offset; 0 = refused (outside the
++ * algorithm's region or the memory range, odd length) */
++static uint32_t amp_dsp_bin_reg(uint32_t type, uint32_t base, uint32_t size, uint32_t off, uint32_t len)
++{
++	uint32_t r0 = swcd_region_to_reg(type, base), r1 = swcd_region_to_reg(type, base + size), reg = r0 + off;
++
++	if (r0 == 0u || off > 0xFFFFu || (len & 3u) || reg < r0 || reg + len > r1 || reg + len < reg || !amp_dsp_mem_ok(reg, len))
++		return 0u;
++	return reg;
++}
++
++static int amp_dsp_load(const struct amp_snap *s, int cs, struct amp_dsp_side *d)
++{
++	const struct amp_dsp_fw *fw = &amp_dsp_fw_in;
++	uint8_t hdr[4u * (10u + 6u * AMP_DSP_MAXALG + 1u)];
++	uint32_t w[10u + 6u * AMP_DSP_MAXALG + 1u], rb = 0, i;
++	int e, cd = -1;
++
++	if (!fw->d[0] || !fw->d[1 + cs]) {
++		d->stage = DS_NOFW;
++		return AMP_ERROR;
++	}
++	/* pre: no error bit, GLOBAL_EN 0, core off (0158 wrote CCM := 0) */
++	d->stage = DS_PRE;
++	e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_DSP_CCM, &d->ccm);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_DSP_CLK_CTRL, &d->clk);
++	if (e != AMP_OK || (d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN) || (d->ccm & AMP_DSP_CORE_EN))
++		return AMP_ERROR;
++	/* probe-time cs35l41_dsp_init writes */
++	d->stage = DS_INIT;
++	for (i = 0; e == AMP_OK && i < 8u; i++)
++		e = amp_dsp_w1(s, cs, 0x02B80080u + 8u * i, 1u, 1);
++	for (i = 0; e == AMP_OK && i < 8u; i++)
++		e = amp_dsp_w1(s, cs, 0x02B80280u + 8u * i, 1u, 1);
++#define AMP_DSP_RX_DO(r, v) if (e == AMP_OK) e = amp_dsp_w1(s, cs, (r), (v), 1);
++	AMP_DSP_RXSRC(AMP_DSP_RX_DO)
++#undef AMP_DSP_RX_DO
++	if (e != AMP_OK)
++		return e;
++	/* the wmfw: memory regions only (no ABSOLUTE), each inside one range, written and read back */
++	d->stage = DS_WMFW;
++	if (swcd_wmfw(fw->d[0], fw->n[0], &amp_dsp_pf) != SWCD_OK)
++		return AMP_ERROR;
++	for (i = 0; e == AMP_OK && i < amp_dsp_pf.nitems; i++) {
++		const struct swcd_item *it = &amp_dsp_pf.it[i];
++
++		if (it->type == SWCD_ABSOLUTE) {
++			d->item = i;
++			return AMP_ERROR;
++		}
++		if (!it->reg)
++			continue;	/* text / algorithm data */
++		d->item = i;
++		if (!amp_dsp_mem_ok(it->reg, it->len))
++			return AMP_ERROR;
++		e = amp_dsp_put(s, cs, it->reg, fw->d[0] + it->pos + 8u, it->len, it->type == SWCD_ADSP2_XM || it->type == SWCD_ADSP2_YM);
++		d->regions++;
++		d->bytes += it->len;
++	}
++	if (e != AMP_OK)
++		return e;
++	/* wm_halo_setup_algs: the id header, then the list + terminator, from XM unpacked */
++	d->stage = DS_HDR;
++	e = amp_rburst(s, cs, AMP_DSP_XM_UNP, hdr, 40u);
++	for (i = 0; e == AMP_OK && i < 10u; i++)
++		w[i] = amp_be32(hdr + 4u * i) & 0xFFFFFFu;
++	if (e != AMP_OK)
++		return e;
++	d->fw_id = w[3];
++	d->fw_ver = w[4];
++	d->fw_xm = w[5];
++	d->n_algs = w[9];
++	if (d->fw_id != AMP_DSP_FW_ID || d->n_algs == 0u || d->n_algs > AMP_DSP_MAXALG || d->fw_xm + AMP_DSP_HB_OFF >= AMP_DSP_XM_WORDS)
++		return AMP_ERROR;
++	e = amp_rburst(s, cs, AMP_DSP_XM_UNP + 40u, hdr + 40u, 4u * (6u * d->n_algs + 1u));
++	for (i = 10u; e == AMP_OK && i < 10u + 6u * d->n_algs + 1u; i++)
++		w[i] = amp_be32(hdr + 4u * i) & 0xFFFFFFu;
++	if (e != AMP_OK || w[10u + 6u * d->n_algs] != AMP_DSP_TERM)
++		return AMP_ERROR;
++	for (i = 0; i < d->n_algs; i++) {
++		const uint32_t *a = &w[10u + 6u * i];	/* id, ver, xm_base, xm_size, ym_base, ym_size */
++
++		if (a[2] + a[3] > AMP_DSP_XM_WORDS || a[4] + a[5] > AMP_DSP_YM_WORDS)
++			return AMP_ERROR;
++		if (a[0] == AMP_DSP_CSPL_ALG)
++			cd = (int)i;
++	}
++	if (cd < 0)
++		return AMP_ERROR;
++	d->cd_xm = w[10u + 6u * (uint32_t)cd + 2u];
++	d->cd_ym = w[10u + 6u * (uint32_t)cd + 4u];
++	d->cd_ysz = w[10u + 6u * (uint32_t)cd + 5u];
++	d->hb_reg = AMP_DSP_XM_UNP + 4u * (d->fw_xm + AMP_DSP_HB_OFF);
++	/* the .bin of this amp: XM / YM blocks relative to a listed algorithm, nothing absolute */
++	d->stage = DS_BIN;
++	if (swcd_bin(fw->d[1 + cs], fw->n[1 + cs], &amp_dsp_pf) != SWCD_OK || (amp_dsp_pf.rev & 0xFFu) != 1u)
++		return AMP_ERROR;
++	for (i = 0; e == AMP_OK && i < amp_dsp_pf.nitems; i++) {
++		const struct swcd_item *it = &amp_dsp_pf.it[i];
++		uint32_t t = it->type, reg = 0u, k;
++
++		if (t == SWCD_NAME_TEXT << 8 || t == SWCD_INFO_TEXT << 8 || t == SWCD_METADATA << 8)
++			continue;
++		d->item = i;
++		if (t != SWCD_ADSP2_XM && t != SWCD_ADSP2_YM && t != SWCD_XM_PACKED && t != SWCD_YM_PACKED)
++			return AMP_ERROR;
++		for (k = 0; k < d->n_algs && !reg; k++) {
++			const uint32_t *a = &w[10u + 6u * k];
++
++			if (a[0] == it->id)
++				reg = (t == SWCD_ADSP2_XM || t == SWCD_XM_PACKED) ? amp_dsp_bin_reg(t, a[2], a[3], it->offset, it->len) :
++				      amp_dsp_bin_reg(t, a[4], a[5], it->offset, it->len);
++		}
++		if (!reg)
++			return AMP_ERROR;
++		e = amp_dsp_put(s, cs, reg, fw->d[1 + cs] + it->pos + 20u, it->len, t == SWCD_ADSP2_XM || t == SWCD_ADSP2_YM);
++		d->blocks++;
++		d->bytes += it->len;
++	}
++	if (e != AMP_OK)
++		return e;
++	e = amp_read(s, cs, AMP_DSP_CCM, &rb);
++	if (e != AMP_OK || (rb & AMP_DSP_CORE_EN))
++		return AMP_ERROR;
++	d->stage = DS_LOADED;
++	return AMP_OK;
++}
++
++/* wm_halo_configure_mpu, then wm_halo_start_core; d->started is set before the CCM write is attempted (the stop then runs on every path) */
++static int amp_dsp_start(const struct amp_snap *s, int cs, struct amp_dsp_side *d)
++{
++	uint32_t rb = 0, i;
++	int e;
++
++	d->stage = DS_MPU;
++	e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	if (e != AMP_OK || (d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))
++		return AMP_ERROR;
++	e = amp_dsp_w1(s, cs, AMP_DSP_MPU_LOCK, 0x5555u, 0);
++	if (e == AMP_OK)
++		e = amp_dsp_w1(s, cs, AMP_DSP_MPU_LOCK, 0xAAAAu, 0);
++	for (i = 0; e == AMP_OK && i < 20u; i++)
++		e = amp_dsp_w1(s, cs, AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], 0xFFFFFFFFu, 0);
++	if (e == AMP_OK)
++		e = amp_dsp_w1(s, cs, AMP_DSP_MPU_LOCK, 0u, 0);
++	for (i = 0; e == AMP_OK && i < 20u; i++) {
++		e = amp_read(s, cs, AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], &rb);
++		if (e == AMP_OK && rb != 0xFFFFFFFFu)
++			e = AMP_ERROR;
++	}
++	if (e != AMP_OK)
++		return e;
++	d->stage = DS_START;
++	d->started = 1;
++	e = amp_dsp_rmw(s, cs, AMP_DSP_CCM, AMP_DSP_CORE_RESET | AMP_DSP_CORE_EN, AMP_DSP_CORE_RESET | AMP_DSP_CORE_EN, &d->ccm);
++	if (e == AMP_OK && !(d->ccm & AMP_DSP_CORE_EN))
++		e = AMP_ERROR;
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_DSP_MBOX2, &d->mbox2);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, d->hb_reg, &d->hb0);
++	d->hb = d->hb0;
++	if (e == AMP_OK)
++		d->stage = DS_NOHB;
++	return e;
++}
++
++/* one heartbeat window on both started amps: <= AMP_DSP_HB_POLLS x 1 ms (tick each ms if given), stops once every started amp moved */
++static void amp_dsp_window(const struct amp_snap *s, int win, void (*tick)(void *), void *ctx)
++{
++	unsigned p;
++	int cs, more;
++
++	for (p = 0; p < AMP_DSP_HB_POLLS; p++) {
++		more = 0;
++		for (cs = 0; cs < 2; cs++)
++			more |= amp_dsp_res.a[cs].stage == DS_NOHB;
++		if (!more || wait_ms(1u))
++			break;
++		if (tick)
++			tick(ctx);
++		for (cs = 0; cs < 2; cs++) {
++			struct amp_dsp_side *d = &amp_dsp_res.a[cs];
++
++			if (d->stage != DS_NOHB)
++				continue;
++			d->polls++;
++			if (amp_read(s, cs, d->hb_reg, &d->hb) != AMP_OK) {
++				d->stage = DS_ERR;
++				continue;
++			}
++			if (d->hb != d->hb0) {
++				d->stage = DS_RUN;
++				d->win = win;
++			}
++		}
++	}
++	for (cs = 0; cs < 2; cs++) {	/* after the window: no error bit, GLOBAL_EN still 0 */
++		struct amp_dsp_side *d = &amp_dsp_res.a[cs];
++
++		if (!d->started || d->stage == DS_ERR)
++			continue;
++		if (amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1) != AMP_OK || amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1) != AMP_OK ||
++		    (d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))
++			d->stage = DS_ERR;
++	}
++}
++
++/* wm_adsp_event PRE_PMD for a started amp: watchdog off, SCRATCH1..4, core EN off, read back */
++static void amp_dsp_stop(const struct amp_snap *s, int cs, struct amp_dsp_side *d)
++{
++	uint32_t rb = 0;
++	int e;
++
++	if (!d->started || d->stopped)
++		return;
++	d->stopped = 1;
++	(void)amp_read(s, cs, AMP_DSP_XM_UNP + 4u * (d->fw_xm + AMP_DSP_STATE_OFF), &d->hstate);
++	(void)amp_read(s, cs, AMP_DSP_XM_UNP + 4u * (d->cd_xm + AMP_DSP_CSPL_STATE_OFF), &d->cspl);
++	e = amp_dsp_rmw(s, cs, AMP_DSP_WDT, 0x1u, 0u, &d->wdt);
++	for (uint32_t i = 0; i < 4u; i++)
++		(void)amp_read(s, cs, AMP_DSP_SCRATCH1 + 8u * i, &d->scratch[i]);
++	if (amp_dsp_rmw(s, cs, AMP_DSP_CCM, AMP_DSP_CORE_EN, 0u, &rb) != AMP_OK)
++		e = AMP_ERROR;
++	d->ccm = rb;
++	d->stop_ok = e == AMP_OK && !(rb & AMP_DSP_CORE_EN);
++}
++
++static void amp_dsp_line(const char *name, const struct amp_dsp_side *d)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, name);
++
++	p = put_txt(line, sizeof(line), p, " dsp ");
++	p = put_txt(line, sizeof(line), p, amp_dsp_stage_name[d->stage]);
++	p = put_txt(line, sizeof(line), p, " #");
++	p = put_dec(line, sizeof(line), p, d->item);
++	p = put_txt(line, sizeof(line), p, " rg=");
++	p = put_dec(line, sizeof(line), p, d->regions);
++	p = put_txt(line, sizeof(line), p, " bl=");
++	p = put_dec(line, sizeof(line), p, d->blocks);
++	p = put_txt(line, sizeof(line), p, " B=");
++	p = put_dec(line, sizeof(line), p, d->bytes);
++	p = put_txt(line, sizeof(line), p, " id=");
++	p = put_hexmin(line, sizeof(line), p, d->fw_id);
++	p = put_txt(line, sizeof(line), p, " v=");
++	p = put_hexmin(line, sizeof(line), p, d->fw_ver);
++	p = put_txt(line, sizeof(line), p, " algs=");
++	p = put_dec(line, sizeof(line), p, d->n_algs);
++	p = put_txt(line, sizeof(line), p, " clk=");
++	p = put_hexmin(line, sizeof(line), p, d->clk);
++	emit("AMP", line, p);
++	p = put_txt(line, sizeof(line), 0, name);
++	p = put_txt(line, sizeof(line), p, " dsp ccm=");
++	p = put_hexmin(line, sizeof(line), p, d->ccm);
++	p = put_txt(line, sizeof(line), p, " mbox2=");
++	p = put_hexmin(line, sizeof(line), p, d->mbox2);
++	p = put_txt(line, sizeof(line), p, " hb ");
++	p = put_hexmin(line, sizeof(line), p, d->hb0);
++	p = put_txt(line, sizeof(line), p, "->");
++	p = put_hexmin(line, sizeof(line), p, d->hb);
++	p = put_txt(line, sizeof(line), p, " win=");
++	p = put_dec(line, sizeof(line), p, (uint32_t)d->win);
++	p = put_txt(line, sizeof(line), p, " polls=");
++	p = put_dec(line, sizeof(line), p, d->polls);
++	p = put_txt(line, sizeof(line), p, " st=");
++	p = put_hexmin(line, sizeof(line), p, d->hstate);
++	p = put_txt(line, sizeof(line), p, " cspl=");
++	p = put_hexmin(line, sizeof(line), p, d->cspl);
++	p = put_txt(line, sizeof(line), p, " st1=");
++	p = put_hexmin(line, sizeof(line), p, d->st1);
++	emit("AMP", line, p);
++	p = put_txt(line, sizeof(line), 0, name);
++	p = put_txt(line, sizeof(line), p, " dsp stop ");
++	p = put_txt(line, sizeof(line), p, !d->started ? "n/a" : d->stop_ok ? "ok" : "FAILED");
++	p = put_txt(line, sizeof(line), p, " wdt=");
++	p = put_hexmin(line, sizeof(line), p, d->wdt);
++	for (uint32_t i = 0; i < 4u; i++) {
++		p = put_txt(line, sizeof(line), p, i ? "," : " scratch=");
++		p = put_hexmin(line, sizeof(line), p, d->scratch[i]);
++	}
++	emit("AMP", line, p);
++}
++
++/* the one verdict line (after the restore): pass only if both loaded, both ran, both stopped and the restore is ok */
++static void amp_dsp_verdict(int restored)
++{
++	const struct amp_dsp_side *l = &amp_dsp_res.a[0], *r = &amp_dsp_res.a[1];
++	char line[RAMLOG_LINE_MAX];
++	unsigned p;
++
++	amp_dsp_line("L", l);
++	amp_dsp_line("R", r);
++	if (l->stage == DS_RUN && r->stage == DS_RUN && l->stop_ok && r->stop_ok && restored && l->fw_id == r->fw_id && l->fw_ver == r->fw_ver) {
++		p = put_txt(line, sizeof(line), 0, "AMP DSP: fw loaded l,r (id ");
++		p = put_hexmin(line, sizeof(line), p, l->fw_id);
++		p = put_txt(line, sizeof(line), p, " rev ");
++		p = put_hexmin(line, sizeof(line), p, l->fw_ver);
++		p = put_txt(line, sizeof(line), p, "), halo running l,r");
++		emit("SWEET", line, p);
++		return;
++	}
++	p = put_txt(line, sizeof(line), 0, "AMP DSP: stopped l=");
++	p = put_txt(line, sizeof(line), p, amp_dsp_stage_name[l->stage]);
++	if (l->stage == DS_WMFW || l->stage == DS_BIN) {
++		p = put_txt(line, sizeof(line), p, "#");
++		p = put_dec(line, sizeof(line), p, l->item);
++	}
++	p = put_txt(line, sizeof(line), p, " r=");
++	p = put_txt(line, sizeof(line), p, amp_dsp_stage_name[r->stage]);
++	if (r->stage == DS_WMFW || r->stage == DS_BIN) {
++		p = put_txt(line, sizeof(line), p, "#");
++		p = put_dec(line, sizeof(line), p, r->item);
++	}
++	p = put_txt(line, sizeof(line), p, " stop ");
++	p = put_txt(line, sizeof(line), p, !l->started ? "-" : l->stop_ok ? "ok" : "FAIL");
++	p = put_txt(line, sizeof(line), p, "/");
++	p = put_txt(line, sizeof(line), p, !r->started ? "-" : r->stop_ok ? "ok" : "FAIL");
++	p = put_txt(line, sizeof(line), p, restored ? " restore ok" : " restore FAILED");
++	emit("SWEET", line, p);
++}
++
++#endif /* SWEET_AMP_DSP_H */
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index fcf83e8..20ce38b 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -127,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 6) {
++		sweet_aoc_audio_mode = 6;   /* patch 0169, step A9e: as 5, plus the CS35L41 HALO DSP firmware load / start / heartbeat / stop (AMPFW) */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 5) {
+ 		sweet_aoc_audio_mode = 5;   /* patch 0167, step A9: as 4, plus the EP0 playback start (silence) between the bind and the PLL poll */
+ 		sweet_aoc_load_start3();
+@@ -146,7 +151,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index 6ec857c..c589471 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -165,10 +165,11 @@ swas_tipc(__unused void *ctx, struct swas_tipc *t)
+  * sweet_amp_audio_run: amp identify + init + TDM config, then our open callback, the PLL lock read, our close callback, the amp restore).
+  * New writes of this file: the IPC window (the audio_output_control queue slots and counters, sweet_audio.h) and the AOC mailbox INTGR0 = 1 << irq
+  * (the doorbell; irq read from the service header, <= 15). ---- */
+-int sweet_aoc_audio_mode;                       /* set by sweet_aoc.c for sweetaoc=4 (5: patch 0167) */
++int sweet_aoc_audio_mode;                       /* set by sweet_aoc.c for sweetaoc=4 (5: patch 0167, 6: patch 0169 = 5 + amp DSP) */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx,
+     uint32_t out[8]);   /* sweet_amp.c (patch 0166, + tick / polls patch 0167) */
++extern void sweet_amp_dsp_arm(void);            /* sweet_amp.c (patch 0169): AMPFW checked, DSP stage armed for the next run */
+ #endif
+ /* patch 0167 (sweetaoc=5): + the audio_playback0 ring (zeroed, reset, fed zeros each poll ms), EP_SETUP, SOURCE on / off (sweet_audio.h) */
+ #define SWAU_PLAY_POLLS 500u    /* = AMP_A9_PLL_POLLS_MAX of sweet_amp.h */
+@@ -207,7 +208,7 @@ swau_cb_open(__unused void *ctx)
+ 	struct swau_bus b = ab;
+ 
+ 	b.say = swau_say;
+-	if (sweet_aoc_audio_mode == 5) {
++	if (sweet_aoc_audio_mode >= 5) {
+ 		swau_open_rc = swau_pb_found ? swau_play_open(&b, &swau_r, swau_as->services_offset, swau_as->service_size, swau_as->ctl_index,
+ 		    swau_pb_index, swau_as->services) : SWAU_E_SVC;
+ 		printf("SWEET AUDIO: playback0 service %u found %u hdr %#x flags %#x irq %u push %u down off %#x size %u slots %u tx %u rx %u wp %u\n",
+@@ -268,7 +269,10 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 		return;
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	if (sweet_aoc_audio_mode == 5) {
++	if (sweet_aoc_audio_mode == 6) {
++		sweet_amp_dsp_arm();
++	}
++	if (sweet_aoc_audio_mode >= 5) {
+ 		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, swau_cb_tick, SWAU_PLAY_POLLS, NULL, out);
+ 	} else {
+ 		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, NULL, 0u, NULL, out);
+@@ -278,7 +282,7 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 	for (i = 0; i < swau_r.nx && i < SWAU_NX; i++) {
+ 		swau_x_line(&swau_r.x[i]);
+ 	}
+-	if (sweet_aoc_audio_mode == 5) {
++	if (sweet_aoc_audio_mode >= 5) {
+ 		int prc = swau_r.play_rc;
+ 
+ 		printf("SWEET AUDIO: stream rc %d (%s) zeroed %u reset %u ep_setup %u started %u stopped %u consumed %u bytes fed %u zero bytes in %u feeds, feed errors %u\n",
+@@ -350,7 +354,7 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
+-		if (sweet_aoc_audio_mode == 4 || sweet_aoc_audio_mode == 5) {
++		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 6) {
+ 			swau_run(&r, image_size);       /* patch 0166, step A9 (5: + stream, patch 0167) */
+ 		}
+ 		return;

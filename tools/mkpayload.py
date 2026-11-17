@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER] [--gpujob CONTAINER] [--aocfw CONTAINER]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER] [--gpujob CONTAINER] [--aocfw CONTAINER] [--ampfw CONTAINER]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -35,6 +35,7 @@ from tools import adt, boards  # noqa: E402
 from tools.pack_wlanfw import parse as wlanfw_parse  # noqa: E402
 from tools.pack_gpujob import parse as gpujob_parse  # noqa: E402
 from tools.pack_aocfw import parse as aocfw_parse  # noqa: E402
+from tools.pack_ampfw import parse as ampfw_parse  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
@@ -163,7 +164,7 @@ def with_board_args(cmdline, board):
     return ' '.join([cmdline] + add) if add else cmdline
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None, gpujob_path=None, aocfw_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None, gpujob_path=None, aocfw_path=None, ampfw_path=None):
     unmeasured = boards.provisional(board)
     if unmeasured:
         raise SystemExit(f'board {board}: board.json "provisional" still lists {unmeasured}; measure them first '
@@ -234,6 +235,19 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
         pieces.append((af_va, af_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, af_pa, len(image), 'AOCFW')
         aocfw = (hex(af_pa), hex(len(image)))
+    ampfw = None
+    if ampfw_path:
+        # CS35L41 DSP files (tools/pack_ampfw.py, sweetaoc=6, xnu patch 0169): same placement, property AMPFW <phys, exact size>; parse()
+        # refuses anything but the pinned files
+        image = open(ampfw_path, 'rb').read()
+        ampfw_parse(image)
+        mf_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        mf_va = kernel_end
+        kernel_end = mf_va + mf_size
+        mf_pa = mf_va - virt_base + PHYS_BASE
+        pieces.append((mf_va, mf_size, image))
+        adt_blob = add_ramdisk_to_adt(adt_blob, mf_pa, len(image), 'AMPFW')
+        ampfw = (hex(mf_pa), hex(len(image)))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -255,7 +269,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, gpujob=gpujob, aocfw=aocfw, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, gpujob=gpujob, aocfw=aocfw, ampfw=ampfw, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -271,9 +285,10 @@ if __name__ == '__main__':
     ap.add_argument('--wlanfw', help='BCM4389 firmware container (tools/pack_wlanfw.py) -> /chosen/memory-map WLANFW')
     ap.add_argument('--gpujob', help='Mali job captures (tools/pack_gpujob.py) -> /chosen/memory-map GPUJOB (sweetmali bit 0x100)')
     ap.add_argument('--aocfw', help='stock aoc.bin, zlib container (tools/pack_aocfw.py) -> /chosen/memory-map AOCFW (sweetaoc=2, xnu patch 0164)')
+    ap.add_argument('--ampfw', help='CS35L41 DSP files container (tools/pack_ampfw.py) -> /chosen/memory-map AMPFW (sweetaoc=6, xnu patch 0169)')
     ap.add_argument('--board', choices=sorted(boards.BOARDS), default='sweet')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw, a.gpujob, a.aocfw)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw, a.gpujob, a.aocfw, a.ampfw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

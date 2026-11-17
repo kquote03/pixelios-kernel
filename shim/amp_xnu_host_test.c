@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "sweet_amp.h"
 #define WA(pa, o, v, a, r) w32_allowed((pa), (o), (v), (a), (r), 0, 0, 0)
 /* ---- the independent constants (typed from the sources, never from ampid.c) ---- */
@@ -91,6 +92,9 @@ struct amp {
 	uint32_t stuck_reg;	/* writes to this register do not stick */
 	/* patch 0166 A9: the TDM / boost / clock registers, PWR_CTRL1 (read only), the PLL model */
 	uint32_t a9v[11]; unsigned a9_nwr, a9_bad; int pll_en_seen;
+	/* patch 0169 A9e: the DSP (XM / YM 24-bit words, PM raw registers), its control words, the stream position of a burst */
+	uint32_t xm[4096], ym[2048], pm[0x1400], rxsrc[4], mpu[20], wdt, errata, wacc, ymp_first, ymu_first;
+	unsigned np, dsp_mem_nw, dsp_ctl_nw, starts, stops; int mpulock, reset_running;
 };
 static struct amp amp[2];
 static unsigned violations;
@@ -383,6 +387,163 @@ static int otp_as_linux(int a)
 	return n == amp[a].nreg;
 }
 
+/* ---- patch 0169 A9e: the DSP model, typed from Linux v6.18 include/sound/cs35l41.h and the AMP wm_adsp.c HALO offsets (not from the header):
+ * XM / YM as 24-bit words behind a packed view (4 words in 3 registers, LSB first: word 0 = bits 0..23 of the first register) and an unpacked
+ * view (one word per register), PM as raw registers. The core runs once CCM_CORE_CTRL EN is set after a full load; the heartbeat word (fw
+ * xm_base + 1) counts each read while it runs. ---- */
+static int hb_dead, hb_needs_sclk, dsp_err_after_start = -1;
+static uint32_t dsp_stuck_addr; static int dsp_stuck_amp = -1;
+static int dsp_mem(uint32_t x)
+{
+	return (x >= 0x2000000u && x <= 0x2002FF0u) || (x >= 0x2800000u && x <= 0x2803FF4u) || (x >= 0x2C00000u && x <= 0x2C017F0u) ||
+	       (x >= 0x3400000u && x <= 0x3401FF4u) || (x >= 0x3800000u && x <= 0x3804FE8u);
+}
+static int dsp_errata(uint32_t x) { return ((x >= 0x2B80080u && x <= 0x2B800B8u) || (x >= 0x2B80280u && x <= 0x2B802B8u)) && !(x & 7u); }
+static int dsp_mpu(uint32_t x)
+{
+	static const uint32_t o[20] = { 0, 4, 8, 0xC, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x5C };
+	for (int i = 0; i < 20; i++)
+		if (x == 0x2BC3000u + o[i])
+			return i + 1;
+	return 0;
+}
+static int dsp_ctl(uint32_t x)	/* registers the DSP part may WRITE */
+{
+	return dsp_errata(x) || (x >= 0x4C50u && x <= 0x4C5Cu && !(x & 3u)) || dsp_mpu(x) || x == 0x2BC3140u || x == 0x2BC1000u || x == 0x2BC7000u;
+}
+static int dsp_rd(uint32_t x)	/* + read only */
+{
+	return dsp_ctl(x) || x == 0x13004u || x == 0x2C08u || (x >= 0x2B805C0u && x <= 0x2B805D8u && !(x & 7u)) || (x >= 0x2BC3100u && x <= 0x2BC3114u);
+}
+static uint32_t pk_get(const uint32_t *w, uint32_t k)
+{
+	unsigned __int128 b = 0;
+	uint32_t g = k / 3u, j = k % 3u;
+
+	for (int i = 3; i >= 0; i--)
+		b = (b << 24) | (w[4u * g + (uint32_t)i] & 0xFFFFFFu);
+	return (uint32_t)(b >> (32u * j));
+}
+static void pk_put(uint32_t *w, uint32_t k, uint32_t v)
+{
+	unsigned __int128 b = 0, m = (unsigned __int128)0xFFFFFFFFu;
+	uint32_t g = k / 3u, j = k % 3u;
+
+	for (int i = 3; i >= 0; i--)
+		b = (b << 24) | (w[4u * g + (uint32_t)i] & 0xFFFFFFu);
+	b = (b & ~(m << (32u * j))) | ((unsigned __int128)v << (32u * j));
+	for (int i = 0; i < 4; i++)
+		w[4u * g + (uint32_t)i] = (uint32_t)(b >> (24u * (uint32_t)i)) & 0xFFFFFFu;
+}
+static int dsp_running(int a)
+{
+	return (amp[a].ccm & 1u) && !hb_dead && (!hb_needs_sclk || sclk_on);
+}
+static uint32_t dsp_get(int a, uint32_t x)
+{
+	struct amp *m = &amp[a];
+
+	if (x >= 0x2000000u && x < 0x2003000u) return pk_get(m->xm, (x - 0x2000000u) / 4u);
+	if (x >= 0x2C00000u && x < 0x2C01800u) return pk_get(m->ym, (x - 0x2C00000u) / 4u);
+	if (x >= 0x2800000u && x < 0x2804000u) {
+		uint32_t k = (x - 0x2800000u) / 4u;
+
+		if (k == m->xm[5] + 1u && dsp_running(a))
+			m->xm[k] = (m->xm[k] + 1u) & 0xFFFFFFu;
+		return m->xm[k];
+	}
+	if (x >= 0x3400000u && x < 0x3402000u) return m->ym[(x - 0x3400000u) / 4u];
+	return m->pm[(x - 0x3800000u) / 4u];
+}
+static void dsp_put(int a, uint32_t x, uint32_t v)
+{
+	struct amp *m = &amp[a];
+
+	if (m->ccm & 1u)
+		violate("DSP memory written while the core runs");
+	if (a == dsp_stuck_amp && x == dsp_stuck_addr)
+		return;
+	m->dsp_mem_nw++;
+	if (x >= 0x2C00000u && x < 0x2C01800u && !m->ymp_first) m->ymp_first = x;
+	if (x >= 0x3400000u && x < 0x3402000u && !m->ymu_first) m->ymu_first = x;
+	if (x >= 0x2000000u && x < 0x2003000u) pk_put(m->xm, (x - 0x2000000u) / 4u, v);
+	else if (x >= 0x2C00000u && x < 0x2C01800u) pk_put(m->ym, (x - 0x2C00000u) / 4u, v);
+	else if (x >= 0x2800000u && x < 0x2804000u) m->xm[(x - 0x2800000u) / 4u] = v & 0xFFFFFFu;
+	else if (x >= 0x3400000u && x < 0x3402000u) m->ym[(x - 0x3400000u) / 4u] = v & 0xFFFFFFu;
+	else m->pm[(x - 0x3800000u) / 4u] = v;
+}
+static void dsp_ctl_wr(int a, uint32_t x, uint32_t v)
+{
+	struct amp *m = &amp[a];
+	int i;
+
+	m->dsp_ctl_nw++;
+	if (dsp_errata(x)) {
+		if (v != 1u) violate("an errata word other than 1");
+		m->errata |= 1u << ((x & 0x200u ? 8u : 0u) + ((x & 0xFFu) - 0x80u) / 8u);
+	} else if (x >= 0x4C50u && x <= 0x4C5Cu) {
+		static const uint32_t want[4] = { 0x28u, 0x21u, 0x3Au, 0x3Bu };
+		if (v != want[(x - 0x4C50u) / 4u]) violate("a DSP RX source other than stock");
+		m->rxsrc[(x - 0x4C50u) / 4u] = v;
+	} else if ((i = dsp_mpu(x))) {
+		if (m->mpulock != 2) violate("an MPU access word written while the MPU is locked");
+		m->mpu[i - 1] = v;
+	} else if (x == 0x2BC3140u) {
+		m->mpulock = v == 0x5555u ? 1 : v == 0xAAAAu && m->mpulock == 1 ? 2 : v == 0u ? 3 : (violate("MPU lock order"), 0);
+	} else if (x == 0x2BC7000u) {
+		m->wdt = v;
+	} else if (x == 0x2BC1000u) {
+		if ((v & 1u) && !(m->ccm & 1u)) {
+			if (m->mpulock != 3 || !m->dsp_mem_nw || m->errata != 0xFFFFu)
+				violate("core started before the load / MPU");
+			m->starts++;
+			if (a == dsp_err_after_start)
+				m->st1 |= 0x40u;
+		}
+		if (!(v & 1u) && (m->ccm & 1u))
+			m->stops++;
+		m->ccm = v & ~0x200u;	/* model: RESET self-clears */
+	}
+}
+static uint32_t dsp_ctl_rd(int a, uint32_t x)
+{
+	struct amp *m = &amp[a];
+	int i;
+
+	if (dsp_errata(x)) return (m->errata >> ((x & 0x200u ? 8u : 0u) + ((x & 0xFFu) - 0x80u) / 8u)) & 1u;
+	if (x >= 0x4C50u && x <= 0x4C5Cu) return m->rxsrc[(x - 0x4C50u) / 4u];
+	if ((i = dsp_mpu(x))) return m->mpu[i - 1];
+	if (x == 0x2BC3140u) return 0u;
+	if (x == 0x2BC7000u) return m->wdt;
+	if (x == 0x2BC1000u) return m->ccm;
+	if (x == 0x2C08u) return 3u;
+	if (x >= 0x2B805C0u && x <= 0x2B805D8u) return 0x5C0000u + (x & 0xFFu);
+	return 0u;
+}
+/* a byte of a frame whose address is DSP memory (q = its position, any length: a burst) */
+static uint8_t dsp_stream(int a, uint32_t fa, unsigned q, uint8_t mosi, int tx_on)
+{
+	struct amp *m = &amp[a];
+	uint32_t x = fa + 4u * ((q - 6u) / 4u);
+
+	if (q < 6u) {
+		if (!tx_on) violate("a burst address / pad byte with the transmitter off");
+		if (mosi != 0) violate("a burst pad byte is not 0");
+		return 0;
+	}
+	if (!dsp_mem(x)) violate("a burst runs past its DSP memory range");
+	if (!(m->frame[0] & 0x80u)) {
+		if (!tx_on) violate("a burst write byte with the transmitter off");
+		m->wacc = (m->wacc << 8) | mosi;
+		if ((q - 6u) % 4u == 3u && dsp_mem(x))
+			dsp_put(a, x, m->wacc);
+		return 0;
+	}
+	if (!released(a) || !dsp_mem(x))
+		return 0;
+	return (uint8_t)(dsp_get(a, x) >> (8u * (3u - (q - 6u) % 4u)));
+}
+
 static int amp_released_ok(int a)
 {
 	return released(a) && amp[a].booted;
@@ -396,6 +557,12 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 
 	if (m->nf < sizeof(m->frame))
 		m->frame[m->nf++] = mosi;
+	if (m->np++ >= 4u) {	/* patch 0169: a DSP memory frame is a burst of any length */
+		uint32_t fa = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
+
+		if (dsp_mem(fa))
+			return dsp_stream(a, fa, m->np - 1u, mosi, tx_on);
+	}
 	if (p == 0) {
 		m->frames++;
 		nframes++;
@@ -417,7 +584,11 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 
 			if (wa == 0x2014u)
 				violate("PWR_CTRL1 (GLOBAL_EN) written");
-			if (m->nwr >= 12) {
+			if (wa == 0x2B80010u || (wa >= 0x13000u && wa <= 0x1305Cu))
+				violate("CORE_SOFT_RESET or a mailbox written");
+			if (m->nwr >= 12 && dsp_ctl(wa)) {
+				dsp_ctl_wr(a, wa, wv);	/* patch 0169 */
+			} else if (m->nwr >= 12) {
 				otp_wr(a, wa, wv);	/* A7: the OTP unpack after the 12 */
 			} else {
 				if (SEQ[m->nwr][0] != wa || SEQ[m->nwr][1] != wv) {
@@ -444,7 +615,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	if (p == 5) {
 		addr = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 		if (addr != REGS4[0] && addr != REGS4[1] && addr != REGS4[2] && addr != REGS4[3] && addr != 0x10010u && addr != 0x10110u && addr != 0x2BC1000u &&
-		    addr != 0x10u && !(addr >= 0x400u && addr <= 0x47Cu && !(addr & 3u)) && !ref_target(addr) && a9_idx(addr) < 0)
+		    addr != 0x10u && !(addr >= 0x400u && addr <= 0x47Cu && !(addr & 3u)) && !ref_target(addr) && a9_idx(addr) < 0 && !dsp_rd(addr))
 			violate("a frame names a register outside the four");
 		if (released(a) && m->was_released && first_frame_tick[a] && first_frame_tick[a] - m->t_high < 2000u)
 			violate("first frame less than 2 ms after the reset release");
@@ -462,6 +633,10 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 	}
 	if (a9_idx(addr) >= 0) {
 		val = m->a9v[a9_idx(addr)];
+		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
+	}
+	if (dsp_rd(addr) && addr != 0x2BC1000u) {
+		val = dsp_ctl_rd(a, addr);
 		return p < 10 ? (uint8_t)(val >> (8 * (9 - p))) : 0;
 	}
 	if (addr == 0x10018u && amp_a9_cb.on)
@@ -519,13 +694,15 @@ static void pad_write(int b, unsigned r, uint32_t v)
 	*w = v;
 	for (int a = 0; a < 2; a++) {
 		if (before[a] && !cs_low(a))
-			amp[a].nf = 0;	/* chip select released: the next frame starts fresh */
+			amp[a].nf = amp[a].np = 0;	/* chip select released: the next frame starts fresh */
 		if (a == 0 && before[0] && !cs_low(0) && amp[0].drop_cs1_after_st1 && amp[0].st1_seen) {
 			h.dat[1] &= ~1u;	/* CS1 stuck low from now on */
 			amp[0].drop_cs1_after_st1 = 0;
 		}
 		if (!before[a] && cs_low(a))
-			amp[a].nf = 0;
+			amp[a].nf = amp[a].np = 0;
+		if (rel[a] && !released(a) && (amp[a].ccm & 1u))
+			amp[a].reset_running = 1;	/* patch 0169: reset while the core ran (the stop was skipped) */
 		if (rel[a] && !released(a)) { amp[a].booted = 0; amp[a].was_released = 0; }
 		if (!rel[a] && released(a)) {
 			int rb = a == 0 ? 2 : 3;
@@ -877,6 +1054,227 @@ static void unit_allowlist(void)
 	printf("ok: allowlist unit cases\n");
 }
 
+/* ---- patch 0169 A9e: synthetic firmware (the stock layout, small) and the DSP cases ---- */
+static uint8_t syn_w[512], syn_b[2][256], syn_c[2048];
+static size_t syn_wn, syn_bn[2];
+static const uint32_t SYN_HDR[24] = { 0x040000u, 0x030000u, 2u, 0x400a4u, 0x1d00u, 0x40u, 0x0eu, 0u, 0u, 2u,	/* id header: fw xm_base 0x40, 2 algs */
+				      0xcdu, 0x1d3100u, 0x20u, 0x10u, 0x0eu, 0x40u, 0xf20bu, 1u, 0x30u, 0x08u, 0u, 0u, 0xbedeadu, 0u };
+static void le32w(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
+/* 4n words -> 3n packed registers, big-endian bytes (as the stock wmfw stores them: the terminator 0xbedead decodes this way) */
+static size_t pack_words(uint8_t *out, const uint32_t *w, size_t n)
+{
+	size_t o = 0;
+
+	for (size_t g = 0; g < n / 4u; g++) {
+		unsigned __int128 b = 0;
+
+		for (int i = 3; i >= 0; i--)
+			b = (b << 24) | (w[4u * g + (size_t)i] & 0xFFFFFFu);
+		for (int j = 0; j < 3; j++) {
+			uint32_t r = (uint32_t)(b >> (32 * j));
+
+			out[o++] = (uint8_t)(r >> 24); out[o++] = (uint8_t)(r >> 16); out[o++] = (uint8_t)(r >> 8); out[o++] = (uint8_t)r;
+		}
+	}
+	return o;
+}
+static size_t region(uint8_t *p, uint32_t type, uint32_t off, const uint8_t *d, uint32_t n)
+{
+	le32w(p, (off & 0xFFFFFFu) | type << 24);
+	le32w(p + 4, n);
+	memcpy(p + 8, d, n);
+	return 8u + n;
+}
+static size_t block(uint8_t *p, uint32_t type, uint32_t off, uint32_t id, const uint8_t *d, uint32_t n)
+{
+	memset(p, 0, 20u + ((n + 3u) & ~3u));
+	p[0] = (uint8_t)off; p[1] = (uint8_t)(off >> 8); p[2] = (uint8_t)type; p[3] = (uint8_t)(type >> 8);
+	le32w(p + 4, id); le32w(p + 16, n);
+	memcpy(p + 20, d, n);
+	return (20u + n + 3u) & ~3u;
+}
+static void syn_build(void)
+{
+	uint8_t t[96];
+	uint32_t code[8] = { 0x111111u, 0x5u, 0x222222u, 0x333333u, 0x444444u, 0x555555u, 0x666666u, 0x777777u }, ymw[12];
+	size_t n;
+
+	memset(syn_w, 0, sizeof(syn_w));
+	memcpy(syn_w, "WMFW", 4); le32w(syn_w + 4, 40); syn_w[8] = 0; syn_w[9] = 3; syn_w[10] = 4; syn_w[11] = 3;
+	n = 40;
+	n += region(syn_w + n, 0xFFu, 0, (const uint8_t *)"synthetic", 9);
+	n += region(syn_w + n, 0x11u, 0, t, (uint32_t)pack_words(t, SYN_HDR, 24));	/* XM packed 0: id header + list */
+	n += region(syn_w + n, 0x11u, 0x40u, t, (uint32_t)pack_words(t, code, 8));	/* XM packed at the fw xm_base (HALO_STATE, HALO_HEARTBEAT) */
+	for (int i = 0; i < 12; i++) ymw[i] = 0x100000u + (uint32_t)i;
+	n += region(syn_w + n, 0x12u, 0, t, (uint32_t)pack_words(t, ymw, 12));	/* YM packed 0 */
+	for (int i = 0; i < 20; i++) t[i] = (uint8_t)(0xA0 + i);
+	n += region(syn_w + n, 0x10u, 0, t, 20);					/* PM: one group of 5 registers */
+	n += region(syn_w + n, 0xF2u, 0, (const uint8_t *)"algdata!", 8);
+	syn_wn = n;
+	for (int a = 0; a < 2; a++) {
+		uint8_t d[12];
+
+		memset(syn_b[a], 0, sizeof(syn_b[a]));
+		memcpy(syn_b[a], "WMDR", 4); le32w(syn_b[a] + 4, 16); syn_b[a][8] = 0; syn_b[a][9] = 0x1d; syn_b[a][10] = 0; syn_b[a][11] = 1;
+		n = 16;
+		n += block(syn_b[a] + n, 0xFE00u, 0, 0, (const uint8_t *)"name!", 5);
+		for (int i = 0; i < 12; i++) d[i] = (uint8_t)(0x30 + 16 * a + i);
+		n += block(syn_b[a] + n, 0x12u, 0, 0xcdu, d, 12);			/* YM packed of alg 0xcd: reg (0x2C00000 + 0x0e * 3) & ~3 */
+		memset(d, 0, 8); d[3] = (uint8_t)(0x41 + a); d[7] = 0x42;
+		n += block(syn_b[a] + n, 0x6u, 8, 0xcdu, d, 8);			/* YM unpacked of alg 0xcd: 0x3400000 + 4 * 0x0e + 8 */
+		syn_bn[a] = n;
+	}
+}
+static void dsp_cfg(int with_fw)
+{
+	amp_dsp_fw_in = (struct amp_dsp_fw){ { 0 }, { 0 } };
+	if (with_fw) {
+		amp_dsp_fw_in.d[0] = syn_w; amp_dsp_fw_in.n[0] = (uint32_t)syn_wn;
+		amp_dsp_fw_in.d[1] = syn_b[0]; amp_dsp_fw_in.n[1] = (uint32_t)syn_bn[0];
+		amp_dsp_fw_in.d[2] = syn_b[1]; amp_dsp_fw_in.n[2] = (uint32_t)syn_bn[1];
+	}
+	hb_dead = hb_needs_sclk = 0; dsp_err_after_start = -1; dsp_stuck_amp = -1; dsp_stuck_addr = 0;
+}
+static void dsp_run(int with_fw)
+{
+	reset_hw(); dsp_cfg(with_fw); tick_need = 20; tick_bad = 0;
+	amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 1 };
+}
+static int dsp_go(void)
+{
+	int rc = amp_init_run();
+
+	amp_a9_cb = (struct amp_a9_cb){ 0 };
+	return rc;
+}
+static void dsp_tests(void)
+{
+	static const uint8_t abc_sha[32] = { 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+					     0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad };
+	uint8_t sha[32];
+	int rc;
+
+	syn_build();
+	amp_sha256((const uint8_t *)"abc", 3, sha);
+	CHECK(!memcmp(sha, abc_sha, 32), "sha256(abc)");
+	{	/* 1000 bytes: several blocks, the length in the last one */
+		static uint8_t z[1000];
+		static const uint8_t want[4] = { 0x54, 0x1b, 0x3e, 0x9d };	/* sha256 of 1000 zero bytes starts 541b3e9d */
+		amp_sha256(z, sizeof(z), sha);
+		CHECK(!memcmp(sha, want, 4), "sha256(1000 x 0)");
+	}
+	/* the allowlist */
+	CHECK(!amp_write_ok(0x2014u, 1u) && !amp_dsp_ctl_ok(0x2014u, 0u), "PWR_CTRL1 never");
+	CHECK(!amp_write_ok(0x2BC1000u, 0x201u) && !amp_write_ok(0x2BC7000u, 0u), "CCM start / WDT not writable unarmed");
+	CHECK(!amp_write_ok(0x13020u, 2u) && !amp_write_ok(0x2B80010u, 1u) && !amp_write_ok(0x2C08u, 3u), "no mailbox, SOFT_RESET, DSP_CLK write");
+	CHECK(amp_write_ok(0x2B80080u, 1u) && !amp_write_ok(0x2B80080u, 0u) && !amp_write_ok(0x2B80084u, 1u) && amp_write_ok(0x4C58u, 0x3Au) &&
+	      !amp_write_ok(0x4C58u, 0x28u) && amp_write_ok(0x2BC305Cu, 0xFFFFFFFFu) && !amp_write_ok(0x2BC3010u, 0xFFFFFFFFu), "control pairs exact");
+	CHECK(amp_dsp_mem_ok(0x3800000u, 0x4FECu) && !amp_dsp_mem_ok(0x3800000u, 0x4FF0u) && !amp_dsp_mem_ok(0x2002FF0u, 8u) && !amp_dsp_mem_ok(0x2001002u, 4u) &&
+	      !amp_dsp_mem_ok(0x2000000u, 6u) && amp_dsp_mem_ok(0x2C017F0u, 4u) && !amp_dsp_mem_ok(0x2BC1000u, 4u), "memory ranges");
+	amp_dsp_row.on = 1; amp_dsp_row.reg = 0x2BC1000u; amp_dsp_row.mask = 0x201u; amp_dsp_row.field = 0x201u; amp_dsp_row.old = 0x10u;
+	CHECK(amp_write_ok(0x2BC1000u, 0x211u) && !amp_write_ok(0x2BC1000u, 0x201u) && !amp_write_ok(0x2BC7000u, 0x211u) && !amp_write_ok(0x2014u, 0x211u), "armed row");
+	amp_dsp_row.on = 0;
+	CHECK(amp_dsp_bin_reg(0x12u, 0x0eu, 0x40u, 0u, 12u) == 0x2C00028u && amp_dsp_bin_reg(0x6u, 0x0eu, 0x40u, 8u, 8u) == 0x3400040u &&
+	      amp_dsp_bin_reg(0x6u, 0x0eu, 0x2u, 8u, 8u) == 0u && amp_dsp_bin_reg(0x12u, 0x0eu, 0x40u, 0x10000u, 4u) == 0u, "bin addressing (Google load_coeff) and bounds");
+	printf("ok: A9e sha256, allowlist, ranges, bin addressing\n");
+
+	/* good: both loaded, started after the TDM config, heartbeat in window 1, stopped, restored */
+	dsp_run(1); rc = dsp_go();
+	CHECK(rc == 0 && violations == 0, why_v);
+	CHECK(has("SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r"), "A9e pass line");
+	CHECK(amp_dsp_res.a[0].win == 1 && amp_dsp_res.a[1].win == 1 && amp[0].starts == 1 && amp[1].starts == 1 && amp[0].stops == 1 && amp[1].stops == 1,
+	      "started once, ran in window 1, stopped once");
+	CHECK(!amp[0].reset_running && !amp[1].reset_running && amp[0].mpulock == 3 && amp[0].errata == 0xFFFFu && amp[1].rxsrc[3] == 0x3Bu, "stop before the reset, MPU, errata, RX sources");
+	CHECK(amp[0].ymp_first == 0x2C00000u && amp[1].ymu_first == 0x3400040u && amp[0].ym[0x10] == 0x41u && amp[1].ym[0x10] == 0x42u && amp[0].ym[0x11] == 0x42u,
+	      "bin blocks at the stock addresses, R gets R-.bin");
+	CHECK(amp[0].xm[3] == 0x400a4u && amp[0].xm[22] == 0xbedeadu && amp[1].pm[4] == 0xB0B1B2B3u, "wmfw regions in memory (packed view decodes)");
+	CHECK(amp[0].a9v[10] == a9v0[0][10] && amp[1].a9v[10] == a9v0[1][10] && restored_exact() && a9_closes == 1 && !tick_bad, "PWR_CTRL1 untouched, restore exact, AOC closed");
+	printf("ok: A9e good: %u + %u memory writes, halo running l,r (window 1), stopped, restore exact\n", amp[0].dsp_mem_nw, amp[1].dsp_mem_nw);
+
+	/* runs only once the stream clocks: window 2 */
+	dsp_run(1); hb_needs_sclk = 1; rc = dsp_go();
+	CHECK(rc == 0 && violations == 0 && amp_dsp_res.a[0].win == 2 && amp_dsp_res.a[1].win == 2 && has("halo running l,r") && !amp[0].reset_running, "A9e window 2");
+	printf("ok: A9e heartbeat only with the stream: running in window 2, stopped\n");
+
+	/* never runs: both windows bounded, stop on both, partial line */
+	dsp_run(1); hb_dead = 1; rc = dsp_go();
+	CHECK(violations == 0 && amp_dsp_res.a[0].polls == 2u * AMP_DSP_HB_POLLS && amp[0].stops == 1 && amp[1].stops == 1 && !amp[0].reset_running &&
+	      !amp[1].reset_running && has("SWEET AMP DSP: stopped l=no-heartbeat r=no-heartbeat stop ok/ok restore ok") && restored_exact(), "A9e no heartbeat");
+	printf("ok: A9e no heartbeat: 2 x %u polls, core stopped l,r before the reset\n", AMP_DSP_HB_POLLS);
+
+	/* an error bit after the start on L: L stopped, line says so */
+	dsp_run(1); dsp_err_after_start = 0; rc = dsp_go();
+	CHECK(violations == 0 && amp_dsp_res.a[0].stage == DS_ERR && amp[0].stops == 1 && amp[1].stops == 1 && !amp[0].reset_running &&
+	      has("l=error-after-start"), "A9e error after start");
+	printf("ok: A9e error bit after the start: stopped, loud\n");
+
+	/* a PM word on R does not stick: R stops at its wmfw region, nothing is started */
+	dsp_run(1); dsp_stuck_amp = 1; dsp_stuck_addr = 0x3800008u; rc = dsp_go();
+	CHECK(violations == 0 && amp_dsp_res.a[1].stage == DS_WMFW && amp_dsp_res.a[0].stage == DS_LOADED && !amp[0].starts && !amp[1].starts &&
+	      has("SWEET AMP DSP: stopped l=loaded-not-started r=wmfw-region#") && restored_exact(), "A9e read-back mismatch");
+	printf("ok: A9e read-back mismatch: stage named, no core started\n");
+
+	/* a wrong terminator (L): alg-header stop, no .bin write, R untouched */
+	dsp_run(1); dsp_stuck_amp = 0; dsp_stuck_addr = 0x2000000u + 4u * 16u; rc = dsp_go();	/* the register holding word 22 (terminator) */
+	CHECK(violations == 0 && amp_dsp_res.a[0].stage != DS_LOADED && amp[0].ymu_first == 0u && amp[1].dsp_mem_nw == 0u && !amp[0].starts, "A9e bad header / region");
+	printf("ok: A9e L header region bad: L stopped (%s), no bin write, R not written\n", amp_dsp_stage_name[amp_dsp_res.a[0].stage]);
+
+	/* no files: no DSP write at all, the sweetaoc=5 part still runs */
+	dsp_run(0); rc = dsp_go();
+	CHECK(rc == 0 && violations == 0 && !amp[0].dsp_ctl_nw && !amp[1].dsp_ctl_nw && !amp[0].dsp_mem_nw && a9_opens == 1 && a9_closes == 1 &&
+	      has("SWEET AMP DSP: stopped l=no-fw r=not-run stop -/- restore ok") && restored_exact(), "A9e no files");
+	printf("ok: A9e no AMPFW: no DSP write, stream part unchanged\n");
+
+	/* the container: a synthetic one is refused (not the pinned files) */
+	{
+		size_t o = 16 + 48;
+		memset(syn_c, 0, sizeof(syn_c));
+		memcpy(syn_c, "AMPFWV01", 8); le32w(syn_c + 8, 1); le32w(syn_c + 12, 3);
+		memcpy(syn_c + 16, "WMFW", 4); le32w(syn_c + 20, (uint32_t)syn_wn); le32w(syn_c + 24, (uint32_t)o);
+		CHECK(amp_dsp_container(syn_c, sizeof(syn_c), &amp_dsp_fw_in) < 0 && !amp_dsp_fw_in.d[0], "unpinned container refused");
+		CHECK(amp_dsp_container(syn_c, 10, &amp_dsp_fw_in) == -1, "short container refused");
+	}
+	/* the stock files, when present: the pinned container check and a full run on them */
+	{
+		const char *dir = getenv("SWEET_CS35L41_FW");
+		char path[600], def[512];
+		static const char *const nm[3] = { "cs35l41-dsp1-spk-prot.wmfw", "cs35l41-dsp1-spk-prot.bin", "R-cs35l41-dsp1-spk-prot.bin" };
+		static uint8_t c[64 + 34000 + 8000];
+		size_t o = 64, k;
+		int ok = 1;
+
+		if (!dir) { snprintf(def, sizeof(def), "%s/pixelios-artifacts/aoc/cs35l41", getenv("HOME") ? getenv("HOME") : "."); dir = def; }
+		memset(c, 0, sizeof(c)); memcpy(c, "AMPFWV01", 8); le32w(c + 8, 1); le32w(c + 12, 3);
+		for (int i = 0; i < 3 && ok; i++) {
+			FILE *f;
+			snprintf(path, sizeof(path), "%s/%s", dir, nm[i]);
+			if (!(f = fopen(path, "rb"))) { ok = 0; break; }
+			k = fread(c + o, 1, sizeof(c) - o, f);
+			fclose(f);
+			memcpy(c + 16 + 16 * i, i == 0 ? "WMFW" : i == 1 ? "BINL" : "BINR", 4); le32w(c + 20 + 16 * i, (uint32_t)k); le32w(c + 24 + 16 * i, (uint32_t)o);
+			o = (o + k + 7u) & ~(size_t)7u;
+		}
+		if (!ok) {
+			printf("skip: stock CS35L41 files not present in %s\n", dir);
+			return;
+		}
+		CHECK(amp_dsp_container(c, o, &amp_dsp_fw_in) == 0, "the stock files match the pinned lengths + sha256");
+		c[100] ^= 1;
+		CHECK(amp_dsp_container(c, o, &amp_dsp_fw_in) == -6, "a flipped byte fails the sha256");
+		c[100] ^= 1;
+		reset_hw(); dsp_cfg(0); tick_need = 20; tick_bad = 0;
+		CHECK(amp_dsp_container(c, o, &amp_dsp_fw_in) == 0, "container");
+		amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 1 };
+		rc = dsp_go();
+		CHECK(rc == 0 && violations == 0 && has("SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r"), "stock files: pass line");
+		CHECK(amp_dsp_res.a[0].hb_reg == 0x2800784u && amp_dsp_res.a[0].cd_xm == 0x94u && amp_dsp_res.a[0].cd_ym == 0x0eu && amp_dsp_res.a[0].regions == 6u &&
+		      amp_dsp_res.a[0].blocks == 2u && amp[0].ymp_first == 0x2C00000u, "stock: heartbeat 0x2800784, CSPL xm 0x94 ym 0xe, 6 regions, 2 blocks");
+		CHECK(amp[0].ymu_first == 0x3401130u && amp[1].ymu_first == 0x3401110u, "stock: YM unpacked blocks L 0x3401130, R 0x3401110");
+		CHECK(!amp[0].reset_running && !amp[1].reset_running && restored_exact(), "stock: stopped, restored");
+		printf("ok: A9e stock files: pinned, %u bytes per amp loaded and read back, halo running l,r, stopped (%u frames)\n", amp_dsp_res.a[0].bytes, nframes);
+	}
+}
+
 int main(void)
 {
 	int rc;
@@ -1054,7 +1452,7 @@ int main(void)
 		CHECK(!amp_write_ok(0x3810u, 0x32u) && !amp_write_ok(0x2C04u, 0x510u), "unarmed A9 register refused");
 		printf("ok: A9 allowlist (rows armed one at a time, PWR_CTRL1 0x2014 never writable)\n");
 
-		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
+		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
 		a9ok = rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && amp_a9_res.opened && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked;
 		CHECK(a9ok, "A9 good: run passes, opened once, closed once, PLL locked l,r");
 		CHECK(violations == 0, why_v);
@@ -1070,27 +1468,27 @@ int main(void)
 		CHECK(restored_exact(), "A9: the same restore (resets low, every word back)");
 		printf("ok: A9 good: %u / %u A9 writes, PLL locked l,r, AOC open + close once, restore exact\n", amp[0].a9_nwr, amp[1].a9_nwr);
 
-		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
+		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !amp_a9_res.a[0].locked && !amp_a9_res.a[1].locked && amp_a9_res.a[0].polls == 100u &&
 		      amp_a9_res.a[1].polls == 100u && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "PLL never locks: 100 polls each, closed, restored");
 		printf("ok: A9 PLL never locks (bounded 100 x 1 ms per amp, AOC closed, restore exact)\n");
 
-		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
+		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !amp_a9_res.opened && amp_a9_res.a[0].polls == 0u && a9_closes == 1 && restored_exact(), "AOC open refused: no PLL poll, close called, restored");
 		printf("ok: A9 AOC open refused (no PLL poll, close still called)\n");
 
-		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
+		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
 		CHECK(violations == 0 && amp_a9_res.a[0].cfg && !amp_a9_res.a[1].cfg && amp[1].a9_nwr == 0 && a9_opens == 0 && restored_exact(), "GLOBAL_EN found set on R: no R write, no AOC open");
 		printf("ok: A9 GLOBAL_EN found set: no write to that amp, no AOC open\n");
 
-		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u }; rc = amp_init_run();
+		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
 		CHECK(violations == 0 && amp[0].a9_nwr == 0 && amp[1].a9_nwr == 0 && a9_opens == 0, "error bit (H8): no A9 write, no open");
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 		printf("ok: A9 amp error bit: no TDM config, no AOC open\n");
 	}
 	/* ---- patch 0167 (sweetaoc=5): joint L/R poll <= 500 x 1 ms with a tick per ms, st3 snapshots, close on every path ---- */
 	{
-		reset_hw(); tick_need = 20; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u }; rc = amp_init_run();
+		reset_hw(); tick_need = 20; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0 }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && !tick_bad && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked,
 		      "A9 play: locked l,r after the stream clocks, opened once, closed once, ticks inside");
 		CHECK(a9_ticks == 20 && amp_a9_res.a[0].polls == 20u && amp_a9_res.a[1].polls == 20u, "joint poll stops at the lock (20 ticks, 20 polls each)");
@@ -1099,21 +1497,22 @@ int main(void)
 		      "st3 line, PLL lines, restore exact, PWR_CTRL1 untouched");
 		printf("ok: A9 play: joint poll locks at tick 20, AOC closed once, restore exact\n");
 
-		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u }; rc = amp_init_run();
+		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0 }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !tick_bad && a9_ticks == 500 && amp_a9_res.a[0].polls == 500u && amp_a9_res.a[1].polls == 500u &&
 		      !amp_a9_res.a[0].locked && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "never clocks: 500 joint polls, closed, restored");
 		CHECK(amp_a9_res.a[1].snap[4] == amp_a9_res.a[1].st3 && amp_a9_res.a[1].snap[0] == amp_a9_res.a[1].st3, "snapshots @1 and @500 taken");
 		printf("ok: A9 play: never clocks (bounded 500 x 1 ms joint, AOC closed, restore exact)\n");
 
-		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 9999u }; rc = amp_init_run();
+		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 9999u, 0 }; rc = amp_init_run();
 		CHECK(a9_ticks == 500 && amp_a9_res.a[0].polls == 500u && a9_closes == 1, "polls above 500 clamped to 500");
 		printf("ok: A9 play: poll bound clamped to 500\n");
 
-		reset_hw(); tick_need = 1; tick_bad = 0; a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u }; rc = amp_init_run();
+		reset_hw(); tick_need = 1; tick_bad = 0; a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0 }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && a9_ticks == 0 && !amp_a9_res.opened && a9_closes == 1 && restored_exact(), "play open failed: no tick, close called");
 		printf("ok: A9 play: open failed (no tick, close still called)\n");
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 	}
+	dsp_tests();	/* patch 0169 */
 	if (fails) {
 		printf("amp_xnu_host_test: %u FAILED\n", fails);
 		return 1;
