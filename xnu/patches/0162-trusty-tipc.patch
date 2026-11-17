@@ -5,7 +5,8 @@ GO_ONLINE, one connect to com.android.trusty.gsa.hwmgr.aoc, HWMGR_CMD_STATE_CMD 
 VDEV_RESET, reclaims, VIRTIO_STOP, RXTX_UNMAP. Plan rule A-1 allowlist enforced per call (function id and arguments) in
 bsd/dev/sweet_tipc.h; no call is retried with other arguments; every std-call <= 2 s, the run <= 10 s. Shared memory is one
 KMA_PERMANENT contiguous allocation, never freed. Host test shim/tipc_host_test.c (fake Trusty). Lines "SWEET TRUSTY: hwmgr.aoc state=N"
-(pass) or "SWEET TRUSTY: tipc stop ...", last "SWEET TRUSTY: tipc done ...". Without sweettrusty=2 nothing changes.
+(pass) or "SWEET TRUSTY: tipc stop ...", last "SWEET TRUSTY: tipc done ..." (td_mask: failed teardown calls; reset_r0: probe
+VDEV_RESET r0, unchecked like trusty-virtio.c:211-219; o6-a5-tipc saw -7 there). Without sweettrusty=2 nothing changes.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -135,14 +136,14 @@ new file mode 100644
 +		printf("SWEET TRUSTY: tipc stop %s at stage %d r0=0x%x r2=0x%x (hwmgr err=%u state=%u)\n", swtp_ename(rc), r.stage,
 +		    r.raw, r.raw2, r.herr, r.state);
 +	}
-+	printf("SWEET TRUSTY: tipc done smc=%u shares=%u reclaimed=%u teardown_bad=%u td_r0=0x%x t=%llu us\n", r.nsmc, r.nshare,
-+	    r.nreclaim, r.td_bad, r.td_raw, (unsigned long long)r.t_us);
++	printf("SWEET TRUSTY: tipc done smc=%u shares=%u reclaimed=%u teardown_bad=%u td_r0=0x%x td_mask=%#x reset_r0=0x%x t=%llu us\n",
++	    r.nsmc, r.nshare, r.nreclaim, r.td_bad, r.td_raw, r.td_mask, r.reset_r0, (unsigned long long)r.t_us);
 +}
 diff --git a/bsd/dev/sweet_tipc.h b/bsd/dev/sweet_tipc.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_tipc.h
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,773 @@
 +/*
 + * Trusty TIPC GET_STATE (patch 0162, plan 2026-11-14 oneshot-2 step A5, boot-arg sweettrusty=2). Pure logic, no kernel
 + * headers: the host test (shim/tipc_host_test.c) drives it with a fake Trusty. It replays the stock Linux driver's path
@@ -275,6 +276,7 @@ new file mode 100644
 +	uint32_t vdev_nid, dfeat, gfeat, cfg_len, msg_max, vr_num[2], vr_align[2], vr_nid[2], vr_size[2];
 +	uint32_t remote, max_msg, state, herr, online, connected;
 +	uint32_t nsmc, nshare, nreclaim, td_bad, td_raw;   /* teardown: failed calls, first r0 */
++	uint32_t reset_r0, td_mask;     /* r0 of the probe VDEV_RESET; failed teardown calls 1 reset 2 reclaim 4 stop 8 descr 16 unmap */
 +	uint64_t h[SWTP_MAXSH];
 +	uint64_t t_us;
 +	/* private */
@@ -688,6 +690,7 @@ new file mode 100644
 +	if (r->reset_done) {
 +		if (swtp_std(b, r, SWTP_SC_VDEV_RESET, r->vdev_nid, 0, 0, &ret) || ret != 0) {
 +			r->td_bad++;
++			r->td_mask |= 1u;
 +			r->td_raw = r->td_raw ? r->td_raw : (ret ? ret : 0xEEEEEEEEu);
 +		}
 +		r->rc = SWTP_OK;
@@ -696,6 +699,7 @@ new file mode 100644
 +		if (swtp_fast(b, r, SWTP_FFA_MEM_RECLAIM, (uint32_t)r->h[i - 1u], (uint32_t)(r->h[i - 1u] >> 32), 0, &o) ||
 +		    (uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
 +			r->td_bad++;
++			r->td_mask |= 2u;
 +			r->td_raw = r->td_raw ? r->td_raw : (uint32_t)o.r0;
 +		} else {
 +			r->nreclaim++;
@@ -705,6 +709,7 @@ new file mode 100644
 +	if (r->descr_loaded) {
 +		if (swtp_std(b, r, SWTP_SC_STOP, (uint32_t)r->hdescr, (uint32_t)(r->hdescr >> 32), SWTP_PG, &ret) || ret != 0) {
 +			r->td_bad++;
++			r->td_mask |= 4u;
 +			r->td_raw = r->td_raw ? r->td_raw : (ret ? ret : 0xEEEEEEEEu);
 +		}
 +		r->rc = SWTP_OK;
@@ -713,6 +718,7 @@ new file mode 100644
 +		if (swtp_fast(b, r, SWTP_FFA_MEM_RECLAIM, (uint32_t)r->h[0], (uint32_t)(r->h[0] >> 32), 0, &o) ||
 +		    (uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
 +			r->td_bad++;
++			r->td_mask |= 8u;
 +			r->td_raw = r->td_raw ? r->td_raw : (uint32_t)o.r0;
 +		} else {
 +			r->nreclaim++;
@@ -722,6 +728,7 @@ new file mode 100644
 +	if (r->mapped) {
 +		if (swtp_fast(b, r, SWTP_FFA_RXTX_UNMAP, 0, 0, 0, &o) || (uint32_t)o.r0 != SWTP_FFA_SUCCESS) {
 +			r->td_bad++;
++			r->td_mask |= 16u;
 +			r->td_raw = r->td_raw ? r->td_raw : (uint32_t)o.r0;
 +		}
 +		r->rc = SWTP_OK;
@@ -795,10 +802,8 @@ new file mode 100644
 +		return r->rc;
 +	}
 +	r->reset_done = 1;
-+	if (ret != 0) {
-+		return swtp_fail(r, SWTP_E_VIRTIO, ret, 1);
-+	}
-+	st = b->arena + r->vstat_off;           /* fw_rsc_vdev.status; gfeatures at -8 */
++	r->reset_r0 = ret;      /* not checked: trusty_virtio_reset discards it (trusty-virtio.c:211-219, ops->reset is void) */
++	st =b->arena + r->vstat_off;           /* fw_rsc_vdev.status; gfeatures at -8 */
 +	st[0] = (uint8_t)(st[0] | SWTP_S_ACK);
 +	st[0] = (uint8_t)(st[0] | SWTP_S_DRIVER);
 +	r->gfeat = r->dfeat & (0x1u | 0xF0000000u);     /* driver table {0} + transport bits 28..31 (virtio.c:256-280) */

@@ -17,7 +17,7 @@ struct share { uint64_t h, pa; uint32_t pages, perm, live; };
 struct fake {
 	/* injections */
 	uint32_t api, ffa_ver, getdescr_ret_neg, num_vdev, dfeat, conn_status, herr, state, never_online, share_fail_at;
-	uint32_t intr_descr, fiq_start, busy_reset, nopint, msgmax, cpu_idle_start, reclaim_deny;
+	uint32_t intr_descr, fiq_start, busy_reset, nopint, msgmax, cpu_idle_start, reclaim_deny, reset_idle_fail;
 	/* state */
 	uint64_t now;
 	uint32_t mapped, unmapped, nsh, started, stopped, resets, online_sent, conn, got_req, got_disc, errors, pending;
@@ -243,6 +243,8 @@ fsmc(void *c, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3, struct swtp_r
 	case SWTP_SC_VDEV_RESET:
 		if (a1 != 9) ERR("reset nid");
 		if (F.busy_reset) { F.busy_reset--; o->r0 = SWTP_E_BUSY; return; }
+		/* measured o6-a5-tipc 20261117T093122Z: the probe reset before START returns SM_ERR_INTERNAL_FAILURE (-7) */
+		if (F.reset_idle_fail && !F.started) { o->r0 = (uint32_t)-7; return; }
 		F.resets++; o->r0 = 0; return;
 	case SWTP_SC_START: {
 		uint8_t *v = vdev();
@@ -417,9 +419,15 @@ main(void)
 	CHECK(rc == SWTP_OK && r.td_bad == 10 && r.nreclaim == 0, "reclaim denied: rc %s td_bad %u", swtp_ename(rc), r.td_bad);
 	check_log("reclaim-deny");
 
-	reset(); F.busy_reset = 1000;     /* BUSY forever: the same call at most 6 times, then a stop */
+	reset(); F.busy_reset = 1000;     /* BUSY forever: each reset at most 6 times, result ignored as Linux does */
 	rc = run(&r);
-	CHECK(rc == SWTP_E_VIRTIO && r.raw == SWTP_E_BUSY && F.nc < 200, "busy forever: rc %s calls %u", swtp_ename(rc), F.nc);
+	CHECK(rc == SWTP_OK && r.reset_r0 == SWTP_E_BUSY && (r.td_mask & 1u) && F.nc < 200, "busy forever: rc %s calls %u", swtp_ename(rc), F.nc);
+
+	reset(); F.reset_idle_fail = 1;   /* hardware: probe VDEV_RESET -7 must not stop the probe (trusty-virtio.c:211-219) */
+	rc = run(&r);
+	CHECK(rc == SWTP_OK && r.reset_r0 == (uint32_t)-7 && F.resets == 1 && F.stopped == 1 && r.td_bad == 0 && live() == 0 && F.errors == 0,
+	    "reset -7 before start: rc %s stage %d reset_r0 %#x resets %u td_bad %u", swtp_ename(rc), r.stage, r.reset_r0, F.resets, r.td_bad);
+	check_log("reset-idle-fail");
 
 	reset(); F.nopint = 100000;     /* a Trusty that never finishes a NOP: every wait still ends */
 	rc = run(&r);
