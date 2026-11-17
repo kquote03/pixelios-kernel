@@ -17,7 +17,7 @@ struct share { uint64_t h, pa; uint32_t pages, perm, live; };
 struct fake {
 	/* injections */
 	uint32_t api, ffa_ver, getdescr_ret_neg, num_vdev, dfeat, conn_status, herr, state, never_online, share_fail_at;
-	uint32_t intr_descr, fiq_start, busy_reset, nopint, msgmax, cpu_idle_start, reclaim_deny, reset_idle_fail;
+	uint32_t intr_descr, fiq_start, busy_reset, nopint, msgmax, cpu_idle_start, reclaim_deny, reset_idle_fail, reply_src, reply_dst;
 	/* state */
 	uint64_t now;
 	uint32_t mapped, unmapped, nsh, started, stopped, resets, online_sent, conn, got_req, got_disc, errors, pending;
@@ -167,7 +167,7 @@ tx_process(void)
 			}
 			F.got_req++;
 			uint32_t w[3] = { 0x80000001u, F.herr, F.state };
-			rx_put(5000, 1024, w, 3);
+			rx_put(F.reply_src ? F.reply_src : 5000, F.reply_dst ? F.reply_dst : 1024, w, 3);
 		} else if (dst == 53 && rd32(b + 16) == 5) {
 			if (plen != 12 || rd32(b + 20) != 4 || rd32(b + 24) != 5000) {
 				ERR("disc bad");
@@ -428,6 +428,14 @@ main(void)
 	CHECK(rc == SWTP_OK && r.reset_r0 == (uint32_t)-7 && F.resets == 1 && F.stopped == 1 && r.td_bad == 0 && live() == 0 && F.errors == 0,
 	    "reset -7 before start: rc %s stage %d reset_r0 %#x resets %u td_bad %u", swtp_ename(rc), r.stage, r.reset_r0, F.resets, r.td_bad);
 	check_log("reset-idle-fail");
+
+	reset(); F.reply_src = 1001;   /* o6-a5-tipc2: reply src != CONN_RSP remote; Linux routes by dst only (trusty-ipc.c:2071-2080) */
+	rc = run(&r);
+	CHECK(rc == SWTP_OK && r.rsrc == 1001 && r.rdst == 1024 && F.got_disc == 1 && live() == 0 && F.errors == 0, "reply src: rc %s", swtp_ename(rc));
+
+	reset(); F.reply_dst = 1025;   /* not our channel: Linux drops it, we stop */
+	rc = run(&r);
+	CHECK(rc == SWTP_E_REPLY && r.rdst == 1025 && F.got_disc == 1 && live() == 0, "reply dst: rc %s", swtp_ename(rc));
 
 	reset(); F.nopint = 100000;     /* a Trusty that never finishes a NOP: every wait still ends */
 	rc = run(&r);

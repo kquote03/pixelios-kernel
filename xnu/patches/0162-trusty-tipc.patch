@@ -6,7 +6,8 @@ VDEV_RESET, reclaims, VIRTIO_STOP, RXTX_UNMAP. Plan rule A-1 allowlist enforced 
 bsd/dev/sweet_tipc.h; no call is retried with other arguments; every std-call <= 2 s, the run <= 10 s. Shared memory is one
 KMA_PERMANENT contiguous allocation, never freed. Host test shim/tipc_host_test.c (fake Trusty). Lines "SWEET TRUSTY: hwmgr.aoc state=N"
 (pass) or "SWEET TRUSTY: tipc stop ...", last "SWEET TRUSTY: tipc done ..." (td_mask: failed teardown calls; reset_r0: probe
-VDEV_RESET r0, unchecked like trusty-virtio.c:211-219; o6-a5-tipc saw -7 there). Without sweettrusty=2 nothing changes.
+VDEV_RESET r0, unchecked like trusty-virtio.c:211-219; o6-a5-tipc saw -7 there; reply src/dst: the GET_STATE reply is matched by
+dst only, as trusty-ipc.c:2071-2080 routes it; o6-a5-tipc2 stopped on a src check). Without sweettrusty=2 nothing changes.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -23,7 +24,7 @@ diff --git a/bsd/dev/sweet_tipc.c b/bsd/dev/sweet_tipc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_tipc.c
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,116 @@
 +/*
 + * Trusty TIPC GET_STATE (patch 0162, plan 2026-11-14 oneshot-2 step A5), boot-arg sweettrusty=2, called from
 + * sweet_trusty_init (patch 0156). The logic, its allowlist (plan rule A-1) and the cites are in sweet_tipc.h (host test
@@ -129,7 +130,8 @@ new file mode 100644
 +	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.descr_w[12],
 +	    r.descr_w[13], r.descr_w[14], r.descr_w[15], r.descr_w[16], r.descr_w[17], r.descr_w[18], r.descr_w[19],
 +	    r.descr_w[20], r.descr_w[21], r.descr_w[22], r.descr_w[23]);
-+	printf("SWEET TRUSTY: tipc online=%u connected=%u remote=%u max_msg=%u\n", r.online, r.connected, r.remote, r.max_msg);
++	printf("SWEET TRUSTY: tipc online=%u connected=%u remote=%u max_msg=%u reply src=%u dst=%u\n", r.online, r.connected, r.remote,
++	    r.max_msg, r.rsrc, r.rdst);
 +	if (rc == SWTP_OK) {
 +		printf("SWEET TRUSTY: hwmgr.aoc state=%u\n", r.state);
 +	} else {
@@ -143,7 +145,7 @@ diff --git a/bsd/dev/sweet_tipc.h b/bsd/dev/sweet_tipc.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_tipc.h
-@@ -0,0 +1,773 @@
+@@ -0,0 +1,776 @@
 +/*
 + * Trusty TIPC GET_STATE (patch 0162, plan 2026-11-14 oneshot-2 step A5, boot-arg sweettrusty=2). Pure logic, no kernel
 + * headers: the host test (shim/tipc_host_test.c) drives it with a fake Trusty. It replays the stock Linux driver's path
@@ -277,6 +279,7 @@ new file mode 100644
 +	uint32_t remote, max_msg, state, herr, online, connected;
 +	uint32_t nsmc, nshare, nreclaim, td_bad, td_raw;   /* teardown: failed calls, first r0 */
 +	uint32_t reset_r0, td_mask;     /* r0 of the probe VDEV_RESET; failed teardown calls 1 reset 2 reclaim 4 stop 8 descr 16 unmap */
++	uint32_t rsrc, rdst;            /* header src/dst of the GET_STATE reply */
 +	uint64_t h[SWTP_MAXSH];
 +	uint64_t t_us;
 +	/* private */
@@ -872,7 +875,9 @@ new file mode 100644
 +	if (swtp_recv(b, r, &m, SWTP_E_REPLY)) {
 +		return r->rc;
 +	}
-+	if (m.dst != SWTP_LOCAL_ADDR || m.src != r->remote || m.len != 12u || m.w[0] != (SWTP_HWMGR_STATE_CMD | SWTP_HWMGR_RESP)) {
++	r->rsrc = m.src;                        /* src is not checked: Linux routes by dst only (trusty-ipc.c:2071-2080) */
++	r->rdst = m.dst;
++	if (m.dst != SWTP_LOCAL_ADDR || m.len != 12u || m.w[0] != (SWTP_HWMGR_STATE_CMD | SWTP_HWMGR_RESP)) {
 +		return swtp_fail(r, SWTP_E_REPLY, m.len, m.w[0]);
 +	}
 +	r->herr = m.w[1];
