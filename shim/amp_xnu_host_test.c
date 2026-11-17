@@ -393,6 +393,7 @@ static int otp_as_linux(int a)
  * xm_base + 1) counts each read while it runs. ---- */
 static int hb_dead, hb_needs_sclk, dsp_err_after_start = -1;
 static uint32_t dsp_stuck_addr; static int dsp_stuck_amp = -1;
+static unsigned dsp_wmax, dsp_rmax;	/* patch 0170: the longest write / read burst seen (data bytes after the 6 address / pad bytes) */
 static int dsp_mem(uint32_t x)
 {
 	return (x >= 0x2000000u && x <= 0x2002FF0u) || (x >= 0x2800000u && x <= 0x2803FF4u) || (x >= 0x2C00000u && x <= 0x2C017F0u) ||
@@ -532,6 +533,8 @@ static uint8_t dsp_stream(int a, uint32_t fa, unsigned q, uint8_t mosi, int tx_o
 		return 0;
 	}
 	if (!dsp_mem(x)) violate("a burst runs past its DSP memory range");
+	if (!(m->frame[0] & 0x80u) && q - 5u > dsp_wmax) dsp_wmax = q - 5u;
+	if ((m->frame[0] & 0x80u) && q - 5u > dsp_rmax) dsp_rmax = q - 5u;
 	if (!(m->frame[0] & 0x80u)) {
 		if (!tx_on) violate("a burst write byte with the transmitter off");
 		m->wacc = (m->wacc << 8) | mosi;
@@ -1125,6 +1128,38 @@ static void syn_build(void)
 		syn_bn[a] = n;
 	}
 }
+/* patch 0170: syn_w + three long regions (XM packed 1212 B, YM unpacked 1004 B, PM 1000 B: 3 bursts each) before the algorithm data */
+static uint8_t syn_w2[4096];
+static size_t syn_wn2;
+static const uint32_t LR_REG[3] = { 0x2000300u, 0x3400400u, 0x3800028u }, LR_LEN[3] = { 1212u, 1004u, 1000u };
+static uint8_t lr_d[3][1212];
+static void syn_build2(void)
+{
+	static const uint32_t ty[3] = { 0x11u, 0x6u, 0x10u }, of[3] = { 0x100u, 0x100u, 8u };
+	size_t n = syn_wn - 16u;	/* drop the trailing 0xF2 region (8 bytes + 8 header) */
+
+	memcpy(syn_w2, syn_w, n);
+	for (int r = 0; r < 3; r++) {
+		for (uint32_t i = 0; i < LR_LEN[r]; i++)
+			lr_d[r][i] = (r == 1 && !(i & 3u)) ? 0u : (uint8_t)(1u + (i * 7u + (uint32_t)r * 13u) % 251u);	/* never 0 (YM unpacked: top byte 0) */
+		n += region(syn_w2 + n, ty[r], of[r], lr_d[r], LR_LEN[r]);
+	}
+	n += region(syn_w2 + n, 0xF2u, 0, (const uint8_t *)"algdata!", 8);
+	syn_wn2 = n;
+}
+/* every register of the long regions holds what ONE burst of the region would have left there (the 4 stream bytes, big endian) */
+static int lr_image_ok(int a)
+{
+	for (int r = 0; r < 3; r++)
+		for (uint32_t i = 0; i < LR_LEN[r]; i += 4u) {
+			uint32_t want = (uint32_t)lr_d[r][i] << 24 | (uint32_t)lr_d[r][i + 1] << 16 | (uint32_t)lr_d[r][i + 2] << 8 | lr_d[r][i + 3];
+			uint32_t got = dsp_get(a, LR_REG[r] + i);
+
+			if (r == 1 ? (got & 0xFFFFFFu) != (want & 0xFFFFFFu) : got != want)
+				return 0;
+		}
+	return 1;
+}
 static void dsp_cfg(int with_fw)
 {
 	amp_dsp_fw_in = (struct amp_dsp_fw){ { 0 }, { 0 } };
@@ -1133,7 +1168,7 @@ static void dsp_cfg(int with_fw)
 		amp_dsp_fw_in.d[1] = syn_b[0]; amp_dsp_fw_in.n[1] = (uint32_t)syn_bn[0];
 		amp_dsp_fw_in.d[2] = syn_b[1]; amp_dsp_fw_in.n[2] = (uint32_t)syn_bn[1];
 	}
-	hb_dead = hb_needs_sclk = 0; dsp_err_after_start = -1; dsp_stuck_amp = -1; dsp_stuck_addr = 0;
+	hb_dead = hb_needs_sclk = 0; dsp_err_after_start = -1; dsp_stuck_amp = -1; dsp_stuck_addr = 0; dsp_wmax = dsp_rmax = 0;
 }
 static void dsp_run(int with_fw)
 {
@@ -1190,6 +1225,33 @@ static void dsp_tests(void)
 	CHECK(amp[0].xm[3] == 0x400a4u && amp[0].xm[22] == 0xbedeadu && amp[1].pm[4] == 0xB0B1B2B3u, "wmfw regions in memory (packed view decodes)");
 	CHECK(amp[0].a9v[10] == a9v0[0][10] && amp[1].a9v[10] == a9v0[1][10] && restored_exact() && a9_closes == 1 && !tick_bad, "PWR_CTRL1 untouched, restore exact, AOC closed");
 	printf("ok: A9e good: %u + %u memory writes, halo running l,r (window 1), stopped, restore exact\n", amp[0].dsp_mem_nw, amp[1].dsp_mem_nw);
+	{	/* patch 0170: regions longer than one burst: 3 bursts each, the memory image of the single burst, every register written once */
+		unsigned nw0 = amp[0].dsp_mem_nw, nw1 = amp[1].dsp_mem_nw;
+
+		syn_build2();
+		dsp_run(1); amp_dsp_fw_in.d[0] = syn_w2; amp_dsp_fw_in.n[0] = (uint32_t)syn_wn2; rc = dsp_go();
+		CHECK(rc == 0 && violations == 0 && has("SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r"), "A9f long regions: pass line");
+		CHECK(dsp_wmax == AMP_DSP_BURST && dsp_rmax == AMP_DSP_BURST && AMP_DSP_BURST <= 512u, "A9f: no write / read burst longer than 480 bytes, 480 used");
+		CHECK(lr_image_ok(0) && lr_image_ok(1), "A9f: memory = the single-burst image (XM packed, YM unpacked, PM across the 480 / 960 boundaries)");
+		CHECK(amp[0].dsp_mem_nw == nw0 + (1212u + 1004u + 1000u) / 4u && amp[1].dsp_mem_nw == nw1 + (1212u + 1004u + 1000u) / 4u,
+		      "A9f: every register written exactly once (no overlap, no gap at a burst boundary)");
+		CHECK(amp_dsp_res.a[0].regions == 7u && amp_dsp_res.a[0].fk == 0, "A9f: 7 memory regions, no failure recorded");
+		printf("ok: A9f bursts <= %u B: 3 long regions per amp land as one burst would, %u + %u memory writes\n", AMP_DSP_BURST, amp[0].dsp_mem_nw,
+		       amp[1].dsp_mem_nw);
+
+		/* a PM register in the second burst does not stick on L: the line names the read-back, its offset and both words; R not written */
+		dsp_run(1); amp_dsp_fw_in.d[0] = syn_w2; amp_dsp_fw_in.n[0] = (uint32_t)syn_wn2; dsp_stuck_amp = 0; dsp_stuck_addr = 0x3800028u + 520u; rc = dsp_go();
+		{
+			char want[96];
+			uint32_t w = (uint32_t)lr_d[2][520] << 24 | (uint32_t)lr_d[2][521] << 16 | (uint32_t)lr_d[2][522] << 8 | lr_d[2][523];
+
+			snprintf(want, sizeof(want), "SWEET AMP DSP: L wmfw-region#7 read-back mismatch +520/1000 exp %08x got 00000000", w);
+			CHECK(violations == 0 && amp_dsp_res.a[0].stage == DS_WMFW && amp_dsp_res.a[0].fk == 3 && has(want) &&
+			      has("SWEET AMP DSP: stopped l=wmfw-region#7/rb r=not-run stop -/- restore ok") && amp[1].dsp_mem_nw == 0u && !amp[0].starts &&
+			      restored_exact(), "A9f read-back mismatch line");
+		}
+		printf("ok: A9f read-back mismatch in burst 2: offset 520, expected / got word printed, no start, R untouched\n");
+	}
 
 	/* runs only once the stream clocks: window 2 */
 	dsp_run(1); hb_needs_sclk = 1; rc = dsp_go();

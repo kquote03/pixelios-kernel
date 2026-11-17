@@ -10,6 +10,7 @@ PATCH_A9 = ROOT / "xnu/patches/0166-aoc-audio.patch"	# patch 0166 (A9b) extends 
 PATCH_PLAY = ROOT / "xnu/patches/0167-aoc-playback.patch"	# patch 0167 (sweetaoc=5) extends sweet_amp.h and sweet_audio.h again
 PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"
 PATCH_DSP = ROOT / "xnu/patches/0169-amp-dsp-load.patch"	# patch 0169 (sweetaoc=6): sweet_amp.h hunk + the new sweet_amp_dsp.h	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
+PATCH_CHUNK = ROOT / "xnu/patches/0170-amp-dsp-chunk.patch"	# patch 0170 (A9f): sweet_amp_dsp.h bursts of <= 480 bytes + failure detail
 TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
@@ -113,6 +114,11 @@ def apply(base: str, name: str, patches) -> str:
         return (d / f"bsd/dev/{name}").read_text()
 
 
+def header_dsp() -> str:
+    """sweet_amp_dsp.h of patch 0169 with the 0170 hunk applied on top (as shim/build.sh does)."""
+    return apply(header("sweet_amp_dsp.h", PATCH_DSP), "sweet_amp_dsp.h", [PATCH_CHUNK])
+
+
 def header_a9() -> str:
     """The 0158 header with the sweet_amp.h hunks of patches 0166 and 0167 applied on top."""
     return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY, PATCH_DSP])
@@ -123,7 +129,7 @@ def run(hdr: str, d: pathlib.Path) -> bool:
     (d / "sweet_amp_otp.h").write_text(header("sweet_amp_otp.h"))
     (d / "sweet_cs_dsp.h").write_text(header("sweet_cs_dsp.h", PATCH_A9))
     if not (d / "sweet_amp_dsp.h").exists() or not getattr(run, "dsp_mut", False):
-        (d / "sweet_amp_dsp.h").write_text(header("sweet_amp_dsp.h", PATCH_DSP))
+        (d / "sweet_amp_dsp.h").write_text(header_dsp())
     c = subprocess.run(["gcc", "-O1", "-w", f"-I{d}", "-o", str(d / "t"), str(TEST)], capture_output=True, text=True)
     if c.returncode:
         return False	# a mutant that does not compile counts as killed
@@ -164,7 +170,7 @@ def main() -> int:
         k1 = sweep(good, MUTANTS, run, d)
         k2 = sweep(good_audio, MUTANTS_AUDIO, run_audio, d)
         k3 = sweep(good, MUTANTS_HOOK, run, d)
-        good_dsp = header("sweet_amp_dsp.h", PATCH_DSP)
+        good_dsp = header_dsp()
 
         def run_dsp(hdr, dd):
             (dd / "sweet_amp_dsp.h").write_text(hdr)

@@ -664,6 +664,10 @@ else
 	awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0169-amp-dsp-load.patch > $O/ampx/p3.diff
 	chk "amp_xnu_host_test: 0169-amp-dsp-load applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p3.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
 	awk '$0=="+++ b/bsd/dev/sweet_amp_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0169-amp-dsp-load.patch > $O/sweet_amp_dsp.h
+	# patch 0170 (A9f) changes sweet_amp_dsp.h: bursts of <= 480 bytes, the failure detail line
+	rm -rf $O/ampd && mkdir -p $O/ampd/bsd/dev && cp $O/sweet_amp_dsp.h $O/ampd/bsd/dev/sweet_amp_dsp.h
+	awk -v f="diff --git a/bsd/dev/sweet_amp_dsp.h b/bsd/dev/sweet_amp_dsp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0170-amp-dsp-chunk.patch > $O/ampd/p.diff
+	chk "amp_xnu_host_test: 0170-amp-dsp-chunk applied to sweet_amp_dsp.h" sh -c "cd $O/ampd && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_amp_dsp.h ../sweet_amp_dsp.h"
 	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
 	chk "amp_xnu_host_test" $O/amp_xnu_host_test
 	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c
