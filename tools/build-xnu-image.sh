@@ -42,7 +42,10 @@ while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; adt_given=1; shift 2 ;; --board) board=$2; shift 2 ;; --aocfw) aocfw=$2; shift 2 ;; --ampfw) ampfw=$2; shift 2 ;; --qr) qr=$2; shift 2 ;;
 	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --wlan-hold) wlan=1; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --gpu-handover) handover=1; shift ;; --gpu-clk-level) gpuclklvl=$2; shift 2 ;; --mif-clk-level) mifclk=1; mifclevel=${2:?--mif-clk-level needs a MIF table row in kHz}; shift 2 ;; --mif-clk) mifclk=1; shift ;; --sweet-probe) sweetprobe=1; shift ;; --pmic-src) pmicsrc=1; shift ;; --pmic-src-clear) pmicsrc=1; pmicclr=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --compress) compress=--compress; shift ;; --wlanfw) wlanfw=$2; shift 2 ;; --wlancred) wlancred=$2; shift 2 ;; --el2-trap) el2=1; shift ;; --el2-b3) el2b3=1; shift ;; --panic-spin) spin=$2; shift 2 ;;
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
-export BOARD=${board:-${BOARD:-}}; board=$(python3 -I tools/boards.py --target) || exit 2   # one target for ADT, payload and shim
+# one target for ADT, payload and shim; bluejay (the default) keeps upstream's path, any other board is checked by tools/boards.py --target
+export BOARD=${board:-${BOARD:-}}
+DEFAULT_TARGET=bluejay   # = tools/boards.py DEFAULT_TARGET (tools/test_no_hardcoded_target.py pins it)
+if [ -z "$BOARD" ] || [ "$BOARD" = "$DEFAULT_TARGET" ]; then board=$DEFAULT_TARGET; else board=$(python3 -I tools/boards.py --target) || exit 2; fi
 [ -z "$compress" ] || [ -n "$overlay" ] || { echo "--compress needs --overlay" >&2; exit 2; }
 [ -z "$wlanfw" ] || [ "$wlan" = 1 ] || { echo "--wlanfw needs --wlan-hold" >&2; exit 2; }
 [ -z "$wlancred" ] || [ "$wlan" = 1 ] || { echo "--wlancred needs --wlan-hold" >&2; exit 2; }
@@ -70,7 +73,7 @@ read -ra ew <<<"$extra"; nrd=0; for w in "${ew[@]}"; do case $w in rd=*) nrd=$((
 [ "$sweetprobe" = 0 ] || case " $args " in *" sweetprobe="*) ;; *) args="$args sweetprobe=1" ;; esac   # xnu patch 0363 gate; an explicit sweetprobe= in --args is kept (patch 0363 logs a GAP for any value but 0/1)
 [ -z "$overlay" ] || case " $args " in *" ufsroot="*) echo "--overlay: ufsroot= in --args is refused (the overlay writes userdata only, AGENTS.md rule 1)" >&2; exit 2 ;; esac   # review 0117 F1
 [ -z "$overlay" ] || case " $args " in *" sweetdev="*) ;; *) args="$args sweetdev=1" ;; esac   # never doubled: an explicit sweetdev= in --args is kept
-args=$(python3 -I tools/mkpayload.py --board-cmdline "$board" "$args") || exit 2   # board.json xnu_bootargs_default (oriole touch recipe); explicit keys win; before every size check
+[ "$board" = "$DEFAULT_TARGET" ] || args=$(python3 -I tools/mkpayload.py --board-cmdline "$board" "$args") || exit 2   # board.json xnu_bootargs_default (oriole touch recipe); explicit keys win; before every size check
 railsarg=(); words=""; dvfsarg=(); hoarg=(); el2arg=(); [ "$el2" = 0 ] || el2arg=(--el2-trap); [ "$el2b3" = 0 ] || el2arg+=(--el2-b3); [ "$handover" = 0 ] || hoarg=(--gpu-handover); [ -z "$gpuclklvl" ] || hoarg+=(--gpu-clk --gpu-clk-level "$gpuclklvl"); [ "$mifclk" = 0 ] || hoarg+=(--mif-clk); [ "$sweetprobe" = 0 ] || hoarg+=(--sweet-probe); [ -z "$mifclevel" ] || hoarg+=(--mif-clk-level "$mifclevel"); [ "$pmicsrc" = 0 ] || hoarg+=(--pmic-src); [ "$pmicclr" = 0 ] || hoarg+=(--pmic-src-clear); [ "$wlan" = 0 ] || hoarg+=(--wlan-hold)
 [ "$rails" = 0 ] || words=rails
 if [ "$dvfs" = read ]; then words="${words:+$words,}dvfsr"

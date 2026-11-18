@@ -35,8 +35,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import adt, boards  # noqa: E402
 from tools.pack_wlanfw import parse as wlanfw_parse  # noqa: E402
 from tools.mkwlancred import parse as wlancred_parse  # noqa: E402
-from tools.pack_aocfw import parse as aocfw_parse  # noqa: E402
-from tools.pack_ampfw import parse as ampfw_parse  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
@@ -274,6 +272,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     if aocfw_path:
         # stock aoc.bin as a zlib container (tools/pack_aocfw.py, sweetaoc=2): same placement, property AOCFW <phys, exact size>;
         # parse() inflates it once here and refuses anything but the pinned image
+        from tools.pack_aocfw import parse as aocfw_parse   # imported only when used (test trees copy mkpayload.py alone)
         image = open(aocfw_path, 'rb').read()
         aocfw_parse(image)
         af_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
@@ -287,6 +286,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     if ampfw_path:
         # CS35L41 DSP files (tools/pack_ampfw.py, sweetaoc=6, the oriole amp DSP-load patch): same placement, property AMPFW <phys, exact size>;
         # parse() refuses anything but the pinned files
+        from tools.pack_ampfw import parse as ampfw_parse
         image = open(ampfw_path, 'rb').read()
         ampfw_parse(image)
         mf_size = (len(image) + PAGE - 1) & ~(PAGE - 1)

@@ -8,7 +8,7 @@
       One `SAFETY PASS pre <id>: ...` or `SAFETY FAIL <id>: <why>` line per item, then `RESULT: PASS|FAIL safety-check pre ...`. Exit 0 = all pass.
       With --image IMG a pass writes IMG.safety (image sha256): tools/fboot.sh --expect xnu refuses an image without it.
   tools/safety-check fastboot [--state DIR]
-      UNDER the lock, phone in fastboot, right before `fastboot boot`: S8 product == bluejay (nothing else is asked of another phone), S4
+      UNDER the lock, phone in fastboot, right before `fastboot boot`: S8 product == the target phone (BOARD, default bluejay) (nothing else is asked of another phone), S4
       battery-voltage >= 3500 mV, S2 storage-temperature < 38 C (the only temperature fastboot reports on bluejay, UFS sensor [obs resident
       2026-11-12 21:10Z]) and the S2/S4 state rules again (a queued run waited). Exit 0 = boot may start.
   tools/safety-check monitor --log USBNET_LOG [--stop FILE] [--until FILE] [--t-boot EPOCH] [--sysfs DIR] [--state DIR]
@@ -148,7 +148,21 @@ def s7(a, kb, bl):
                                                                   "; GAP: no BOOT_LINE_LENGTH in this tree's tools/mkpayload.py, kernel tag alone judged" if shim is None else ""))
 
 
-GUARDS = (("tools/fboot.sh", '[ "$prod" = bluejay ]'), ("tools/fboot.sh", "tools/phone-lock check"), ("tools/to-fastboot.sh", "bluejay"))
+# the product guard compares against the target phone (BOARD, default bluejay; tools/boards.py --target), never a looser check
+# each guard is (file, alternatives): one alternative must be present. The board form (oriole port) is the bluejay literal with the target read
+# from tools/boards.py --target, which refuses any BOARD without a board.json; to-fastboot.sh only execs tools/phone goto (product check = boards.target_board()).
+GUARDS = (("tools/fboot.sh", ('[ "$prod" = bluejay ]', '[ "$prod" = "$board" ]')), ("tools/fboot.sh", ("tools/phone-lock check",)),
+          ("tools/to-fastboot.sh", ("bluejay",)))
+
+
+def target_board():
+    """The phone this run may touch: $BOARD, default bluejay (AGENTS.md rule 2). Any other value must be a board with a board.json
+    (tools/boards.py target_board() refuses it otherwise); the default needs no lookup, so bluejay keeps upstream's path."""
+    b = os.environ.get("BOARD") or "bluejay"
+    if b == "bluejay":
+        return b
+    import boards  # noqa: E402  (tools/ is on sys.path)
+    return boards.target_board()
 
 
 def s8(a):
@@ -157,14 +171,17 @@ def s8(a):
         return ("S8", False, "the run writes %s: only userdata may be written (AGENTS rule 1)" % ", ".join(bad))
     if a.action == "flash-userdata" and not os.path.exists(os.path.join(a.tree, "tools", "fflash-userdata.sh")):
         return ("S8", False, "userdata flash without tools/fflash-userdata.sh in %s" % a.tree)
-    for f, needle in GUARDS:
+    for f, needles in GUARDS:
         try:
-            if needle not in open(os.path.join(a.tree, f)).read():
-                return ("S8", False, "%s lost its guard '%s' (bluejay/lock check)" % (f, needle))
+            text = open(os.path.join(a.tree, f)).read()
+            if not any(n in text for n in needles):
+                return ("S8", False, "%s lost its guard '%s' (target phone/lock check)" % (f, needles[0]))
+            if '[ "$prod" = "$board" ]' in text and "tools/boards.py --target" not in text:
+                return ("S8", False, "%s compares the product with $board but never sets it from tools/boards.py --target" % f)
         except OSError as e:
             return ("S8", False, "%s unreadable: %s" % (f, e))
     what = "RAM boot (fastboot boot), no partition write" if a.action == "ram-boot" and not a.writes else "userdata only, via tools/fflash-userdata.sh"
-    return ("S8", True, what + "; bluejay + lock checked by tools/fboot.sh / to-fastboot.sh under the lock and by `safety-check fastboot`")
+    return ("S8", True, what + "; target phone (BOARD) + lock checked by tools/fboot.sh / to-fastboot.sh under the lock and by `safety-check fastboot`")
 
 
 def s9(a):
@@ -224,11 +241,12 @@ def cmd_fastboot(a):
         simseams.require_sandbox(["SAFETY_FASTBOOT"])
     now, res = time.time(), []
     prod, raw = getvar(fb, "product")
-    if prod != "bluejay":
-        out("SAFETY FAIL S8: fastboot product is %r, not bluejay (%s): nothing else is asked" % (prod, raw))
+    want = target_board()
+    if prod != want:
+        out("SAFETY FAIL S8: fastboot product is %r, not %s (%s): nothing else is asked" % (prod, want, raw))
         out("RESULT: FAIL safety-check fastboot failed=S8")
         return 1
-    res.append(("S8", True, "product bluejay"))
+    res.append(("S8", True, "product %s" % want))
     st = L.load_state(a.state)
     v, raw = getvar(fb, "battery-voltage")
     mv = pint(v) if v else None

@@ -97,9 +97,15 @@ while [ $# -gt 0 ]; do case "$1" in
 	--intent) intent=$2; shift 2 ;; --dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --compress) compress=--compress; shift ;; --wlanfw) wlanfw=$2; shift 2 ;; --aocfw) aocfw=$2; shift 2 ;; --ampfw) ampfw=$2; shift 2 ;; --print-bootargs) printba=1; shift ;; --el2-trap) el2=--el2-trap; shift ;; --el2-b3) el2b3=--el2-b3; shift ;; --panic-spin) spin=$2; shift 2 ;;
 	*) echo "unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$xself" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" >&2; exit 2 ;; esac; done
 # one target for the image AND for every phone check: --board X sets BOARD=X for the tools xrun calls (fboot.sh, phone, safety-check, ...)
-export BOARD=${board:-${BOARD:-}}; board=$(python3 -I tools/boards.py --target) || exit 2
-# board.json xnu_bootargs_default (oriole: its own touch recipe, run oriole-gui7) replaces the bluejay TOUCH DEFAULTS below; tools/mkpayload.py adds those keys
-boarddef=$(python3 -I -c 'import sys; sys.path.insert(0, "tools"); import boards; print(1 if boards.BOARDS[sys.argv[1]].get("xnu_bootargs_default") else 0)' "$board") || exit 2
+# bluejay (the default) keeps upstream's path unchanged; any other target is checked by tools/boards.py --target (a board.json must exist)
+export BOARD=${board:-${BOARD:-}}; boarddef=0
+DEFAULT_TARGET=bluejay   # = tools/boards.py DEFAULT_TARGET (tools/test_no_hardcoded_target.py pins it)
+if [ -z "$BOARD" ] || [ "$BOARD" = "$DEFAULT_TARGET" ]; then board=$DEFAULT_TARGET
+else
+	board=$(python3 -I tools/boards.py --target) || exit 2
+	# board.json xnu_bootargs_default (oriole: its own touch recipe, run oriole-gui7) replaces the bluejay TOUCH DEFAULTS below; tools/mkpayload.py adds those keys
+	boarddef=$(python3 -I -c 'import sys; sys.path.insert(0, "tools"); import boards; print(1 if boards.BOARDS[sys.argv[1]].get("xnu_bootargs_default") else 0)' "$board") || exit 2
+fi
 # GPU INTENT DEFAULTS (goal "GPU result is the default", sprint-gpu 2026-11-09): `tools/xrun --kernel K --intent gpu` alone reproduces the nav44 configuration
 # (docs/sprint/2026-11-08-gpu.md GOAL MET: fps-bench v2.1 fps_min 56.7). Every default is overridable (an explicit flag / boot-arg key wins) and listed on the `implicit:` line.
 # NOT defaults: the kdebug stream (sweetkdbg), the GIC probe (sweetmali bit 0x40) and the witnesses
@@ -113,7 +119,9 @@ gpu_add() { case " $args " in *" $1="*) ;; *) args="${args:+$args }$1=$2"; gpuim
 # Kernel side: sweettouch defaults to 2 (patch 0088), so only the bus/clock/pad keys are passed (~100 boot-arg bytes; gpu line 870 of 1023, patch 0176).
 if [ "$intent" != el2 ] && ! [[ " $args " =~ \ sweettouch=(0|-[0-9]+)\  ]]; then
 	[ -n "$rails" ] || [ "${norails:-0}" = 1 ] || { rails=--rails; gpuimplicit="${gpuimplicit:+$gpuimplicit }--rails"; }
-	[ "$boarddef" = 1 ] || { gpu_add sweettouchmux 1; gpu_add sweettouchclk 3; gpu_add sweettouchcs 1; gpu_add sweettouchpoke 'm:10c00640=0=10;d:100;m:10c0180c=5=f;'; }
+	if [ "$boarddef" != 1 ]; then   # oriole: board.json xnu_bootargs_default (tools/mkpayload.py) carries its own touch recipe
+	gpu_add sweettouchmux 1; gpu_add sweettouchclk 3; gpu_add sweettouchcs 1; gpu_add sweettouchpoke 'm:10c00640=0=10;d:100;m:10c0180c=5=f;'
+	fi
 fi
 if [ "$intent" = gpu ]; then
 	[ -n "$handover" ] || { handover=--gpu-handover; gpuimplicit="${gpuimplicit:+$gpuimplicit }--gpu-handover"; }
@@ -358,7 +366,7 @@ if [ "$check" = 1 ]; then
 	for _ in $(seq 1 "$uw"); do grep -qsx -e 18d1 -e 1209 "$usbsys"/*/idVendor && break; sim_sleep 1; done
 	grep -qsx -e 18d1 -e 1209 "$usbsys"/*/idVendor || die "no Google USB device (18d1) appeared within ${uw} s (and no iOS gadget 1209): needs Power+VolDown hold"
 	"$tofb" 200 >>"$LOG" 2>&1 || {
-		if grep -q REFUSED "$LOG"; then die "device is not bluejay (to-fastboot refused): $(tailog)"; fi
+		if grep -q REFUSED "$LOG"; then die "device is not $board (to-fastboot refused): $(tailog)"; fi
 		die "needs Power+VolDown hold (phone not reachable by fastboot/adb)"; }
 fi
 # r1 F1/F2: both checks again while holding the lock, for EVERY run (--no-flash-check too): a queued run must not boot XNU on a userdata or a port that changed while it waited
