@@ -51,6 +51,9 @@ required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS
 `tools/check-all.sh` rebuilds default images and overwrites `shim/out/*.img`: rebuild with the flags you need right
 before `fastboot boot`.
 
+Upstream (release 2026-11-15) keeps its hard rules and recipes in a super repo that is not part of this checkout; the rules above stay in force here,
+and rule 8 above replaces upstream's rule 8 (independent review) for this fork (user decision 2026-11-18). Maintainer tools kept as documented commands (tool census callers): regenerate QR log patch 0094 with `python3 -I tools/make-qr2-patch.py XNU_TREE_PATCHED_THROUGH_0093 [out.patch]` and retrain its tables with `tools/qrz-train.py`; userdata read-back check of the UDUMP path (maintainer/human only): `python3 -I tools/udump-recv.py` before `fastboot boot`, then `tools/check-udump.sh`. Wi-Fi conformance matrix for the Apple80211/IO80211 Settings rows (SPEC-WIFI Part F): `python3 -I tools/matrix_wifi_list.py --spec <super>/docs/specs/SPEC-WIFI.md --root .` prints `RESULT: PASS matrix-wifi-list rows=N ...`.
+
 ## Workflow
 
 - Small, reviewable commits; one concern each. Commit completed work; push only after the gate passes.

@@ -51,9 +51,7 @@ class Rejects(unittest.TestCase):
             m.parse(blob)
 
     def test_magic(self): self.bad(b'SWEETDEX' + self.good[8:])
-    def test_version(self):
-        self.bad(self.good[:8] + struct.pack('<I', 3) + self.good[12:])
-        self.bad(self.good[:8] + struct.pack('<I', 2) + self.good[12:])   # a v1 entry read with the 40-byte v2 header runs past the end
+    def test_version(self): self.bad(self.good[:8] + struct.pack('<I', 3) + self.good[12:])
     def test_count_too_big(self): self.bad(self.good[:12] + struct.pack('<I', 5000) + self.good[16:])
     def test_count_past_end(self): self.bad(self.good[:12] + struct.pack('<I', 2) + self.good[16:])
     def test_truncated(self):
@@ -98,6 +96,19 @@ class Rejects(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0); self.assertIn('40 MiB', r.stderr)
 
 
+    def test_packer_refuses_over_observed_device_limit(self):
+        for size, ok in ((20 << 20, True), (22 << 20, False)):
+            d = tree({'usr/lib/a': b''})
+            with open(os.path.join(d, 'usr/lib/a'), 'wb') as f:
+                f.truncate(size)
+            out = os.path.join(d, 'o.bin')
+            r = run(d, out)
+            if ok:
+                self.assertEqual(r.returncode, 0); self.assertIn('WARNING', r.stderr); self.assertTrue(os.path.exists(out))
+            else:
+                self.assertEqual(r.returncode, 1); self.assertIn('RESULT: FAIL', r.stdout)
+                self.assertIn('HANDOFF.md:174', r.stdout); self.assertFalse(os.path.exists(out))
+
     def test_control_bytes_case_and_long_names(self):
         for p in ('/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/usr/lib/\xe9', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/' + 'n' * 246):
             self.assertIsNotNone(m.path_check(p), repr(p))
@@ -132,60 +143,65 @@ class Rejects(unittest.TestCase):
         self.assertEqual(r.returncode, 0); self.assertIn('WARNING', r.stderr)
 
 
-class Zlib(unittest.TestCase):
-    # Version 2 archives (xnu patch 0163): compressed entries, verified like the kernel sd_stream.
-    ents = [('/usr/lib/big', 0o755, 0, 0, b'abcd' * 5000), ('/usr/lib/small', 0o644, 0, 0, b'xy')]
-
-    def ent(self, body, usize, crc, flags=1, zero=0):
-        p = b'/usr/lib/z'
-        e = struct.pack('<HHIIIQQII', len(p), 0o644, 0, 0, crc, len(body), usize, flags, zero) + p
-        e += b'\0' * (-len(e) % 16) + body
-        return b'SWEETDEV' + struct.pack('<II', 2, 1) + e + b'\0' * (-len(e) % 16)
-
-    def test_unused_feature_keeps_v1_bytes(self):
-        a = m.pack(self.ents)
-        self.assertEqual(m.pack(self.ents, None), a)
-        self.assertEqual(m.pack(self.ents, 10 ** 9), a)            # nothing above the threshold: still version 1
-        self.assertEqual(struct.unpack_from('<I', a, 8)[0], 1)
-        incompressible = [('/usr/lib/r', 0o644, 0, 0, os.urandom(4000))]
-        self.assertEqual(m.pack(incompressible, 0), m.pack(incompressible))   # compression not smaller: stored, version 1
-
-    def test_round_trip(self):
-        blob = m.pack(self.ents, zlib_above=1000)
-        self.assertEqual(struct.unpack_from('<I', blob, 8)[0], 2)
-        self.assertLess(len(blob), 1000)
-        ents = m.parse(blob, with_usize=True)
-        self.assertEqual([(e[0], e[4], e[5], e[6]) for e in ents], [(p, d, True, len(d)) for p, _, _, _, d in self.ents])
-
-    def test_good_truncated_crc_bomb(self):
-        data = bytes(range(256)) * 40
-        z, crc = zlib.compress(data, 9), zlib.crc32(data)
-        self.assertTrue(m.parse(self.ent(z, len(data), crc))[0][5])
-        self.assertFalse(m.parse(self.ent(z[:-5], len(data), crc))[0][5])          # truncated stream
-        self.assertFalse(m.parse(self.ent(z, len(data), crc ^ 1))[0][5])           # wrong crc
-        self.assertFalse(m.parse(self.ent(z + b'X', len(data), crc))[0][5])        # data after the stream
-        self.assertFalse(m.parse(self.ent(z, len(data) - 1, crc))[0][5])
-        zb = zlib.compress(b'\0' * (4 << 20), 9)                                   # bomb: declared 100 bytes
-        e = m.parse(self.ent(zb, 100, zlib.crc32(b'\0' * 100)))[0]
-        self.assertFalse(e[5]); self.assertLessEqual(len(e[4]), 101)
-
-    def test_caps_and_fields(self):
-        z = zlib.compress(b'x', 9)
-        for blob in (self.ent(z, (40 << 20) + 1, 0), self.ent(z, 1, 0, flags=2), self.ent(z, 1, 0, zero=1),
-                     self.ent(b'abc', 4, 0, flags=0)):
-            with self.assertRaises(ValueError):
-                m.parse(blob)
-        with self.assertRaises(ValueError):
-            m.pack([('/usr/lib/a', 0o644, 0, 0, b'\0' * (21 << 20)), ('/usr/lib/b', 0o644, 0, 0, b'\0' * (20 << 20))], 0)
-
-    def test_cli_flag(self):
-        d = tree({'usr/lib/libx.dylib': b'x' * 100000, 'usr/local/bin/t': b'tt'})
-        o = os.path.join(d, '..', 'oz.bin')
-        r = run(d, o, '--zlib-above', '4096'); self.assertEqual(r.returncode, 0, r.stderr)
-        blob = open(o, 'rb').read()
-        self.assertLess(len(blob), 2000)
-        self.assertEqual([(e[0], len(e[4]), e[5]) for e in m.parse(blob)], [('/usr/lib/libx.dylib', 100000, True), ('/usr/local/bin/t', 2, True)])
-
-
 if __name__ == '__main__':
     unittest.main()
+
+
+class Whiteout(unittest.TestCase):
+    """xnu patch 0280: DIR/<path>.sweetwhiteout (empty) packs a removal; files below /private/var/mobile/ are owned by mobile."""
+    def tree(self, files):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        for p, body in files.items():
+            os.makedirs(os.path.dirname(d + p), exist_ok=True)
+            open(d + p, "wb").write(body)
+        return d
+
+    def setUp(self):
+        import mkdevoverlay as mm
+        self._guard = mm.whiteout_guard
+        mm.whiteout_guard = lambda paths: None   # the image check has its own test below
+
+    def tearDown(self):
+        import mkdevoverlay as mm
+        mm.whiteout_guard = self._guard
+
+    def test_guard_refuses_a_root_image_file(self):
+        import mkdevoverlay as mm
+        from test_overlay_std import standard_root_image   # R13: the gate container mounts the image; a missing one FAILS, never skips
+        img = standard_root_image()
+        self.assertTrue(os.path.isfile(img), "standard root image %s missing on this host (R13: stage it, do not skip)" % img)
+        os.environ["MKDEVOVERLAY_WH_IMAGE"] = img
+        try:
+            with self.assertRaises(SystemExit) as c:
+                self._guard(["/usr/local/bin/wifid-probe"])   # in the standard root (review 0280 F1)
+            self.assertIn("has that file", str(c.exception))
+            self._guard(["/usr/local/bin/no-such-tool"])       # absent: allowed
+        finally:
+            os.environ.pop("MKDEVOVERLAY_WH_IMAGE", None)
+
+    def test_whiteout_entry(self):
+        import mkdevoverlay as mm
+        ents = mm.collect(self.tree({"/usr/local/bin/added.sweetwhiteout": b"", "/usr/local/bin/keep": b"x"}))
+        got = {p: (mode, data) for p, mode, uid, gid, data in ents}
+        self.assertEqual(got["/usr/local/bin/added"], (0xFFFF, b""))
+        self.assertEqual(got["/usr/local/bin/keep"][1], b"x")
+        back = mm.parse(mm.pack(ents))
+        self.assertIn(("/usr/local/bin/added", 0xFFFF, 0, 0, b"", True), back)
+
+    def test_whiteout_outside_allow_and_nonempty_refused(self):
+        import mkdevoverlay as mm
+        with self.assertRaises(SystemExit):
+            mm.collect(self.tree({"/usr/lib/libSystem.B.dylib.sweetwhiteout": b""}))
+        with self.assertRaises(SystemExit):
+            mm.collect(self.tree({"/usr/local/bin/x.sweetwhiteout": b"not empty"}))
+
+    def test_bt_paths_and_mobile_owner(self):
+        import mkdevoverlay as mm
+        ents = mm.collect(self.tree({"/Applications/BTApp.app/BTApp": b"bin",
+                                     "/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist": b"pl"}))
+        own = {p: (uid, gid) for p, mode, uid, gid, data in ents}
+        self.assertEqual(own["/Applications/BTApp.app/BTApp"], (0, 0))
+        self.assertEqual(own["/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist"], (501, 501))
+        with self.assertRaises(SystemExit):
+            mm.collect(self.tree({"/Applications/BTApp.app/Info.plist": b"x"}))   # only the binary is allowed

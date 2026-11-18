@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ref-capture: read-only capture of the stock Linux state of the phone in recovery (TP-034).
+"""ref-capture: read-only capture of the stock Linux state of the phone in recovery (TP-056).
 
   tools/ref-capture [--out DIR] [--only NAME,...]     capture (default dir ~/pixelios-artifacts/ref/<board>/<UTC stamp>/)
   tools/ref-capture --list                             print the allowlist, touch nothing

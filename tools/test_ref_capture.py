@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tools/ref-capture (TP-034) with a fake adb: device/state refusal, the allowlist/denylist, timeouts, output files."""
+"""Tests for tools/ref-capture (TP-056) with a fake adb: device/state refusal, the allowlist/denylist, timeouts, output files."""
 import ast, importlib.machinery, importlib.util, os, re, stat, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))

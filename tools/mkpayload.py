@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER] [--gpujob CONTAINER] [--aocfw CONTAINER] [--ampfw CONTAINER]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER] [--wlancred BLOB] [--aocfw CONTAINER] [--ampfw CONTAINER]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -10,15 +10,15 @@ rewritten to its unslid target. The shim then only copies flat segments.
 
 Payload layout (little endian, all offsets from payload start):
   0x000  char  magic[8] = "SWEETXNU"
-  0x008  u32   version = 1, nsegs
+  0x008  u32   version = 3, nsegs   (3: cmdline[2048]; 2 had cmdline[1024], segs at 0x448; 1 had cmdline[608], segs at 0x2a8; shim/loader.c refuses any other)
   0x010  u64   virt_base      kernel VA that maps to phys_base
   0x018  u64   entry_va       LC_UNIXTHREAD pc
   0x020  u64   adt_off, adt_size
   0x030  u64   kernel_end_va  end of the highest segment (page aligned)
   0x038  u64   phys_base      kernel-managed RAM (same values as the ADT's dram-base/size)
   0x040  u64   mem_size
-  0x048  char  cmdline[608]
-  0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
+  0x048  char  cmdline[2048]  BOOT_LINE_LENGTH of xnu patch 0320 (0176: 1024), NUL-terminated (at most 2047 characters)
+  0x848  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
 --ramdisk appends IMAGE as one more segment right after the kernel and moves
 kernel_end past it, so the shim needs no changes: the image lands below the
@@ -26,22 +26,25 @@ ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0). --wlanfw does the same for the BCM4389 container but names the
 property WLANFW (page-rounded placement, <phys, exact size>), which nothing turns into a disk; the container is
-validated (magic, CRCs) before it is packed.
+validated (magic, CRCs) before it is packed. --wlancred (tools/mkwlancred.py, 128 bytes) is placed the same way as property WLANCRED
+<phys, 128>; it is validated (magic, crc) and only `wlancred: present` is reported, never a phys address or any value.
 """
 import argparse, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import adt, boards  # noqa: E402
 from tools.pack_wlanfw import parse as wlanfw_parse  # noqa: E402
-from tools.pack_gpujob import parse as gpujob_parse  # noqa: E402
+from tools.mkwlancred import parse as wlancred_parse  # noqa: E402
 from tools.pack_aocfw import parse as aocfw_parse  # noqa: E402
 from tools.pack_ampfw import parse as ampfw_parse  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
-BOOT_LINE_LENGTH = 608
+BOOT_LINE_LENGTH = 2048	# = shim/payload.h and xnu patch 0320 (on 0176) pexpert/pexpert/arm64/boot.h (tools/test_bootline_layout.py)
+PAYLOAD_VERSION = 3	# = shim/payload.h PAYLOAD_VERSION
 CMDLINE = 0x48
-SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
+SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x848
+KERNEL_TAG = b'SWEET_BOOT_LINE_LENGTH=%d\0' % BOOT_LINE_LENGTH	# xnu patch 0176 tag (follows the macro: 2048 with 0320), osfmk/arm64/arm_vm_init.c (review bootline-1024-r1 F1)
 
 
 def parse_macho(buf):
@@ -147,11 +150,44 @@ def adt_dram(adt_blob):
 
 
 def check_cmdline(cmdline):
-    """The boot-args line is a 608-byte field incl. the NUL; refuse longer ones instead of cutting them silently."""
+    """The boot-args line is a BOOT_LINE_LENGTH (2048) byte field incl. the NUL; refuse longer ones instead of cutting them silently."""
     cl = cmdline.encode()
     if len(cl) > BOOT_LINE_LENGTH - 1:
         sys.exit(f'mkpayload: cmdline is {len(cl)} bytes, the limit is {BOOT_LINE_LENGTH - 1}')
     return cl
+
+
+# QEMU-lab markers (super repo tools/qemu-lab/qadt.py + kernel lab patches 0299/0301-0303 on branch lab/qemu-ios, never on trunk): a phone payload must never
+# carry them (user 2026-11-11). Only the lab's own payload builder (qpay.py) passes lab=True.
+LAB_NODE_NAMES = ('sweet-vblk',)
+LAB_COMPATIBLE = (b'pixos,qemu-virtio-mmio',)
+LAB_PROPS = ('psci-method',)
+LAB_BOOTARGS = ('rd=vblkroot', 'sweetvinput')
+
+
+def lab_markers(adt_blob, cmdline):
+    """Every QEMU-lab marker in this ADT + boot-args line, as 'where: what' strings (empty = a phone-clean image)."""
+    found = []
+    def walk(n, path):
+        here = path + '/' + n.name
+        if n.name in LAB_NODE_NAMES:
+            found.append(f'ADT node {here}')
+        comp = n.prop('compatible') or b''
+        for c in LAB_COMPATIBLE:
+            if c in comp.split(b'\0'):
+                found.append(f'ADT {here} compatible {c.decode()}')
+        for k, _, _ in n.props:
+            if k in LAB_PROPS:
+                found.append(f'ADT {here} property {k}')
+        for c in n.children:
+            walk(c, here)
+    root, _ = adt.parse(adt_blob)
+    walk(root, '')
+    for w in cmdline.split():
+        for b in LAB_BOOTARGS:
+            if w.startswith(b):
+                found.append(f'boot-arg {w}')
+    return found
 
 
 def with_board_args(cmdline, board):
@@ -164,12 +200,15 @@ def with_board_args(cmdline, board):
     return ' '.join([cmdline] + add) if add else cmdline
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None, gpujob_path=None, aocfw_path=None, ampfw_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None, wlancred_path=None, lab=False, aocfw_path=None, ampfw_path=None):
     unmeasured = boards.provisional(board)
     if unmeasured:
         raise SystemExit(f'board {board}: board.json "provisional" still lists {unmeasured}; measure them first '
                          f'(device/*/{board}/docs/PORT.md) and remove them from the list')
     buf = bytearray(open(kernel_path, 'rb').read())
+    if KERNEL_TAG not in buf:
+        sys.exit(f'mkpayload: {kernel_path} lacks {KERNEL_TAG[:-1].decode()!r} (needs xnu patches 0176 + 0320): with another boot-line '
+                 f'length it would read the {BOOT_LINE_LENGTH}-byte boot-args line of this shim as bootFlags/memSizeActual; rebuild the kernel')
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
     segs = [s for s in m['segs'] if s['vmsize']]
@@ -182,6 +221,11 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
     adt_blob = open(adt_path, 'rb').read()
+    if not lab:
+        marks = lab_markers(adt_blob, cmdline)
+        if marks:
+            raise SystemExit('mkpayload: REFUSED: QEMU-lab markers in a phone payload (the lab patches must never boot on a phone; '
+                             'only tools/qemu-lab/qpay.py builds lab payloads): ' + '; '.join(marks))
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     if not any(PHYS_BASE >= base and PHYS_BASE + MEM_SIZE <= base + size
@@ -210,18 +254,22 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
         pieces.append((fw_va, fw_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, fw_pa, len(image), 'WLANFW')
         wlanfw = (hex(fw_pa), hex(len(image)))
-    gpujob = None
-    if gpujob_path:
-        # Mali job captures (tools/pack_gpujob.py, sweetmali bit 0x100): same placement, property GPUJOB <phys, exact size>
-        image = open(gpujob_path, 'rb').read()
-        gpujob_parse(image)
-        gj_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
-        gj_va = kernel_end
-        kernel_end = gj_va + gj_size
-        gj_pa = gj_va - virt_base + PHYS_BASE
-        pieces.append((gj_va, gj_size, image))
-        adt_blob = add_ramdisk_to_adt(adt_blob, gj_pa, len(image), 'GPUJOB')
-        gpujob = (hex(gj_pa), hex(len(image)))
+    wlancred = None
+    if wlancred_path:
+        # RAM-only credential blob (tools/mkwlancred.py, SPEC-WIFI TRANSPORT s.3): same placement as WLANFW, own property; no address or value is reported
+        with open(wlancred_path, 'rb') as f:
+            image = f.read()
+        try:
+            wlancred_parse(image)
+        except ValueError as e:     # the text names the rule, never a value
+            sys.exit(f'mkpayload: --wlancred: {e}')
+        cr_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        cr_va = kernel_end
+        kernel_end = cr_va + cr_size
+        cr_pa = cr_va - virt_base + PHYS_BASE
+        pieces.append((cr_va, cr_size, image))
+        adt_blob = add_ramdisk_to_adt(adt_blob, cr_pa, len(image), 'WLANCRED')
+        wlancred = 'present'
     aocfw = None
     if aocfw_path:
         # stock aoc.bin as a zlib container (tools/pack_aocfw.py, sweetaoc=2): same placement, property AOCFW <phys, exact size>;
@@ -237,8 +285,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
         aocfw = (hex(af_pa), hex(len(image)))
     ampfw = None
     if ampfw_path:
-        # CS35L41 DSP files (tools/pack_ampfw.py, sweetaoc=6, xnu patch 0169): same placement, property AMPFW <phys, exact size>; parse()
-        # refuses anything but the pinned files
+        # CS35L41 DSP files (tools/pack_ampfw.py, sweetaoc=6, the oriole amp DSP-load patch): same placement, property AMPFW <phys, exact size>;
+        # parse() refuses anything but the pinned files
         image = open(ampfw_path, 'rb').read()
         ampfw_parse(image)
         mf_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
@@ -261,7 +309,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     out += adt_blob
     out += b'\0' * (-len(out) & 0xf)
 
-    struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
+    struct.pack_into('<8sII', out, 0, b'SWEETXNU', PAYLOAD_VERSION, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
     cl = check_cmdline(with_board_args(cmdline, board))
@@ -269,7 +317,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlan
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, gpujob=gpujob, aocfw=aocfw, ampfw=ampfw, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, wlancred=wlancred, aocfw=aocfw, ampfw=ampfw, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -283,12 +331,12 @@ if __name__ == '__main__':
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--wlanfw', help='BCM4389 firmware container (tools/pack_wlanfw.py) -> /chosen/memory-map WLANFW')
-    ap.add_argument('--gpujob', help='Mali job captures (tools/pack_gpujob.py) -> /chosen/memory-map GPUJOB (sweetmali bit 0x100)')
-    ap.add_argument('--aocfw', help='stock aoc.bin, zlib container (tools/pack_aocfw.py) -> /chosen/memory-map AOCFW (sweetaoc=2, xnu patch 0164)')
-    ap.add_argument('--ampfw', help='CS35L41 DSP files container (tools/pack_ampfw.py) -> /chosen/memory-map AMPFW (sweetaoc=6, xnu patch 0169)')
+    ap.add_argument('--wlancred', help='credential blob (tools/mkwlancred.py) -> /chosen/memory-map WLANCRED')
+    ap.add_argument('--aocfw', help='stock aoc.bin, zlib container (tools/pack_aocfw.py) -> /chosen/memory-map AOCFW (sweetaoc=2)')
+    ap.add_argument('--ampfw', help='CS35L41 DSP files container (tools/pack_ampfw.py) -> /chosen/memory-map AMPFW (sweetaoc=6)')
     ap.add_argument('--board', choices=sorted(boards.BOARDS), default='sweet')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw, a.gpujob, a.aocfw, a.ampfw)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw, a.wlancred, aocfw_path=a.aocfw, ampfw_path=a.ampfw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
