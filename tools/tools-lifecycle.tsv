@@ -308,3 +308,9 @@ date	tool	old	new	reason	evidence
 2026-11-14	touch_irq1_core_lib.py	-	active	C driver (fake gpa9 EINT bank, FTM5 FIFO, EINT unit and GIC slot; store allowlist trap), core extraction from the patch text and compile-and-run helper of the patch 0356 host test, split out of test_touch_irq1_core.py under the R29 size limit	tools/test_touch_irq1_core.py
 2026-11-14	touch_irq1_core_mut_lib.py	-	active	mutants and equivalent mutants of the patch 0356 core, split out of test_touch_irq1_core.py under the R29 size limit	tools/test_touch_irq1_core.py
 2026-11-15	sweetprobe_audit.py	-	active	audits of the --sweet-probe read-only probes (shim/sweetprobe.c source audit + 30 mutants + objects, the SLC client of acpm.c), kept out of test-bluejay-boot.py (R29); imported by tools/mifclk_audit.py	lowclk xnu 0363 2026-11-15; tools/test_sweetprobe_audit.py
+2026-11-18	amp_xnu_mutants.py	-	allowlisted	mutation check of the oriole amp header (xnu patch 0373 + 0378/0379/0381-0384 hunks), run by shim/build.sh host tests	shim/build.sh amp_xnu_mutants step; docs/research/56
+2026-11-18	mk_launchd_job.py	-	active	oriole: writes the launchd job plist of the SweetAudio installer for the dev overlay (docs/AUTOMATION.md)	tools/test_mk_launchd_job.py
+2026-11-18	pack_ampfw.py	-	active	oriole: AMPFW container of the CS35L41 DSP files for mkpayload --ampfw (xnu patch 0381)	tools/test_pack_ampfw.py
+2026-11-18	pack_aocfw.py	-	active	oriole: AOCFW zlib container of the stock aoc.bin for mkpayload --aocfw (xnu patch 0376)	tools/test_pack_aocfw.py
+2026-11-18	phone-battery	-	active	TP-031 fastboot battery read before a phone run (oriole lane rules)	tools/test_phone_battery.py
+2026-11-18	ref-capture	-	active	TP-056 read-only stock Linux reference capture in recovery	tools/test_ref_capture.py

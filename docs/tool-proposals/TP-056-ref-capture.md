@@ -14,6 +14,8 @@ refs: "-"
 ## checked
 `tools/tool-proposals check ref-capture` / `check recovery`: no tool, no proposal. The earlier stock reference (`~/.hermes/cache/scratch/oriole-recovery1/dmesg.txt`) was taken by hand with ad-hoc `adb shell` lines; one of those (`/sys/kernel/debug/clk/clk_summary`) crashed the phone [obs, user]. TP-031 reads fastboot variables only.
 
+**Caller:** the driver by hand before a stock-reference step of a bring-up plan (oriole plan 2026-11-14 step I1, docs/AUTOMATION.md), no gate step (needs the phone in recovery).
+
 ## why
 Every area of the plan (Wi-Fi, GPU, charging, BT, speakers) needs the stock Linux state of this phone (pinctrl, regulators, power supplies, device tree, interrupts) as its success criterion. By hand that is ~20 commands per session, each a chance to read a crashing debugfs file. One bounded, allowlisted capture removes that and makes the reference reproducible.
 

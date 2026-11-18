@@ -21,7 +21,12 @@ class Oriole(unittest.TestCase):
         self.assertEqual(boards.device_name("oriole"), "Pixel 6")
 
     def test_shim_header_identical_to_bluejay(self):
-        self.assertEqual(boards.c_header("oriole"), boards.c_header("bluejay"))
+        # upstream 2026-11-15 added EL2_DRAM_BANKS (from board.json dram_banks): the only line allowed to differ, because oriole has 8 GiB
+        # (high banks 0x880000000 + 3 x 2 GiB, observed oriole-probe1) and bluejay 6 GiB; every other line stays identical
+        o = [l for l in boards.c_header("oriole").splitlines() if not l.startswith("#define EL2_DRAM_BANKS ")]
+        b = [l for l in boards.c_header("bluejay").splitlines() if not l.startswith("#define EL2_DRAM_BANKS ")]
+        self.assertEqual(o, b)
+        self.assertIn("#define EL2_DRAM_BANKS { 0x80000000UL, 0x80000000UL }, { 0x880000000UL, 0x180000000UL }", boards.c_header("oriole"))
 
     def test_reference_board_values_match_bluejay(self):
         for k in SHARED:
