@@ -37,7 +37,7 @@ CF=(--target=arm64-apple-ios16.0 -isysroot "$SDK" -miphoneos-version-min=16.0 -O
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_tone" "$HERE/sweetaudio_tone.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_install" "$HERE/sweetaudio_install.c"
 "$CLANG" "${CF[@]}" -Wno-deprecated-declarations -framework CoreFoundation -framework CoreAudio -framework AudioToolbox -framework AVFAudio -lobjc -o "$OUT/sweetaudio_play" "$HERE/sweetaudio_play.c"
-"$CLANG" "${CF[@]}" -dynamiclib -install_name /usr/local/lib/libsalog.dylib -framework CoreFoundation -o "$OUT/libsalog.dylib" "$HERE/salog.c"
+"$CLANG" "${CF[@]}" -dynamiclib -install_name /usr/local/lib/libsalog.dylib -framework CoreFoundation -framework CoreAudio -o "$OUT/libsalog.dylib" "$HERE/salog.c"
 for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/libsalog.dylib" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play"; do ldid -S "$f"; done
 python3 -I - "$OUT/SweetAudio.driver/Info.plist" <<'EOF'
 import os, plistlib, sys

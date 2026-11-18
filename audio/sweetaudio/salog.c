@@ -9,7 +9,9 @@
  * then per item: descriptor byte (high nibble type: 0 scalar, 1 count, 2 string, 3 pointer, 4 object; low nibble privacy flags),
  * size byte, size bytes of data (scalars by value, strings/objects as a pointer).
  */
+#include <CoreAudio/AudioHardware.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <stdlib.h>
 #include <os/log.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -137,6 +139,52 @@ salog_os_log_impl(void *dso, os_log_t log, os_log_type_t type, const char *forma
 	_os_log_impl(dso, log, type, format, buf, size);
 }
 
+/* SALOG_HIDE_NULL=1: drop the HAL device with UID "Null_Device" from every device list read in this process ('dev#' on the system
+ * object or a plug-in). VirtualAudio then has no Null port to keep its default route on, and routes to the Speaker port of
+ * SweetAudio.driver (runs a12i-k: the speaker port exists but the cached route stays on Null_Device). */
+static int salog_hide = -1;
+static _Atomic uint32_t salog_hidden_n;
+
+static int
+is_null_device(AudioObjectID id)
+{
+	AudioObjectPropertyAddress u = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	CFStringRef s = NULL;
+	UInt32 sz = sizeof s;
+	if (AudioObjectGetPropertyData(id, &u, 0, NULL, &sz, &s) != 0 || s == NULL)
+		return 0;
+	int r = CFStringCompare(s, CFSTR("Null_Device"), 0) == kCFCompareEqualTo;
+	CFRelease(s);
+	return r;
+}
+
+static OSStatus
+salog_get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qs, const void *qd, UInt32 *io, void *out)
+{
+	OSStatus r = AudioObjectGetPropertyData(obj, a, qs, qd, io, out);
+	if (salog_hide < 0) {
+		const char *e = getenv("SALOG_HIDE_NULL");
+		salog_hide = e && e[0] == '1';
+	}
+	if (r != 0 || !salog_hide || a == NULL || a->mSelector != kAudioHardwarePropertyDevices || io == NULL || out == NULL)
+		return r;
+	AudioObjectID *ids = out;
+	UInt32 n = *io / sizeof(AudioObjectID), k = 0;
+	for (UInt32 i = 0; i < n; i++) {
+		if (is_null_device(ids[i])) {
+			if (atomic_fetch_add(&salog_hidden_n, 1) < 64) {
+				char m[96];
+				int l = snprintf(m, sizeof m, "valog[%d]: hid Null_Device %u from the device list of %u\n", getpid(), (unsigned)ids[i], (unsigned)obj);
+				(void)write(2, m, (size_t)l);
+			}
+			continue;
+		}
+		ids[k++] = ids[i];
+	}
+	*io = k * sizeof(AudioObjectID);
+	return r;
+}
+
 static bool
 salog_type_enabled(os_log_t log, os_log_type_t type)
 {
@@ -147,6 +195,7 @@ salog_type_enabled(os_log_t log, os_log_type_t type)
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } salog_interpose[] = {
 	{ (const void *)salog_os_log_impl, (const void *)_os_log_impl },
 	{ (const void *)salog_type_enabled, (const void *)os_log_type_enabled },
+	{ (const void *)salog_get, (const void *)AudioObjectGetPropertyData },
 };
 
 __attribute__((constructor)) static void
