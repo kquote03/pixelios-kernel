@@ -640,6 +640,10 @@ else
 		chk "${hpt}_asan (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/${hpt}_asan $hpt.c
 		chk "${hpt}_asan" $O/${hpt}_asan
 	done
+	# /dev/sweetaudio FIFO of xnu patch 0173 (new-file hunk of bsd/dev/sweet_audio_fifo.h): threshold, underrun, play-out, wrap, gain clamp
+	awk '$0=="+++ b/bsd/dev/sweet_audio_fifo.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0173-aoc-sweetaudio-dev.patch > $O/sweet_audio_fifo.h
+	chk "audio_fifo_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -Werror -I$O -o $O/audio_fifo_host_test audio_fifo_host_test.c
+	chk "audio_fifo_host_test" $O/audio_fifo_host_test
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
 	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c
