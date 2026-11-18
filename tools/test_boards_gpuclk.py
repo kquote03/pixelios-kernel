@@ -75,7 +75,8 @@ class GpuPairs(unittest.TestCase):
     def test_uv_is_per_chip(self):
         # fvmap voltages are per chip: another board never inherits the bluejay unit's rows (0 = not observed -> shim GAP, no compare)
         self.assertEqual(boards.gpu_dvfs_uv("bluejay"), boards._GPU_DVFS_UV)
-        self.assertIn("#define GPU_CLK_UVS { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }", boards.c_header("oriole"))
+        # oriole: its own rows, observed run gpu-o-up1 (2026-11-18), never the bluejay unit's
+        self.assertIn("#define GPU_CLK_UVS { 750000, 737500 }, { 750000, 700000 }, { 750000, 681250 }, { 712500, 650000 }", boards.c_header("oriole"))
         self.assertIn("#define GPU_CLK_PAIRS { 996000, 848000 }, { 996000, 762000 }, { 885000, 701000 }, { 750000, 572000 }", boards.c_header("oriole"))
         saved = boards.BOARDS["oriole"].get("gpu_dvfs_uv")
         try:

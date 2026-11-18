@@ -240,7 +240,7 @@ _GPU_DVFS_UV = {(996000, 848000): (775000, 756250), (996000, 762000): (775000, 7
 # holds only for the unit it was read on. Any other board gets its own OBSERVED rows from board.json `gpu_dvfs_uv`
 # ([[G3DL2 kHz, G3D kHz, G3DL2 uV, G3D uV], ...], from the `SWEET FVMAP: dom 5/6 lv N rate= volt=` lines of a sweetfvmap boot of THAT phone)
 # or 0 = not observed (the shim then logs "fvmap voltage of the asked rate not pinned: undervolt not checked" instead of comparing
-# its rails with another chip's voltages). oriole 2026-11-18: G3D/G3DL2 rows not printed yet (PORT.md P0.1), so no key.
+# its rails with another chip's voltages). oriole: rows observed run gpu-o-up1 (2026-11-18), board.json gpu_dvfs_uv.
 _GPU_DVFS_UV_BOARD = "bluejay"
 _GPU_UV_RANGE = (450000, 1300000)   # S2MPG11 BUCK2S DT range 450-1300 mV (gs101-pmic.dtsi:766-768, as gpurailon.c)
 

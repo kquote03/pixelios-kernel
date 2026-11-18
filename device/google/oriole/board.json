@@ -153,7 +153,33 @@
     "touch": "read from source: Google kernel/devices/google/raviole android-gs-raviole-6.1-android16 dts/gs101-oriole-touch.dtsi (st,dchip_id 0x36 0x48, st,max-coords 1079 2399, firmware ftm5_fw_o6.ftb) includes gs101/gs101-fts-touch.dtsi (st,irq-gpio gpa9 0, st,reset-gpio gpp26 0, CS gpp23-3, spi-max-frequency 10 MHz), which includes gs101-common-touch.dtsi:8-15 (SPI gpp23-0..2, TS_SPI_SEL gpp26-1, DVDD LDO25M, AVDD LDO26M). Same files as bluejay; only the panel map and IC firmware name differ.",
     "userdata_mib": "OBSERVED on the phone (run oriole-probe1 (2026-11-12, probe shim git 36cacae, image sha256 981284da), capture device/google/oriole/hardware/probe-log-2026-11-12-oriole-probe1.txt): GPT entry userdata first=0x22F1E6 last=0x1DC03FA on LUN 0 = 28906005 x 4 KiB = 112914 MiB; identical to bluejay's GPT layout (128 GB UFS).",
     "fg": "read from source, raviole wiring of the MAX77759 fuel gauge (ModelGauge m5) for the opt-in XNU reader of xnu patch old-oriole-0148 (boot-arg sweetbatt=1, bsd/dev/sweet_hsi2c_fg.h: READ transfers only; the same controller sequence as the shim --fg-read of branch wip/shim-fg-read, shim/fgread.c, reviewed docs/reviews/fgread-review-fable-1.md there). Feeds the ADT node /sweet-batt (tools/mkadt.py). VDT = Google devices/google/gs101 a9b5edb (~/.hermes/cache/scratch/src-dev-gs101), BMS = Google kernel/google-modules/bms 183509a (~/.hermes/cache/scratch/src-gm-bms), GKI = kernel/common android-gs-raviole-6.1-android16 a4662a84 (ios-pixel6/pixel6-oriole-kernel). bus i2c12 + addr7 0x36: VDT dts/gs101-raviole-battery.dtsi:150-155 (&hsi2c_12, clock-frequency 400000), :182-185 (max77759fg@36, compatible maxim,max77759, reg <0x36>), included for oriole through Google devices/google/raviole 81506b9 dts/gs101-oriole.dtsi:8 -> gs101-oriole-common.dtsi:8 -> gs101-raviole.dtsi:10 (oriole data: gs101-oriole-battery.dtsi:13-17); gauge-type 2 (:192) = MAX_M5_GAUGE_TYPE (BMS maxfg_common.h:19). rsense_10uohm 500 = maxim,rsense-default (VDT :193), units of 10 uOhm (BMS max1720x_battery.c:473-477), i.e. 5 mOhm. regs (the ONLY registers the reader reads, in this order; tools/mkadt.py and the patch header pin the list): RepSOC 0x06, Temp 0x08, VCell 0x09, Current 0x0A, AvgCurrent 0x0B, FullCapRep 0x35, DevName 0x21 (BMS max_m5_reg.h:209,219,224,229,234,894,548); all inside the plain readable range 0x00..0x4F of max_m5_is_reg (BMS max_m5.c:1592-1596; the same predicate is the regmap volatile_reg, :1621). The shim --fg-read read five of them (not Current and DevName). Access: regmap reg_bits 8, val_bits 16, REGMAP_ENDIAN_NATIVE (BMS max_m5.c:1615-1618, map created on the 0x36 client, :1677) = one register byte written, then two data bytes read with a repeated start (GKI drivers/base/regmap/regmap-i2c.c:172-198, two messages in one i2c_transfer), LSB first (guess: NATIVE on little-endian arm64; consistent with the values of run oriole-fg1, observed). Units: VCell 78.125 uV/LSB (BMS maxfg_common.h:192-196), RepSOC 1/256 % (:210-214), Temp 1/256 degC signed (:198-202), Current / AvgCurrent s16 * 156250 / rsense uA (max1720x_battery.c:473-477; Linux reports the negative as current_now / current_avg, :1147,1152; the reader prints the register sign). FullCapRep, Current and DevName are printed raw. Also on hsi2c_12 and NEVER addressed: 0x66 MAX77759 PMIC (VDT :158-161), 0x69 MAX77759 charger (:208-211), 0x25 MAX77759 TCPC (VDT gs101-common-typec.dtsi:103-107), 0x57 PCA9468 (raviole gs101-raviole-charging.dtsi:94-101), 0x35 MAX20339 OVP (VDT gs101-common-typec.dtsi:83-90; 0x35 is also the FullCapRep REGISTER number, sent only as the pointer byte to 0x36). handoff = the HSI2C12 words the bootloader leaves, OBSERVED on the phone in run oriole-peri1 (2026-11-14, READ-ONLY --peri-probe, all nine) and again in run oriole-fg1 (2026-11-14, --fg-read: the eight it prints; restore=ok to the same values); the XNU reader refuses unless the live controller holds exactly these (it runs much later than the shim), so its restore values are always these.",
-    "gpu_dvfs_uv": "NOT SET on purpose (2026-11-18, upstream-port GPU prep): the GPU fvmap voltages are per chip (tools/boards.py gpu_dvfs_uv); the bluejay unit's rows are not oriole's. Oriole's G3D (dom 5) / G3DL2 (dom 6) rows were not printed in run oriole-dvfs-read (PORT.md P0.1: only the num_of_lv headers 12 / 7). Until a sweetfvmap=0x206A000 boot of this phone prints `SWEET FVMAP: dom 5|6 lv N rate= volt=`, the shim's --gpu-clk-level undervolt check logs 'not pinned' GAPs instead of comparing with another chip. Then add [[G3DL2 kHz, G3D kHz, G3DL2 uV, G3D uV], ...] for pairs 0..3 of _GPU_DVFS_V2."
+    "gpu_dvfs_uv": "OBSERVED on this phone, run gpu-o-up1 (2026-11-18, kernel 820ba87b, sweetfvmap=0x206a000): `SWEET FVMAP: dom 5 lv 0 rate=848000 volt=737500`, `lv 1 rate=762000 volt=700000`, `lv 2 rate=701000 volt=681250`, `lv 3 rate=572000 volt=650000` (G3D) and `dom 6 lv 0 rate=996000 volt=750000`, `lv 1 rate=885000 volt=750000`, `lv 2 rate=750000 volt=712500` (G3DL2). Rows = pairs 0..3 of tools/boards.py _GPU_DVFS_V2 as [G3DL2 kHz, G3D kHz, G3DL2 uV, G3D uV]. The voltages are 12.5-37.5 mV below the bluejay unit's (per-chip ASV binning); the rates equal the gs101 table."
   },
+  "gpu_dvfs_uv": [
+    [
+      996000,
+      848000,
+      750000,
+      737500
+    ],
+    [
+      996000,
+      762000,
+      750000,
+      700000
+    ],
+    [
+      885000,
+      701000,
+      750000,
+      681250
+    ],
+    [
+      750000,
+      572000,
+      712500,
+      650000
+    ]
+  ],
   "userdata_mib": 112914
 }
