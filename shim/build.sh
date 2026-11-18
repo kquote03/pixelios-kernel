@@ -668,6 +668,9 @@ else
 	rm -rf $O/ampd && mkdir -p $O/ampd/bsd/dev && cp $O/sweet_amp_dsp.h $O/ampd/bsd/dev/sweet_amp_dsp.h
 	awk -v f="diff --git a/bsd/dev/sweet_amp_dsp.h b/bsd/dev/sweet_amp_dsp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0170-amp-dsp-chunk.patch > $O/ampd/p.diff
 	chk "amp_xnu_host_test: 0170-amp-dsp-chunk applied to sweet_amp_dsp.h" sh -c "cd $O/ampd && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_amp_dsp.h ../sweet_amp_dsp.h"
+	# patch 0171 (A9g) changes it again: the MPU read-back is a logged value (not a stop), the start / run stage detail line
+	awk -v f="diff --git a/bsd/dev/sweet_amp_dsp.h b/bsd/dev/sweet_amp_dsp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0171-amp-dsp-mpu.patch > $O/ampd/p2.diff
+	chk "amp_xnu_host_test: 0171-amp-dsp-mpu applied to sweet_amp_dsp.h" sh -c "cd $O/ampd && patch -s -p1 --no-backup-if-mismatch < p2.diff && cp bsd/dev/sweet_amp_dsp.h ../sweet_amp_dsp.h"
 	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
 	chk "amp_xnu_host_test" $O/amp_xnu_host_test
 	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c

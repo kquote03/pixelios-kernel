@@ -107,6 +107,7 @@ static uintptr_t rfault_pa;
 static unsigned rfault_after;		/* the fault applies only after this many reads of rfault_pa */
 static unsigned rfault_cnt;
 static unsigned wfault_n;		/* 1-based write index that faults (not applied) */
+static uintptr_t wfault_pa;		/* patch 0171: the address of the faulted write */
 static unsigned ignore_from;		/* writes from this 1-based index on are dropped (accepted) */
 static int no_clock;			/* the bus never clocks (RX never fills) */
 static uint64_t ticks, tick_step, freq;
@@ -394,6 +395,8 @@ static int otp_as_linux(int a)
 static int hb_dead, hb_needs_sclk, dsp_err_after_start = -1;
 static uint32_t dsp_stuck_addr; static int dsp_stuck_amp = -1;
 static unsigned dsp_wmax, dsp_rmax;	/* patch 0170: the longest write / read burst seen (data bytes after the 6 address / pad bytes) */
+/* patch 0171: the MPU access words read back through this mask (hardware that does not return all ones); nw when L's 3rd access word landed */
+static uint32_t dsp_mpu_rbmask = 0xFFFFFFFFu; static unsigned mark_mpu3;
 static int dsp_mem(uint32_t x)
 {
 	return (x >= 0x2000000u && x <= 0x2002FF0u) || (x >= 0x2800000u && x <= 0x2803FF4u) || (x >= 0x2C00000u && x <= 0x2C017F0u) ||
@@ -489,6 +492,7 @@ static void dsp_ctl_wr(int a, uint32_t x, uint32_t v)
 	} else if ((i = dsp_mpu(x))) {
 		if (m->mpulock != 2) violate("an MPU access word written while the MPU is locked");
 		m->mpu[i - 1] = v;
+		if (a == 0 && i == 3 && !mark_mpu3) mark_mpu3 = nw;
 	} else if (x == 0x2BC3140u) {
 		m->mpulock = v == 0x5555u ? 1 : v == 0xAAAAu && m->mpulock == 1 ? 2 : v == 0u ? 3 : (violate("MPU lock order"), 0);
 	} else if (x == 0x2BC7000u) {
@@ -513,7 +517,7 @@ static uint32_t dsp_ctl_rd(int a, uint32_t x)
 
 	if (dsp_errata(x)) return (m->errata >> ((x & 0x200u ? 8u : 0u) + ((x & 0xFFu) - 0x80u) / 8u)) & 1u;
 	if (x >= 0x4C50u && x <= 0x4C5Cu) return m->rxsrc[(x - 0x4C50u) / 4u];
-	if ((i = dsp_mpu(x))) return m->mpu[i - 1];
+	if ((i = dsp_mpu(x))) return m->mpu[i - 1] & dsp_mpu_rbmask;
 	if (x == 0x2BC3140u) return 0u;
 	if (x == 0x2BC7000u) return m->wdt;
 	if (x == 0x2BC1000u) return m->ccm;
@@ -732,8 +736,10 @@ static int try_write32(uintptr_t pa, uint32_t v)
 	nw++;
 	if (flip_at && nw == flip_at)
 		h.dat[flip_bank] ^= flip_bit;
-	if (wfault_n && nw == wfault_n)
+	if (wfault_n && nw == wfault_n) {
+		wfault_pa = pa;
 		return 0;
+	}
 	if (ignore_from && nw >= ignore_from)
 		return 1;
 	if (pa == SYSREG) { h.sys = v; return 1; }
@@ -1169,6 +1175,7 @@ static void dsp_cfg(int with_fw)
 		amp_dsp_fw_in.d[2] = syn_b[1]; amp_dsp_fw_in.n[2] = (uint32_t)syn_bn[1];
 	}
 	hb_dead = hb_needs_sclk = 0; dsp_err_after_start = -1; dsp_stuck_amp = -1; dsp_stuck_addr = 0; dsp_wmax = dsp_rmax = 0;
+	dsp_mpu_rbmask = 0xFFFFFFFFu; mark_mpu3 = 0;
 }
 static void dsp_run(int with_fw)
 {
@@ -1269,6 +1276,47 @@ static void dsp_tests(void)
 	CHECK(violations == 0 && amp_dsp_res.a[0].stage == DS_ERR && amp[0].stops == 1 && amp[1].stops == 1 && !amp[0].reset_running &&
 	      has("l=error-after-start"), "A9e error after start");
 	printf("ok: A9e error bit after the start: stopped, loud\n");
+	/* patch 0171: the start / run stage detail lines */
+	CHECK(has("SWEET AMP DSP: L step=post-st1-err/w1 reg=00010010 w=00000000 r=00000040 e=0 pwr1=") &&
+	      has("SWEET AMP DSP: L mpu rb 20/20 not-ffffffff=0") && has("SWEET AMP DSP: R mpu rb 20/20 not-ffffffff=0"), "A9g error after start: detail line");
+	dsp_run(1); hb_dead = 1; rc = dsp_go();
+	CHECK(violations == 0 && has("SWEET AMP DSP: L step=hb-still/w2 reg=") && has("SWEET AMP DSP: R step=hb-still/w2 reg="), "A9g no heartbeat: detail line");
+	printf("ok: A9g detail lines: post-st1-err/w1 (st1, pwr1), hb-still/w2\n");
+
+	/* patch 0171: MPU access words that do not read back all ones (stock never reads them): logged, the core starts, pass */
+	dsp_run(1); dsp_mpu_rbmask = 0x0000FFFFu; rc = dsp_go();
+	CHECK(rc == 0 && violations == 0 && amp[0].starts == 1 && amp[1].starts == 1 && amp[0].mpulock == 3 && amp[1].mpulock == 3 &&
+	      has("SWEET AMP DSP: L mpu rb 20/20 not-ffffffff=20 first 02bc3000=0000ffff") &&
+	      has("SWEET AMP DSP: R mpu rb 20/20 not-ffffffff=20 first 02bc3000=0000ffff") &&
+	      has("SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r") && restored_exact(), "A9g MPU read-back is a logged value");
+	printf("ok: A9g MPU words read 0000ffff: logged (20/20 not-ffffffff), started, pass line\n");
+
+	/* patch 0171: a failing SPI write on L's 3rd MPU access word: step named, the MPU relocked (LOCK_CONFIG := 0), no core started, R untouched */
+	{
+		unsigned m3, nrl = 0, nacc = 0, ncs = 0, rr;
+
+		dsp_run(1); rc = dsp_go(); m3 = mark_mpu3;
+		CHECK(m3 > 400u, "A9g: the 3rd L MPU access write seen");
+		for (unsigned k = m3 - 400u; k <= m3 + 400u; k++) {	/* every MMIO write position around the L MPU access frames */
+			dsp_run(1); wfault_n = k; rc = dsp_go();
+			if (amp_dsp_res.a[0].stage != DS_MPU || !has("SWEET AMP DSP: L step=access reg=02bc30"))
+				continue;	/* the fault hit another frame */
+			nacc++;
+			/* a dropped chip-select pad write leaves L's CS low; a later L read (amp_read checks only the OTHER CS, 0158;
+			 * guess: the a9 reads after the DSP stop) extends the open frame. Measured pre-existing: the same 25 positions with the relock removed. */
+			if (bank_of(wfault_pa, &rr) >= 0 && violations && !strcmp(why_v, "a write frame longer than 10 bytes"))
+				ncs++;
+			else
+				CHECK(violations == 0, why_v);
+			CHECK(!amp[0].starts && !amp[1].starts && amp[1].mpulock == 0, "A9g: failed MPU write: no start, R MPU untouched");
+			CHECK(has(" w=ffffffff r=00000000 e=") && has("SWEET AMP DSP: stopped l=mpu r=loaded-not-started"), "A9g: failed MPU write: step named");
+			CHECK(!has("restore ok") || restored_exact(), "A9g: failed MPU write: restore ok only when exact");
+			nrl += amp[0].mpulock == 3;
+		}
+		CHECK(nacc > 0u && nrl > 0u, "A9g: a failed MPU access write is followed by the relock");
+		printf("ok: A9g failed MPU access write at %u fault positions: step=access named, no start; relocked in %u (others: controller / CS stuck; "
+		       "%u CS-pad faults extend a later L read frame, pre-existing)\n", nacc, nrl, ncs);
+	}
 
 	/* a PM word on R does not stick: R stops at its wmfw region, nothing is started */
 	dsp_run(1); dsp_stuck_amp = 1; dsp_stuck_addr = 0x3800008u; rc = dsp_go();

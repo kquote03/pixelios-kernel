@@ -11,6 +11,7 @@ PATCH_PLAY = ROOT / "xnu/patches/0167-aoc-playback.patch"	# patch 0167 (sweetaoc
 PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"
 PATCH_DSP = ROOT / "xnu/patches/0169-amp-dsp-load.patch"	# patch 0169 (sweetaoc=6): sweet_amp.h hunk + the new sweet_amp_dsp.h	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
 PATCH_CHUNK = ROOT / "xnu/patches/0170-amp-dsp-chunk.patch"	# patch 0170 (A9f): sweet_amp_dsp.h bursts of <= 480 bytes + failure detail
+PATCH_MPU = ROOT / "xnu/patches/0171-amp-dsp-mpu.patch"	# patch 0171 (A9g): MPU read-back logged, relock after a failed MPU write, detail lines
 TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
@@ -57,6 +58,9 @@ MUTANTS_DSP = [
     ("A9e: started marked only after the CCM write", "\td->started = 1;\n\te = amp_dsp_rmw(", "\te = amp_dsp_rmw("),
     ("A9e: error bit after the start not checked", "(d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))\n\t\t\td->stage = DS_ERR;", "0)\n\t\t\td->stage = DS_ERR;"),
     ("A9e: read-back not compared", "if ((!unp24 || (i & 3u)) && amp_dsp_rb[i] != d[off + i])", "if (0)"),
+    # patch 0171 A9g: the relock after a failed MPU write (new restore path); the MPU read-back stays a logged value
+    ("A9g: no relock after a failed MPU write", "\telse\n\t\t(void)amp_write(s, cs, AMP_DSP_MPU_LOCK, 0u);", "\telse\n\t\t(void)0;"),
+    ("A9g: MPU read-back mismatch stops again", "\t\td->mpu_rb++;\n", "\t\tif (rb != 0xFFFFFFFFu)\n\t\t\treturn AMP_ERROR;\n\t\td->mpu_rb++;\n"),
 ]
 MUTANTS_HOOK = [
     ("A9e: start with only L loaded", "amp_dsp_res.a[0].stage == DS_LOADED && amp_dsp_res.a[1].stage == DS_LOADED", "amp_dsp_res.a[0].stage == DS_LOADED"),
@@ -116,7 +120,7 @@ def apply(base: str, name: str, patches) -> str:
 
 def header_dsp() -> str:
     """sweet_amp_dsp.h of patch 0169 with the 0170 hunk applied on top (as shim/build.sh does)."""
-    return apply(header("sweet_amp_dsp.h", PATCH_DSP), "sweet_amp_dsp.h", [PATCH_CHUNK])
+    return apply(header("sweet_amp_dsp.h", PATCH_DSP), "sweet_amp_dsp.h", [PATCH_CHUNK, PATCH_MPU])
 
 
 def header_a9() -> str:
