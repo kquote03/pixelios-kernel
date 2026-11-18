@@ -4,15 +4,15 @@ Tags: *observed* (run label, PORT.md rows A9-A12), *read from source*, *guess*. 
 
 ## 1. Chain (what each stage does)
 
-1. **AOC firmware** (*observed* A6-A8, patches 0164/0165): `aocf.bin` rides in the boot payload (`/chosen/memory-map AOCFW`), the kernel
+1. **AOC firmware** (*observed* A6-A8, patches 0376/0377): `aocf.bin` rides in the boot payload (`/chosen/memory-map AOCFW`), the kernel
    copies it into the AOC carveout and asks the GSA to load it (Trusty TIPC, command 90), then starts the AOC; 69 services come up.
-2. **AOC EP1** (*observed* a10h, patch 0181): `audio_playback1` (low-latency EP, BIND2 src 1 -> SINK_SPEAKER, S16 48 kHz) is the only
+2. **AOC EP1** (*observed* a10h, patch 0393): `audio_playback1` (low-latency EP, BIND2 src 1 -> SINK_SPEAKER, S16 48 kHz) is the only
    entry point whose PCM reaches TDM0. EP0 (the stock MMAP EP) and the AOC signal generator output zeros in every format tried.
 3. **TDM0 -> CS35L41 L/R** (*observed* a10d-a10h): stock HAL format = 4 x 32-bit slots (TDM_0_RX Chan Four, S32_LE: amp ASP width 32,
-   WL 24), R on slots 1/0, PCM gain 17 (stock). Amp bring-up: OTP unpack (0158), HALO DSP firmware from `ampfw.bin` (0169-0171), stock
-   DAPM power-up order (0172), DAC fed from ASPRX1 (DSP bypassed, 0181), stock power-down order on idle / shutdown.
-4. **/dev/sweetaudio** (patches 0173/0181/0182): 48 kHz S16LE stereo char device, 0666, one writer, 8192-frame FIFO, non-blocking
-   write; the kernel feeds the EP1 ring every 1 ms. Gain default -6 dB, max 0 dB, every sample clamped at -3 dBFS (0182). Amps power down
+   WL 24), R on slots 1/0, PCM gain 17 (stock). Amp bring-up: OTP unpack (0373), HALO DSP firmware from `ampfw.bin` (0381-0383), stock
+   DAPM power-up order (0384), DAC fed from ASPRX1 (DSP bypassed, 0393), stock power-down order on idle / shutdown.
+4. **/dev/sweetaudio** (patches 0385/0393/0394): 48 kHz S16LE stereo char device, 0666, one writer, 8192-frame FIFO, non-blocking
+   write; the kernel feeds the EP1 ring every 1 ms. Gain default -6 dB, max 0 dB, every sample clamped at -3 dBFS (0394). Amps power down
    30 s after the last writer closed and power up again on the next open.
 5. **iOS side** (`audio/sweetaudio/`): `SweetAudio.driver` (HAL plug-in, UID `Speaker`, transport `bltn`) gives VirtualAudio a
    Speaker device; VirtualAudio still routes the default category to its `Null_Device` through a HAL aggregate `VAD [vdef] AggDev 1`
@@ -26,7 +26,7 @@ Tags: *observed* (run label, PORT.md rows A9-A12), *read from source*, *guess*. 
 
 | Item | Value |
 |---|---|
-| Kernel | `sweetaoc=15` (implies `sweetamp=1` since 0182); `sweetaudiotest=1` = 2 test beeps at boot (off by default) |
+| Kernel | `sweetaoc=15` (implies `sweetamp=1` since 0394); `sweetaudiotest=1` = 2 test beeps at boot (off by default) |
 | Userland | `sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib,SALOG_TAP_NULL=1`; optional `SALOG_GAIN_DB=0..24` (default 12), `SALOG_OSLOG=1` (VirtualAudio os_log to stderr; add `sweetnull=mediaserverd` to see it) |
 | Blobs (not in git) | `~/pixelios-artifacts/aoc/aocf.bin` (`tools/pack_aocfw.py` of stock `/vendor/firmware/aoc.bin`), `~/pixelios-artifacts/amp/ampfw.bin` (`tools/pack_ampfw.py` of the stock `cs35l41-dsp1-spk-prot.wmfw` + L/R `.bin` tunings, vendor.img `/vendor/firmware`) |
 | Root files | `/Library/Audio/Plug-Ins/HAL/SweetAudio.driver`, VirtualAudio.plugin moved back to `HAL/`, `/usr/local/lib/libsalog.dylib`, `/usr/local/bin/sweetaudio_*`, the launchd job; installed once by the dev overlay `ov-sa-driver+va` (`audio/sweetaudio/build.sh driver+va`) and kept on the root |
@@ -46,9 +46,9 @@ Log lines to look for: `SWEET AUDIO: a12: /dev/sweetaudio up on EP1`, `valog[..]
 ## 3. Key findings (each cost runs)
 
 - EP0 outputs zeros; only EP1 reaches the speaker path (a10h).
-- AOC replies may carry another id than the command (EP_SETUP 206 answered with id 288); stock never compares it (0168, a9c/a9d).
-- CS35L41 MPU access words read back 0x3, not 0xFFFFFFFF; stock never reads them, our compare was the bug (0171, a9g).
-- TDM0 carries 4 x 32-bit slots (stock mixer paths); with the card default S16 the amp got nothing usable (0176).
+- AOC replies may carry another id than the command (EP_SETUP 206 answered with id 288); stock never compares it (0380, a9c/a9d).
+- CS35L41 MPU access words read back 0x3, not 0xFFFFFFFF; stock never reads them, our compare was the bug (0383, a9g).
+- TDM0 carries 4 x 32-bit slots (stock mixer paths); with the card default S16 the amp got nothing usable (0388).
 - VirtualAudio creates a device only for known UIDs (`Speaker`, `Codec`, ...); with UID `Speaker` it builds Device_Speaker and the
   `pspk` port, but its cached default route stays on `Null_Device` (a12h-l). Tapping the aggregate that drives Null_Device is the
   working path (a12n).
@@ -64,6 +64,6 @@ Log lines to look for: `SWEET AUDIO: a12: /dev/sweetaudio up on EP1`, `valog[..]
 
 ## 5. Measured levels (a12p, daily-verify4-audio, observed)
 
-Boot chime: VirtualAudio mix peak 4337 (-17.6 dBFS) -> tap 17269 -> kernel 8654 (-11.6 dBFS; before 0182 / the tap gain: 772).
+Boot chime: VirtualAudio mix peak 4337 (-17.6 dBFS) -> tap 17269 -> kernel 8654 (-11.6 dBFS; before 0394 / the tap gain: 772).
 AudioQueue -3 dBFS test tone: mix 23198 (VirtualAudio at unity for it) -> limiter (gain 2 dB) 29196 -> kernel ~14600. Drift trim
 -1181..-370 ppm, kernel underruns 1 per stream start, overruns 0.

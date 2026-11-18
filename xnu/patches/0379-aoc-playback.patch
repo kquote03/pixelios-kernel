@@ -1,0 +1,628 @@
+SWEET AUDIO PLAYBACK (patch 0379, plan A9 continued), boot-arg sweetaoc=5 together with sweetamp=1. Everything of sweetaoc=4 (patch 0378) plus, between
+the BIND2 bind 1 and the PLL poll, the stock EP0 playback start on that path with SILENCE only (sweet_audio.h swau_play_open; aoc ac69293 alsa
+snd_aoc_pcm_prepare / trigger START): audio_playback0 ring header checked read-only first (ring, irq <= 15, data area inside the window and clear of
+the control block / service headers / audio_output_control queues), its AOC_DOWN data area zeroed, the stock write-pointer reset
+(aoc_ring_reset_write_pointer), CMD_AUDIO_OUTPUT_EP_SETUP 206 (ep 0, 2 ch, 16 bit, 48 kHz, fixed, watermark 48000, wraparound, PLAYBACK) and
+CMD_AUDIO_OUTPUT_SOURCE 201 source 0 on 1. Then one joint L/R PLL poll <= 500 x 1 ms (sweet_amp.h amp_a9_pll2) that feeds zeros into the ring each ms
+(swau_feed, <= 1024 bytes, only what the AOC consumed) and logs IRQ1_STATUS3 at polls 1/10/100/250/500. Close: SOURCE 0 on 0 whenever an on 1 may
+have been written, then the 0378 BIND2 bind 0; then the 0373 restore. No new amp register, PWR_CTRL1 / GLOBAL_EN still refused; no SINK / SINK2 / gain;
+no EP teardown (stock sends none). sweetaoc=4 unchanged (per-amp 100 x 1 ms poll). Pass line "SWEET AUDIO: tdm0 clocking, amp pll locked l,r, dsp not
+loaded"; partial "SWEET AUDIO: tdm0 stream started (ep0 consumed N bytes), amp pll NOT locked l,r ...". Host tests: shim/aoc_audio_host_test.c,
+shim/amp_xnu_host_test.c. BUILT, UNRUN.
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+index 585c01d..8dda9f9 100644
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -149,9 +149,10 @@ sweet_amp_init(void)
+  * read-modify-write). A lost update either leaves the R reset low (the R identify then fails: no write) or re-drives the touch CS for one transfer
+  * (the next transfer drives it again); the restore compares only the amp bits. out[]: 0 run rc (0 = pass), 1 a9 ran, 2 AOC opened, 3/4 cfg L/R,
+  * 5/6 PLL locked L/R, 7 bits: 1 L error, 2 R error, 4 L GLOBAL_EN, 8 R GLOBAL_EN, 16 L PLL_UNLOCK, 32 R PLL_UNLOCK. */
+-int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint32_t out[8]);
++/* patch 0379 (sweetaoc=5): + tick (once per poll ms, may be NULL) and polls (0 = the 0378 per-amp poll; else the joint poll, <= 500) */
++int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx, uint32_t out[8]);
+ int
+-sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint32_t out[8])
++sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx, uint32_t out[8])
+ {
+ 	unsigned i;
+ 	int rc;
+@@ -165,8 +166,9 @@ sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint3
+ 			return -1;
+ 		}
+ 	}
+-	printf("SWEET AMP: a9 run (sweetaoc=4): identify, init, TDM config, AOC open, PLL lock, AOC close, restore\n");
+-	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx };
++	printf("SWEET AMP: a9 run (sweetaoc=%s): identify, init, TDM config, AOC open%s, PLL lock, AOC close, restore\n", polls ? "5" : "4",
++	    polls ? " + stream start (silence)" : "");
++	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx, tick, polls };
+ 	rc = amp_init_run();
+ 	amp_a9_cb = (struct amp_a9_cb){ 0 };
+ 	out[0] = (uint32_t)rc;
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+index 72116a1..816f4a9 100644
+--- a/bsd/dev/sweet_amp.h
++++ b/bsd/dev/sweet_amp.h
+@@ -231,6 +231,11 @@ static inline const char *peri_gate_name(enum peri_gate g)
+ #define AMP_PLL_UNLOCK		0x10u
+ #define AMP_GLOBAL_EN		0x1u
+ #define AMP_A9_PLL_POLLS	100u
++/* patch 0379 (sweetaoc=5): one joint L/R poll of at most 500 x 1 ms while the AOC stream runs. No stock source bounds a PLL_LOCK wait (stock
++ * never waits for it: its IRQ handler only clears it, AMP cs35l41.c:2040-2042); the stock stream may take DEFAULT_PCM_WAIT_TIME_IN_MSECS 10000
++ * to make progress (aoc alsa/aoc_alsa.h:72, aoc_alsa_pcm.c:513), the stock PDN wait is 100 x 1 ms (AMP cs35l41.c:2328-2338): ours stays <= 500. */
++#define AMP_A9_PLL_POLLS_MAX	500u
++#define AMP_A9_NSNAP		5u
+ #define AMP_A9_X_ASSERT(r, m, f) _Static_assert((r) != AMP_REG_PWR_CTRL1 && ((f) & ~(m)) == 0u, "A9 row: never PWR_CTRL1, field inside its mask");
+ AMP_A9_TAB(AMP_A9_X_ASSERT)
+ #undef AMP_A9_X_ASSERT
+@@ -1095,9 +1100,12 @@ static int bring_up(const struct amp_snap *s)
+ }
+ 
+ /* ---- A9b run (patch 0378): called by amp_init_run between the init of both amps and the restore, only when the AOC glue armed amp_a9_cb ---- */
+-struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; };
++/* patch 0379: polls != 0 selects the joint L/R poll (bound min(polls, AMP_A9_PLL_POLLS_MAX)); tick (may be NULL) runs once per poll ms */
++struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; void (*tick)(void *ctx); unsigned polls; };
+ static struct amp_a9_cb amp_a9_cb;
+-struct amp_a9_side { int cfg, locked, unlock, gen, err; unsigned writes, skipped, polls; uint32_t st1, st3, pwr1; };
++struct amp_a9_side { int cfg, locked, unlock, gen, err; unsigned writes, skipped, polls; uint32_t st1, st3, pwr1; uint32_t snap[AMP_A9_NSNAP]; };
++/* patch 0379: IRQ1_STATUS3 as last read at these poll counts (0 = not reached) */
++static const unsigned amp_a9_snap_at[AMP_A9_NSNAP] = { 1u, 10u, 100u, 250u, 500u };
+ static struct amp_a9_res { int ran, opened; struct amp_a9_side a[2]; } amp_a9_res;
+ 
+ /* one row: read, merge, write only if it changes (regmap_update_bits; a plain write row always writes), read back the field.
+@@ -1198,6 +1206,63 @@ static void amp_a9_pll(const struct amp_snap *s, int cs, const char *name, struc
+ 		say(name, " !!! a9: amp error bit or read failure after the TDM open (H8)");
+ }
+ 
++/* patch 0379: the after-poll reads of one amp (IRQ1_STATUS1, PWR_CTRL1), its line and the st3 snapshot line */
++static void amp_a9_after(const struct amp_snap *s, int cs, const char *name, struct amp_a9_side *d, int e)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p, k;
++
++	d->unlock = (d->st3 & AMP_PLL_UNLOCK) != 0u;
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	d->err = e != AMP_OK || (d->st1 & AMP_ERR_BITS);
++	d->gen = e != AMP_OK || (d->pwr1 & AMP_GLOBAL_EN);
++	amp_a9_line(name, d->locked ? " a9 pll locked" : " a9 pll NOT locked", d);
++	p = put_txt(line, sizeof(line), 0, name);
++	p = put_txt(line, sizeof(line), p, " a9 st3");
++	for (k = 0; k < AMP_A9_NSNAP; k++) {
++		p = put_txt(line, sizeof(line), p, " @");
++		p = put_dec(line, sizeof(line), p, amp_a9_snap_at[k]);
++		p = put_txt(line, sizeof(line), p, "=");
++		p = put_hex(line, sizeof(line), p, d->snap[k], 8);
++	}
++	emit("AMP", line, p);
++	if (d->err)
++		say(name, " !!! a9: amp error bit or read failure after the TDM open (H8)");
++}
++
++/* patch 0379: L and R polled in the same ms, <= min(polls, AMP_A9_PLL_POLLS_MAX) x 1 ms, stops once both locked; tick each ms (reads only on the amps) */
++static void amp_a9_pll2(const struct amp_snap *s)
++{
++	unsigned n = amp_a9_cb.polls < AMP_A9_PLL_POLLS_MAX ? amp_a9_cb.polls : AMP_A9_PLL_POLLS_MAX, p, k;
++	int e[2] = { AMP_OK, AMP_OK }, cs;
++
++	for (p = 0; p < n && !(amp_a9_res.a[0].locked && amp_a9_res.a[1].locked) && (e[0] == AMP_OK || e[1] == AMP_OK); p++) {
++		if (wait_ms(1u)) {
++			e[0] = e[1] = AMP_TIMEOUT;
++			break;
++		}
++		if (amp_a9_cb.tick)
++			amp_a9_cb.tick(amp_a9_cb.ctx);
++		for (cs = 0; cs < 2; cs++) {
++			struct amp_a9_side *d = &amp_a9_res.a[cs];
++
++			if (e[cs] != AMP_OK || d->locked)
++				continue;
++			e[cs] = amp_read(s, cs, AMP_REG_IRQ1_STATUS3, &d->st3);
++			d->polls = p + 1u;
++			d->locked = e[cs] == AMP_OK && (d->st3 & AMP_PLL_LOCK);
++			for (k = 0; k < AMP_A9_NSNAP; k++)
++				if (amp_a9_snap_at[k] == p + 1u)
++					d->snap[k] = d->st3;
++		}
++	}
++	amp_a9_after(s, 0, "L", &amp_a9_res.a[0], e[0]);
++	amp_a9_after(s, 1, "R", &amp_a9_res.a[1], e[1]);
++}
++
+ static void amp_a9_part(const struct amp_snap *s, int il, int ir)
+ {
+ 	amp_a9_res = (struct amp_a9_res){ 0 };
+@@ -1209,7 +1274,9 @@ static void amp_a9_part(const struct amp_snap *s, int il, int ir)
+ 	if (amp_a9_cfg(s, 0, "L", &amp_a9_res.a[0]) != AMP_OK || amp_a9_cfg(s, 1, "R", &amp_a9_res.a[1]) != AMP_OK)
+ 		return;
+ 	amp_a9_res.opened = amp_a9_cb.open(amp_a9_cb.ctx);
+-	if (amp_a9_res.opened) {
++	if (amp_a9_res.opened && amp_a9_cb.polls) {
++		amp_a9_pll2(s);			/* patch 0379 (sweetaoc=5): joint poll while the stream runs */
++	} else if (amp_a9_res.opened) {
+ 		amp_a9_pll(s, 0, "L", &amp_a9_res.a[0]);
+ 		amp_a9_pll(s, 1, "R", &amp_a9_res.a[1]);
+ 	}
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index b9d740b..fcf83e8 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -24,7 +24,7 @@ extern volatile uint32_t sweet_usblog_sent;             /* sweet_usb.c (this pat
+ void sweet_aoc_init(void);
+ extern void sweet_aoc_load_start(void);              /* bsd/dev/sweet_aoc_load.c (patch 0376), sweetaoc=2 */
+ extern void sweet_aoc_load_start3(void);             /* same file (patch 0377), sweetaoc=3: load, then AOC start */
+-extern int sweet_aoc_audio_mode;                 /* sweet_aoc_start.c (patch 0378), 4 = sweetaoc=4: A8 start, then the A9 audio path open */
++extern int sweet_aoc_audio_mode;                 /* sweet_aoc_start.c (patch 0378), 4 = sweetaoc=4: A8 start, then the A9 audio path open; 5 (patch 0379) + stream */
+ 
+ #define SWA_WAIT_USB_MS   300000u
+ #define SWA_SETTLE_MS     500u
+@@ -127,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 5) {
++		sweet_aoc_audio_mode = 5;   /* patch 0379, step A9: as 4, plus the EP0 playback start (silence) between the bind and the PLL poll */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 4) {
+ 		sweet_aoc_audio_mode = 4;   /* patch 0378, step A9: the A8 sequence, then audio_output_control BIND2 + the amp TDM config (needs sweetamp=1) */
+ 		sweet_aoc_load_start3();
+@@ -141,7 +146,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index b3c2020..6ec857c 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -165,10 +165,14 @@ swas_tipc(__unused void *ctx, struct swas_tipc *t)
+  * sweet_amp_audio_run: amp identify + init + TDM config, then our open callback, the PLL lock read, our close callback, the amp restore).
+  * New writes of this file: the IPC window (the audio_output_control queue slots and counters, sweet_audio.h) and the AOC mailbox INTGR0 = 1 << irq
+  * (the doorbell; irq read from the service header, <= 15). ---- */
+-int sweet_aoc_audio_mode;                       /* set by sweet_aoc.c for sweetaoc=4 */
++int sweet_aoc_audio_mode;                       /* set by sweet_aoc.c for sweetaoc=4 (5: patch 0379) */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-extern int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void *ctx, uint32_t out[8]);   /* sweet_amp.c (patch 0378) */
++extern int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx,
++    uint32_t out[8]);   /* sweet_amp.c (patch 0378, + tick / polls patch 0379) */
+ #endif
++/* patch 0379 (sweetaoc=5): + the audio_playback0 ring (zeroed, reset, fed zeros each poll ms), EP_SETUP, SOURCE on / off (sweet_audio.h) */
++#define SWAU_PLAY_POLLS 500u    /* = AMP_A9_PLL_POLLS_MAX of sweet_amp.h */
++static uint32_t swau_pb_index, swau_pb_found;
+ _Static_assert(SWAU_IPC_LEN == SWAS_IPC_LEN, "one IPC window");
+ 
+ static void
+@@ -203,7 +207,15 @@ swau_cb_open(__unused void *ctx)
+ 	struct swau_bus b = ab;
+ 
+ 	b.say = swau_say;
+-	swau_open_rc = swau_open(&b, &swau_r, swau_as->services_offset, swau_as->service_size, swau_as->ctl_index);
++	if (sweet_aoc_audio_mode == 5) {
++		swau_open_rc = swau_pb_found ? swau_play_open(&b, &swau_r, swau_as->services_offset, swau_as->service_size, swau_as->ctl_index,
++		    swau_pb_index, swau_as->services) : SWAU_E_SVC;
++		printf("SWEET AUDIO: playback0 service %u found %u hdr %#x flags %#x irq %u push %u down off %#x size %u slots %u tx %u rx %u wp %u\n",
++		    swau_pb_index, swau_pb_found, swau_r.pb.hdr, swau_r.pb.flags, swau_r.pb.irq, (swau_r.pb.flags & SWAU_RING_PUSH) != 0u,
++		    swau_r.pb.g.offset, swau_r.pb.g.size, swau_r.pb.g.slots, swau_r.pb.g.tx, swau_r.pb.g.rx, swau_r.pb.g.wp);
++	} else {
++		swau_open_rc = swau_open(&b, &swau_r, swau_as->services_offset, swau_as->service_size, swau_as->ctl_index);
++	}
+ 	printf("SWEET AUDIO: service %u hdr %#x flags %#x irq %u up off %#x size %u slots %u tx %u rx %u down off %#x size %u slots %u tx %u rx %u\n",
+ 	    swau_as->ctl_index, swau_r.s.hdr, swau_r.s.flags, swau_r.s.irq, swau_r.s.r[0].offset, swau_r.s.r[0].size, swau_r.s.r[0].slots,
+ 	    swau_r.s.r[0].tx, swau_r.s.r[0].rx, swau_r.s.r[1].offset, swau_r.s.r[1].size, swau_r.s.r[1].slots, swau_r.s.r[1].tx, swau_r.s.r[1].rx);
+@@ -220,6 +232,17 @@ swau_cb_close(__unused void *ctx)
+ 	swau_close_rc = swau_close(&b, &swau_r);
+ }
+ 
++/* patch 0379: once per poll ms of the amp run: zeros into the ring (no wait, no print) */
++static void
++swau_cb_tick(__unused void *ctx)
++{
++	static const struct swau_bus ab = { swas_ir32, swas_iw32, swas_isync, swau_doorbell, swas_sleep_ms, NULL, NULL };
++	struct swau_bus b = ab;
++
++	b.say = swau_say;
++	swau_feed(&b, &swau_r);
++}
++
+ static void
+ swau_run(struct swas_res *r, uint32_t image_size)
+ {
+@@ -228,17 +251,55 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 
+ 	swau_as = r;
+ 	swau_open_rc = swau_close_rc = -1;
++	swau_pb_index = swau_pb_found = 0;
++	for (i = 0; i < r->services && i < SWAS_MAX_SVC && !swau_pb_found; i++) {    /* patch 0379: audio_playback0 by name (aoc_alsa_drv.c:37) */
++		static const char pb[] = "audio_playback0";
++		uint32_t k;
++
++		for (k = 0; k < sizeof(pb) && r->names[i][k] == pb[k]; k++) {
++		}
++		if (k == sizeof(pb)) {
++			swau_pb_found = 1;
++			swau_pb_index = i;
++		}
++	}
+ 	if (!swas_imap(NULL, SWAS_CARVE_PA + image_size, SWAS_IPC_LEN)) {
+ 		printf("SWEET AUDIO: stop ipc-map-failed, nothing written\n");
+ 		return;
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, NULL, out);
++	if (sweet_aoc_audio_mode == 5) {
++		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, swau_cb_tick, SWAU_PLAY_POLLS, NULL, out);
++	} else {
++		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, NULL, 0u, NULL, out);
++	}
+ #endif
+ 	swas_iunmap(NULL);
+ 	for (i = 0; i < swau_r.nx && i < SWAU_NX; i++) {
+ 		swau_x_line(&swau_r.x[i]);
+ 	}
++	if (sweet_aoc_audio_mode == 5) {
++		int prc = swau_r.play_rc;
++
++		printf("SWEET AUDIO: stream rc %d (%s) zeroed %u reset %u ep_setup %u started %u stopped %u consumed %u bytes fed %u zero bytes in %u feeds, feed errors %u\n",
++		    prc, prc >= 0 && prc < SWAU_NSTOP ? swau_stop_name[prc] : "?", swau_r.pb.zeroed, swau_r.pb.reset, swau_r.ep_set, swau_r.started,
++		    swau_r.stopped, swau_r.consumed, swau_r.pb.fed, swau_r.pb.feeds, swau_r.pb.feed_err);
++		printf("SWEET AUDIO: open rc %d (%s) dsp mode %u bound %u unbound %u close rc %d; amp rc %d a9 %u opened %u cfg %u/%u pll %u/%u flags %#x\n",
++		    swau_open_rc, swau_open_rc >= 0 && swau_open_rc < SWAU_NSTOP ? swau_stop_name[swau_open_rc] : "not-run", swau_r.dsp_mode,
++		    swau_r.bound, swau_r.unbound, swau_close_rc, arc, out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++		if (arc == 0 && out[2] && swau_open_rc == SWAU_OK && swau_close_rc == SWAU_OK && swau_r.started && swau_r.stopped && out[3] && out[4] &&
++		    !(out[7] & 0xFu)) {
++			if (out[5] && out[6]) {
++				printf("SWEET AUDIO: tdm0 clocking, amp pll locked l,r, dsp not loaded\n");
++			} else {
++				printf("SWEET AUDIO: tdm0 stream started (ep0 consumed %u bytes), amp pll NOT locked l,r (l %u r %u), dsp not loaded (st3 per poll point in the AMP lines; GLOBAL_EN stays 0)\n",
++				    swau_r.consumed, out[5], out[6]);
++			}
++			return;
++		}
++		printf("SWEET AUDIO: stop (see the AUDIO / AMP lines), GLOBAL_EN never written\n");
++		return;
++	}
+ 	printf("SWEET AUDIO: open rc %d (%s) dsp mode %u bound %u unbound %u close rc %d; amp rc %d a9 %u opened %u cfg %u/%u pll %u/%u flags %#x\n",
+ 	    swau_open_rc, swau_open_rc >= 0 && swau_open_rc < SWAU_NSTOP ? swau_stop_name[swau_open_rc] : "not-run", swau_r.dsp_mode,
+ 	    swau_r.bound, swau_r.unbound, swau_close_rc, arc, out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+@@ -289,8 +350,8 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
+-		if (sweet_aoc_audio_mode == 4) {
+-			swau_run(&r, image_size);       /* patch 0378, step A9 */
++		if (sweet_aoc_audio_mode == 4 || sweet_aoc_audio_mode == 5) {
++			swau_run(&r, image_size);       /* patch 0378, step A9 (5: + stream, patch 0379) */
+ 		}
+ 		return;
+ 	}
+diff --git a/bsd/dev/sweet_audio.h b/bsd/dev/sweet_audio.h
+index 3659292..d8a3bc6 100644
+--- a/bsd/dev/sweet_audio.h
++++ b/bsd/dev/sweet_audio.h
+@@ -26,6 +26,32 @@
+  *     SINK_SPEAKER 0 (:2083, PORT_TDM_0_RX -> SINK_SPEAKER alsa:aoc_alsa_hw.c:33-48), u8 bind = 1; 11 bytes;
+  *   the same with bind = 0 on every path after a BIND2 bind = 1 was written (restore).
+  * No EP_SETUP, no SOURCE, no PCM data, no gain, no SET_PARAMETER. Every wait bounded.
++ *
++ * Patch 0379 (step A9, sweetaoc=5): the stock playback start on that bound path, SILENCE only (aoc = google-modules/aoc ac69293):
++ * the stock PCM prepare + trigger START of EP0 (alsa:aoc_alsa_pcm.c snd_aoc_pcm_prepare :533-623, snd_aoc_pcm_trigger :625-672) after the
++ * BIND2 of 0378, and its trigger STOP before the BIND2 undo (aoc_audio_stop alsa:aoc_alsa_hw.c:2711-2727, then the path close :1662-1688).
++ *   data service audio_playback0 (alsa:aoc_alsa_drv.c:37; EP index 0 = PCM device 0, alsa:aoc_alsa_pcm.c:405), found by name in the A8 table:
++ *     a RING (type 1, ipc aoc_ipc_core_internal.h:51-58), AP writes region AOC_DOWN = 1 (aoc_service_ring_base aoc_ipc_core.c:691-703:
++ *     data at ipc + offset, size bytes); raw PCM, no message header (aoc_service_write_message :654-689 ring branch).
++ *   1. ring zero: every byte of the AOC_DOWN data area := 0 (ours: the stock reset in 2 publishes size - wp bytes of whatever the ring
++ *      holds, so the ring is made silent first; zeros are the only PCM bytes ever written).
++ *   2. ring reset (aoc_ring_reset_write_pointer :578-600, called by prepare alsa:aoc_alsa_pcm.c:564-570): rem = size - wp; if rem > 0:
++ *      tx += rem, wp = (wp + rem) % size (_region_advance_tx :53-65). No doorbell (stock rings none here).
++ *   3. CMD_AUDIO_OUTPUT_EP_SETUP 206 (aoc-interface-gs101.h:105, struct :948-966 with channelMetadataUnpacked :771-777), 28 bytes, as
++ *      aoc_audio_playback_set_params alsa:aoc_alsa_hw.c:1729-1816 for S16_LE 2 ch 48000 (the card's TDM_0_RX default, aoc_alsa_card.c:238-246):
++ *      d.address u32 = 0 (:1741), d.watermark u32 = PLAYBACK_WATERMARK_DEFAULT 48000 (:1739, aoc_alsa.h:100), d.length u32 = 0 (:1740),
++ *      d.metadata.chan = 2 (channels as is, :1764), .bits = WIDTH_16_BIT 1 (:1752-1753, gs101.h:755-760), .sr = SR_48KHZ 5 (:1767-1768,
++ *      gs101.h:736-745), .format = FRMT_FIXED_POINT 1 (:1762-1763, gs101.h:749-753), .offset = 0 (:1743), d.channel = 0 (EP0, :1738),
++ *      d.wraparound = 1 (:1742), mode = ENTRYPOINT_MODE_PLAYBACK 0 (:1790-1792, gs101.h:938-946). gs101: no EP_SETUP2 (:1808, !CONFIG_SOC_GS101).
++ *      Stock has no EP teardown for playback (aoc_audio_close :4106-4124 sends nothing): none here either.
++ *   4. CMD_AUDIO_OUTPUT_SOURCE 201 (gs101.h:91, struct :882-886): + u8 source = 0 (entry_point_idx), u8 on = 1; 10 bytes
++ *      (aoc_audio_start :2685-2703 -> aoc_audio_playback_trigger_source :1256-1287).
++ *   feed (aoc_audio_write :3076-3112 -> aoc_service_write aoc_service_core.c:104-201): at most size - (tx - rx) bytes (aoc_ring_bytes_available_to_write
++ *      :350-365, clamped as :332-348) of ZEROS at wp (wrapping, _aoc_ring_write_buffer :185-210), barrier, tx += n, wp = (wp + n) % size; the doorbell
++ *      only if the ring is a push ring (flags & 0x01000000, aoc_service_core.c:193-194, aoc_ring_is_push :739-748).
++ *   undo, on every path after a SOURCE on = 1 was written: SOURCE source 0 on = 0 (trigger STOP :2711-2727), then the 0378 BIND2 bind = 0.
++ * Not sent (the stock playback path never sends them): CMD_AUDIO_OUTPUT_SINK 200 / SINK2 270 (SINK2 only from a mixer control,
++ * alsa:aoc_alsa_ctl.c:1724), no TDM / BE command (be_prepare alsa:aoc_alsa_path.c:960-990 sends nothing for TDM_0_RX), no gain.
+  */
+ #ifndef SWEET_AUDIO_H
+ #define SWEET_AUDIO_H
+@@ -46,6 +72,20 @@
+ #define SWAU_CMD_BIND2         271u
+ #define SWAU_SINK_SPEAKER      0u
+ #define SWAU_SRC_EP0           0u
++/* patch 0379 (sweetaoc=5) */
++#define SWAU_CMD_SOURCE        201u
++#define SWAU_CMD_EP_SETUP      206u
++#define SWAU_EP_SETUP_LEN      28u
++#define SWAU_EP_WATERMARK      48000u  /* PLAYBACK_WATERMARK_DEFAULT */
++#define SWAU_EP_CHAN           2u
++#define SWAU_EP_BITS_16        1u      /* WIDTH_16_BIT */
++#define SWAU_EP_SR_48K         5u      /* SR_48KHZ */
++#define SWAU_EP_FMT_FIXED      1u      /* FRMT_FIXED_POINT */
++#define SWAU_EP_MODE_PLAYBACK  0u
++#define SWAU_RING_TYPE         1u      /* AOC_SERVICE_TYPE_RING */
++#define SWAU_RING_PUSH         0x01000000u
++#define SWAU_RING_MAX          0x00100000u     /* our bound on the zeroed data area (stock buffer_bytes_max 96 KiB, aoc_alsa_pcm.c:185) */
++#define SWAU_FEED_MAX          1024u   /* zero bytes per feed call (48000 * 2 ch * 2 B = 192 bytes per ms) */
+ 
+ enum {
+ 	SWAU_OK = 0, SWAU_E_ARGS, SWAU_E_READ, SWAU_E_SVC, SWAU_E_FULL, SWAU_E_WRITE, SWAU_E_RING, SWAU_E_TIMEOUT, SWAU_E_AOCERR,
+@@ -86,13 +126,23 @@ struct swau_x {
+ 	int rc;
+ };
+ 
+-#define SWAU_NX 3
++#define SWAU_NX 6       /* 0379: GET_DSP_STATE, BIND2 1, EP_SETUP, SOURCE 1, SOURCE 0, BIND2 0 */
++/* patch 0379: the audio_playback0 ring (AOC_DOWN region only) */
++struct swau_ring {
++	uint32_t hdr, flags, irq;
++	struct swau_region g;
++	uint32_t rx0, fed, feeds, feed_err, zeroed, reset;
++};
+ struct swau_res {
+ 	struct swau_svc s;
+ 	struct swau_x x[SWAU_NX];
+ 	uint32_t nx, bound, unbound, dsp_mode;
+ 	uint8_t cntr;
+ 	int rc;
++	/* patch 0379 (sweetaoc=5) */
++	struct swau_ring pb;
++	uint32_t play, ep_set, started, stopped, consumed;
++	int play_rc;
+ };
+ 
+ static int
+@@ -366,16 +416,233 @@ swau_open(const struct swau_bus *b, struct swau_res *r, uint32_t services_offset
+ 	return r->rc;
+ }
+ 
+-/* undo: BIND2 bind = 0 once, if a bind = 1 may have reached the AOC */
++/* ---- patch 0379 (sweetaoc=5): playback start of EP0 on the bound path, silence only ---- */
++static void
++swau_put32(uint8_t *m, uint32_t v)
++{
++	m[0] = (uint8_t)v;
++	m[1] = (uint8_t)(v >> 8);
++	m[2] = (uint8_t)(v >> 16);
++	m[3] = (uint8_t)(v >> 24);
++}
++
++static int
++swau_ep_setup(const struct swau_bus *b, struct swau_res *r)
++{
++	uint8_t m[SWAU_EP_SETUP_LEN];
++
++	swau_hdr(m, r->cntr++, sizeof(m), SWAU_CMD_EP_SETUP);
++	swau_put32(m + 8, 0u);                  /* d.address */
++	swau_put32(m + 12, SWAU_EP_WATERMARK);  /* d.watermark */
++	swau_put32(m + 16, 0u);                 /* d.length */
++	m[20] = SWAU_EP_CHAN;                   /* d.metadata.chan */
++	m[21] = SWAU_EP_BITS_16;                /* d.metadata.bits */
++	m[22] = SWAU_EP_SR_48K;                 /* d.metadata.sr */
++	m[23] = SWAU_EP_FMT_FIXED;              /* d.metadata.format */
++	m[24] = 0u;                             /* d.metadata.offset */
++	m[25] = SWAU_SRC_EP0;                   /* d.channel = entry_point_idx */
++	m[26] = 1u;                             /* d.wraparound */
++	m[27] = SWAU_EP_MODE_PLAYBACK;          /* mode */
++	return swau_cmd(b, r, m, sizeof(m));
++}
++
++static int
++swau_source(const struct swau_bus *b, struct swau_res *r, uint8_t on)
++{
++	uint8_t m[10];
++
++	swau_hdr(m, r->cntr++, sizeof(m), SWAU_CMD_SOURCE);
++	m[8] = SWAU_SRC_EP0;
++	m[9] = on;
++	return swau_cmd(b, r, m, sizeof(m));
++}
++
++/* the audio_playback0 header, READ ONLY: a ring, irq <= 15, its AOC_DOWN data area inside the window, counters sane */
++static int
++swau_ring_open(const struct swau_bus *b, struct swau_ring *p, uint32_t services_offset, uint32_t service_size, uint32_t idx)
++{
++	struct swau_region *g = &p->g;
++	uint32_t end;
++
++	*p = (struct swau_ring){ 0 };
++	if (service_size < 32u + 4u + 56u || services_offset >= SWAU_IPC_LEN || idx >= 200u) {
++		return SWAU_E_ARGS;
++	}
++	p->hdr = services_offset + idx * service_size;
++	if (p->hdr > SWAU_IPC_LEN - (32u + 4u + 56u) || (p->hdr & 3u)) {
++		return SWAU_E_SVC;
++	}
++	if (!b->ir32(b->ctx, p->hdr + 32u, &p->flags)) {
++		return SWAU_E_READ;
++	}
++	p->irq = (p->flags >> 19) & 0x1Fu;
++	if (((p->flags >> 16) & 7u) != SWAU_RING_TYPE || p->irq > 15u) {
++		return SWAU_E_SVC;
++	}
++	g->base = p->hdr + 36u + 28u * SWAU_DOWN;
++	if (!swau_region_read(b, g)) {
++		return SWAU_E_READ;
++	}
++	end = g->offset + g->size;
++	if (g->slots == 0u || g->size == 0u || g->size > SWAU_RING_MAX || (g->size & 3u) || (g->offset & 3u) || g->offset >= SWAU_IPC_LEN ||
++	    end > SWAU_IPC_LEN || end < g->offset || g->wp >= g->size || (g->wp & 3u)) {
++		return SWAU_E_SVC;
++	}
++	if (g->tx - g->rx > g->size) {
++		return SWAU_E_CORRUPT;
++	}
++	return SWAU_OK;
++}
++
++/* zero the whole AOC_DOWN data area, then the stock write-pointer reset */
++static int
++swau_ring_prime(const struct swau_bus *b, struct swau_ring *p)
++{
++	struct swau_region *g = &p->g;
++	uint32_t i, rem;
++
++	for (i = 0; i < g->size; i += 4u) {
++		if (!b->iw32(b->ctx, g->offset + i, 0u)) {
++			return SWAU_E_WRITE;
++		}
++	}
++	b->isync(b->ctx);
++	p->zeroed = 1;
++	if (!swau_counters(b, g)) {
++		return SWAU_E_READ;
++	}
++	if (g->wp >= g->size || (g->wp & 3u)) {
++		return SWAU_E_CORRUPT;
++	}
++	rem = g->size - g->wp;
++	if (!b->iw32(b->ctx, g->base + 12u, g->tx + rem) || !b->iw32(b->ctx, g->base + 20u, (g->wp + rem) % g->size)) {
++		return SWAU_E_WRITE;
++	}
++	b->isync(b->ctx);
++	p->reset = 1;
++	p->rx0 = g->rx;
++	return SWAU_OK;
++}
++
++/* one feed of ZEROS: what the AOC consumed since, at most SWAU_FEED_MAX bytes; no wait. Called each poll ms while the stream runs. */
++static void
++swau_feed(const struct swau_bus *b, struct swau_res *r)
++{
++	struct swau_ring *p = &r->pb;
++	struct swau_region *g = &p->g;
++	uint32_t used, n, k;
++
++	if (!r->started || r->stopped) {
++		return;
++	}
++	if (!swau_counters(b, g) || g->wp >= g->size || (g->wp & 3u)) {
++		p->feed_err++;
++		return;
++	}
++	used = g->tx - g->rx;
++	if (used > g->size) {
++		used = g->size;
++	}
++	n = g->size - used;
++	if (n > SWAU_FEED_MAX) {
++		n = SWAU_FEED_MAX;
++	}
++	n &= ~3u;
++	if (n == 0u) {
++		return;
++	}
++	for (k = 0; k < n; k += 4u) {
++		if (!b->iw32(b->ctx, g->offset + (g->wp + k) % g->size, 0u)) {
++			p->feed_err++;
++			return;         /* tx not advanced: the AOC sees nothing new */
++		}
++	}
++	b->isync(b->ctx);
++	if (!b->iw32(b->ctx, g->base + 12u, g->tx + n) || !b->iw32(b->ctx, g->base + 20u, (g->wp + n) % g->size)) {
++		p->feed_err++;
++		return;
++	}
++	b->isync(b->ctx);
++	if ((p->flags & SWAU_RING_PUSH) && !b->doorbell(b->ctx, p->irq)) {
++		p->feed_err++;
++	}
++	p->fed += n;
++	p->feeds++;
++}
++
++/* sweetaoc=5 open: audio_playback0 checked (read only, before any command), the 0378 open, ring zero + reset, EP_SETUP, SOURCE on = 1.
++ * After a SOURCE on = 1 was WRITTEN (whatever the reply) r->started = 1; the caller must call swau_close on every path. */
++static int
++swau_play_open(const struct swau_bus *b, struct swau_res *r, uint32_t services_offset, uint32_t service_size, uint32_t ctl_index,
++    uint32_t pb_index, uint32_t nsvc)
++{
++	struct swau_ring pb = { 0 };
++	int rc;
++
++	b->say(b->ctx, "audio_playback0: ring header (read only)");
++	rc = nsvc > 200u || pb_index >= nsvc || ctl_index >= nsvc || pb_index == ctl_index ? SWAU_E_ARGS :
++	    swau_ring_open(b, &pb, services_offset, service_size, pb_index);
++	if (rc != SWAU_OK) {
++		*r = (struct swau_res){ 0 };
++		r->play = 1;
++		r->pb = pb;
++		return r->rc = r->play_rc = rc;
++	}
++	rc = swau_open(b, r, services_offset, service_size, ctl_index);
++	r->play = 1;
++	r->pb = pb;
++	if (rc != SWAU_OK) {
++		return r->play_rc = rc;
++	}
++	{       /* the area to zero must not touch the control block + all nsvc service headers (A8 table) or the audio_output_control queues */
++		uint32_t a0 = pb.g.offset, a1 = pb.g.offset + pb.g.size, hi = nsvc, i;
++
++		if (a0 < services_offset + hi * service_size) {
++			return r->rc = r->play_rc = SWAU_E_SVC;
++		}
++		for (i = 0; i < 2u; i++) {
++			if (a0 < r->s.r[i].offset + r->s.r[i].size * r->s.r[i].slots && r->s.r[i].offset < a1) {
++				return r->rc = r->play_rc = SWAU_E_SVC;
++			}
++		}
++	}
++	b->say(b->ctx, "audio_playback0: ring zeroed, write pointer reset (prepare)");
++	rc = swau_ring_prime(b, &r->pb);
++	if (rc != SWAU_OK) {
++		return r->rc = r->play_rc = rc;
++	}
++	b->say(b->ctx, "cmd 206 EP_SETUP ep 0 2 ch 16 bit 48 kHz fixed, watermark 48000, wraparound, PLAYBACK");
++	rc = swau_ep_setup(b, r);
++	r->ep_set = r->x[r->nx - 1u].written;
++	if (rc != SWAU_OK) {
++		return r->rc = r->play_rc = rc;
++	}
++	b->say(b->ctx, "cmd 201 SOURCE 0 on 1 (trigger START)");
++	rc = swau_source(b, r, 1u);
++	r->started = r->x[r->nx - 1u].written;  /* the message may have reached the AOC: undo it */
++	return r->rc = r->play_rc = rc;
++}
++
++/* undo, each once: SOURCE on = 0 if an on = 1 may have reached the AOC (stock trigger STOP), then BIND2 bind = 0 if a bind = 1 may have */
+ static int
+ swau_close(const struct swau_bus *b, struct swau_res *r)
+ {
+-	if (!r->bound || r->unbound) {
+-		return SWAU_OK;
++	int rs = SWAU_OK, rb = SWAU_OK;
++
++	if (r->started && !r->stopped) {
++		r->stopped = 1;
++		if (swau_counters(b, &r->pb.g)) {
++			r->consumed = r->pb.g.rx - r->pb.rx0;
++		}
++		b->say(b->ctx, "cmd 201 SOURCE 0 on 0 (undo: trigger STOP)");
++		rs = swau_source(b, r, 0u);
++	}
++	if (r->bound && !r->unbound) {
++		b->say(b->ctx, "cmd 271 BIND2 src 0 dst 0 bind 0 (undo)");
++		r->unbound = 1;
++		rb = swau_bind2(b, r, 0u);
+ 	}
+-	b->say(b->ctx, "cmd 271 BIND2 src 0 dst 0 bind 0 (undo)");
+-	r->unbound = 1;
+-	return swau_bind2(b, r, 0u);
++	return rs != SWAU_OK ? rs : rb;
+ }
+ 
+ #endif /* SWEET_AUDIO_H */

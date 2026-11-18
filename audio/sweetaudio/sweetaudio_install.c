@@ -195,7 +195,7 @@ ringer_kick(void)
 	sleep(8);
 }
 
-/* the kernel makes /dev/sweetaudio once the AOC + amps are up (~+120 s, patch 0173) and holds it for its 2-beep self-test: wait for an
+/* the kernel makes /dev/sweetaudio once the AOC + amps are up (~+120 s, patch 0385) and holds it for its 2-beep self-test: wait for an
  * open to succeed, bounded to 300 s (1 s steps) */
 static int
 wait_dev(void)

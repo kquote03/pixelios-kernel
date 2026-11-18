@@ -1,4 +1,4 @@
-/* Host test for xnu patch 0158 (bsd/dev/sweet_amp.h, boot-arg sweetamp=1): the A1 identify of shim/ampid_host_test.c (same fake SoC and fake CS35L41,
+/* Host test for xnu patch 0373 (bsd/dev/sweet_amp.h, boot-arg sweetamp=1): the A1 identify of shim/ampid_host_test.c (same fake SoC and fake CS35L41,
  * typed from the driver text) plus the A7 checks: every write frame is one of the 12 stock B2 probe writes in stock order (cs35l41.c:4306-4308,
  * :3675-3686, :4401), only after that amp was identified, never PWR_CTRL1; an error bit in IRQ1_STATUS1 fails the init; the armed-write allowlist.
  * A7 OTP: each amp unpacks its OTP words into the 38 row registers exactly as a re-typed
@@ -90,9 +90,9 @@ struct amp {
 	uint32_t otpid, mem[32], ra[48], rv[48], ra0[48], rv0[48]; unsigned nreg, nreg0, mem_reads, otp_nwr, lock_seen;
 	int key, mem_flip;	/* mem_flip: OTP_MEM5 reads differently from the second pass on */
 	uint32_t stuck_reg;	/* writes to this register do not stick */
-	/* patch 0166 A9: the TDM / boost / clock registers, PWR_CTRL1 (read only), the PLL model */
+	/* patch 0378 A9: the TDM / boost / clock registers, PWR_CTRL1 (read only), the PLL model */
 	uint32_t a9v[11]; unsigned a9_nwr, a9_bad; int pll_en_seen;
-	/* patch 0169 A9e: the DSP (XM / YM 24-bit words, PM raw registers), its control words, the stream position of a burst */
+	/* patch 0381 A9e: the DSP (XM / YM 24-bit words, PM raw registers), its control words, the stream position of a burst */
 	uint32_t xm[4096], ym[2048], pm[0x1400], rxsrc[4], mpu[20], wdt, errata, wacc, ymp_first, ymu_first;
 	unsigned np, dsp_mem_nw, dsp_ctl_nw, starts, stops; int mpulock, reset_running;
 };
@@ -107,7 +107,7 @@ static uintptr_t rfault_pa;
 static unsigned rfault_after;		/* the fault applies only after this many reads of rfault_pa */
 static unsigned rfault_cnt;
 static unsigned wfault_n;		/* 1-based write index that faults (not applied) */
-static uintptr_t wfault_pa;		/* patch 0171: the address of the faulted write */
+static uintptr_t wfault_pa;		/* patch 0383: the address of the faulted write */
 static unsigned ignore_from;		/* writes from this 1-based index on are dropped (accepted) */
 static int no_clock;			/* the bus never clocks (RX never fills) */
 static uint64_t ticks, tick_step, freq;
@@ -270,7 +270,7 @@ static int ref_unpack(uint32_t id, const uint32_t *otp_mem, uint32_t *ra, uint32
 	return 0;
 }
 
-/* ---- patch 0166 A9 model: registers typed from cs35l41.h (not from the header under test) ---- */
+/* ---- patch 0378 A9 model: registers typed from cs35l41.h (not from the header under test) ---- */
 static const uint32_t A9R[11] = { 0x3810u, 0x3814u, 0x3808u, 0x480Cu, 0x6808u, 0x4808u, 0x2D10u, 0x2C04u, 0x2C0Cu, 0x4840u, 0x2014u };
 static int sclk_on, pll_never, a9_opens, a9_closes, a9_open_ret = 1;
 static uint32_t a9v0[2][11];
@@ -331,7 +331,7 @@ static uint32_t a9_st3(int a)
 	return m->st3;
 }
 static int cb_open(void *ctx) { (void)ctx; a9_opens++; sclk_on = a9_open_ret; return a9_open_ret; }
-/* patch 0167 (sweetaoc=5) model: the open starts the stream but SCLK only runs after tick_need ticks (0 = never); a tick outside open..close is a violation */
+/* patch 0379 (sweetaoc=5) model: the open starts the stream but SCLK only runs after tick_need ticks (0 = never); a tick outside open..close is a violation */
 static int a9_ticks, tick_need, tick_bad;
 static int cb_open5(void *ctx) { (void)ctx; a9_opens++; a9_ticks = 0; sclk_on = 0; return a9_open_ret; }
 static void cb_tick(void *ctx) { (void)ctx; if (a9_opens != 1 || a9_closes) tick_bad++; a9_ticks++; sclk_on = tick_need && a9_ticks >= tick_need; }
@@ -353,7 +353,7 @@ static void otp_wr(int a, uint32_t wa, uint32_t wv)
 		return;
 	}
 	if (amp_a9_cb.on && m->lock_seen && (a9_idx(wa) >= 0 || wa == 0x10018u)) {
-		a9_wr(a, wa, wv);	/* patch 0166: after the OTP relock */
+		a9_wr(a, wa, wv);	/* patch 0378: after the OTP relock */
 		return;
 	}
 	if (!ref_target(wa)) {
@@ -388,14 +388,14 @@ static int otp_as_linux(int a)
 	return n == amp[a].nreg;
 }
 
-/* ---- patch 0169 A9e: the DSP model, typed from Linux v6.18 include/sound/cs35l41.h and the AMP wm_adsp.c HALO offsets (not from the header):
+/* ---- patch 0381 A9e: the DSP model, typed from Linux v6.18 include/sound/cs35l41.h and the AMP wm_adsp.c HALO offsets (not from the header):
  * XM / YM as 24-bit words behind a packed view (4 words in 3 registers, LSB first: word 0 = bits 0..23 of the first register) and an unpacked
  * view (one word per register), PM as raw registers. The core runs once CCM_CORE_CTRL EN is set after a full load; the heartbeat word (fw
  * xm_base + 1) counts each read while it runs. ---- */
 static int hb_dead, hb_needs_sclk, dsp_err_after_start = -1;
 static uint32_t dsp_stuck_addr; static int dsp_stuck_amp = -1;
-static unsigned dsp_wmax, dsp_rmax;	/* patch 0170: the longest write / read burst seen (data bytes after the 6 address / pad bytes) */
-/* patch 0171: the MPU access words read back through this mask (hardware that does not return all ones); nw when L's 3rd access word landed */
+static unsigned dsp_wmax, dsp_rmax;	/* patch 0382: the longest write / read burst seen (data bytes after the 6 address / pad bytes) */
+/* patch 0383: the MPU access words read back through this mask (hardware that does not return all ones); nw when L's 3rd access word landed */
 static uint32_t dsp_mpu_rbmask = 0xFFFFFFFFu; static unsigned mark_mpu3;
 static int dsp_mem(uint32_t x)
 {
@@ -564,7 +564,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 
 	if (m->nf < sizeof(m->frame))
 		m->frame[m->nf++] = mosi;
-	if (m->np++ >= 4u) {	/* patch 0169: a DSP memory frame is a burst of any length */
+	if (m->np++ >= 4u) {	/* patch 0381: a DSP memory frame is a burst of any length */
 		uint32_t fa = ((uint32_t)m->frame[0] << 24 | (uint32_t)m->frame[1] << 16 | (uint32_t)m->frame[2] << 8 | m->frame[3]) & 0x7fffffffu;
 
 		if (dsp_mem(fa))
@@ -594,7 +594,7 @@ static uint8_t amp_byte(int a, uint8_t mosi, int tx_on)
 			if (wa == 0x2B80010u || (wa >= 0x13000u && wa <= 0x1305Cu))
 				violate("CORE_SOFT_RESET or a mailbox written");
 			if (m->nwr >= 12 && dsp_ctl(wa)) {
-				dsp_ctl_wr(a, wa, wv);	/* patch 0169 */
+				dsp_ctl_wr(a, wa, wv);	/* patch 0381 */
 			} else if (m->nwr >= 12) {
 				otp_wr(a, wa, wv);	/* A7: the OTP unpack after the 12 */
 			} else {
@@ -709,7 +709,7 @@ static void pad_write(int b, unsigned r, uint32_t v)
 		if (!before[a] && cs_low(a))
 			amp[a].nf = amp[a].np = 0;
 		if (rel[a] && !released(a) && (amp[a].ccm & 1u))
-			amp[a].reset_running = 1;	/* patch 0169: reset while the core ran (the stop was skipped) */
+			amp[a].reset_running = 1;	/* patch 0381: reset while the core ran (the stop was skipped) */
 		if (rel[a] && !released(a)) { amp[a].booted = 0; amp[a].was_released = 0; }
 		if (!rel[a] && released(a)) {
 			int rb = a == 0 ? 2 : 3;
@@ -806,7 +806,7 @@ static void reset_hw(void)
 		memcpy(amp[a].rv0, amp[a].rv, sizeof(amp[a].rv));
 		amp[a].nreg0 = amp[a].nreg;
 	}
-	for (int a = 0; a < 2; a++) {	/* patch 0166 A9: random start words, PWR_CTRL1 with GLOBAL_EN clear */
+	for (int a = 0; a < 2; a++) {	/* patch 0378 A9: random start words, PWR_CTRL1 with GLOBAL_EN clear */
 		for (int i = 0; i < 10; i++)
 			amp[a].a9v[i] = rnd();
 		amp[a].a9v[10] = rnd() & ~1u;
@@ -975,8 +975,8 @@ static void unit_writes(void)
 	}
 	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 2u << 6, 0x04u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 3u << 6, 0x7Cu, 0, 0, 2, 0x47Cu, 0), "armed OTP_MEM31 read frame");
 	CHECK(!w32_allowed(R_TX, 3u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && !w32_allowed(R_TX, 6u << 6, 0x00u, 0, 0, 2, 0x47Cu, 0), "armed read: another byte / a seventh byte refused");
-	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x201Cu, 0), "armed read of an unlisted register refused");	/* patch 0172: PWR_CTRL2 0x2018 is read now; PWR_CTRL3 is not */
-	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2014u, 0), "patch 0166: PWR_CTRL1 may be READ (GLOBAL_EN must read 0), never written");
+	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x201Cu, 0), "armed read of an unlisted register refused");	/* patch 0384: PWR_CTRL2 0x2018 is read now; PWR_CTRL3 is not */
+	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2014u, 0), "patch 0378: PWR_CTRL1 may be READ (GLOBAL_EN must read 0), never written");
 	CHECK(!w32_allowed(R_PKT, 0, 10u, 0, 0, 2, 0x400u, 0) && !w32_allowed(R_CH, 0, CH_TX | CH_RX, 10u << 6, 0, 2, 0x400u, 0), "an armed read never sends a write frame");
 	CHECK(w32_allowed(R_CH, 0, CH_TX | CH_RX, 6u << 6, 0, 2, 0x400u, 0), "an armed read sends its 6-byte frame");
 	printf("ok: armed write unit cases\n");
@@ -1063,7 +1063,7 @@ static void unit_allowlist(void)
 	printf("ok: allowlist unit cases\n");
 }
 
-/* ---- patch 0169 A9e: synthetic firmware (the stock layout, small) and the DSP cases ---- */
+/* ---- patch 0381 A9e: synthetic firmware (the stock layout, small) and the DSP cases ---- */
 static uint8_t syn_w[512], syn_b[2][256], syn_c[2048];
 static size_t syn_wn, syn_bn[2];
 static const uint32_t SYN_HDR[24] = { 0x040000u, 0x030000u, 2u, 0x400a4u, 0x1d00u, 0x40u, 0x0eu, 0u, 0u, 2u,	/* id header: fw xm_base 0x40, 2 algs */
@@ -1134,7 +1134,7 @@ static void syn_build(void)
 		syn_bn[a] = n;
 	}
 }
-/* patch 0170: syn_w + three long regions (XM packed 1212 B, YM unpacked 1004 B, PM 1000 B: 3 bursts each) before the algorithm data */
+/* patch 0382: syn_w + three long regions (XM packed 1212 B, YM unpacked 1004 B, PM 1000 B: 3 bursts each) before the algorithm data */
 static uint8_t syn_w2[4096];
 static size_t syn_wn2;
 static const uint32_t LR_REG[3] = { 0x2000300u, 0x3400400u, 0x3800028u }, LR_LEN[3] = { 1212u, 1004u, 1000u };
@@ -1232,7 +1232,7 @@ static void dsp_tests(void)
 	CHECK(amp[0].xm[3] == 0x400a4u && amp[0].xm[22] == 0xbedeadu && amp[1].pm[4] == 0xB0B1B2B3u, "wmfw regions in memory (packed view decodes)");
 	CHECK(amp[0].a9v[10] == a9v0[0][10] && amp[1].a9v[10] == a9v0[1][10] && restored_exact() && a9_closes == 1 && !tick_bad, "PWR_CTRL1 untouched, restore exact, AOC closed");
 	printf("ok: A9e good: %u + %u memory writes, halo running l,r (window 1), stopped, restore exact\n", amp[0].dsp_mem_nw, amp[1].dsp_mem_nw);
-	{	/* patch 0170: regions longer than one burst: 3 bursts each, the memory image of the single burst, every register written once */
+	{	/* patch 0382: regions longer than one burst: 3 bursts each, the memory image of the single burst, every register written once */
 		unsigned nw0 = amp[0].dsp_mem_nw, nw1 = amp[1].dsp_mem_nw;
 
 		syn_build2();
@@ -1276,14 +1276,14 @@ static void dsp_tests(void)
 	CHECK(violations == 0 && amp_dsp_res.a[0].stage == DS_ERR && amp[0].stops == 1 && amp[1].stops == 1 && !amp[0].reset_running &&
 	      has("l=error-after-start"), "A9e error after start");
 	printf("ok: A9e error bit after the start: stopped, loud\n");
-	/* patch 0171: the start / run stage detail lines */
+	/* patch 0383: the start / run stage detail lines */
 	CHECK(has("SWEET AMP DSP: L step=post-st1-err/w1 reg=00010010 w=00000000 r=00000040 e=0 pwr1=") &&
 	      has("SWEET AMP DSP: L mpu rb 20/20 not-ffffffff=0") && has("SWEET AMP DSP: R mpu rb 20/20 not-ffffffff=0"), "A9g error after start: detail line");
 	dsp_run(1); hb_dead = 1; rc = dsp_go();
 	CHECK(violations == 0 && has("SWEET AMP DSP: L step=hb-still/w2 reg=") && has("SWEET AMP DSP: R step=hb-still/w2 reg="), "A9g no heartbeat: detail line");
 	printf("ok: A9g detail lines: post-st1-err/w1 (st1, pwr1), hb-still/w2\n");
 
-	/* patch 0171: MPU access words that do not read back all ones (stock never reads them): logged, the core starts, pass */
+	/* patch 0383: MPU access words that do not read back all ones (stock never reads them): logged, the core starts, pass */
 	dsp_run(1); dsp_mpu_rbmask = 0x0000FFFFu; rc = dsp_go();
 	CHECK(rc == 0 && violations == 0 && amp[0].starts == 1 && amp[1].starts == 1 && amp[0].mpulock == 3 && amp[1].mpulock == 3 &&
 	      has("SWEET AMP DSP: L mpu rb 20/20 not-ffffffff=20 first 02bc3000=0000ffff") &&
@@ -1291,7 +1291,7 @@ static void dsp_tests(void)
 	      has("SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r") && restored_exact(), "A9g MPU read-back is a logged value");
 	printf("ok: A9g MPU words read 0000ffff: logged (20/20 not-ffffffff), started, pass line\n");
 
-	/* patch 0171: a failing SPI write on L's 3rd MPU access word: step named, the MPU relocked (LOCK_CONFIG := 0), no core started, R untouched */
+	/* patch 0383: a failing SPI write on L's 3rd MPU access word: step named, the MPU relocked (LOCK_CONFIG := 0), no core started, R untouched */
 	{
 		unsigned m3, nrl = 0, nacc = 0, ncs = 0, rr;
 
@@ -1302,7 +1302,7 @@ static void dsp_tests(void)
 			if (amp_dsp_res.a[0].stage != DS_MPU || !has("SWEET AMP DSP: L step=access reg=02bc30"))
 				continue;	/* the fault hit another frame */
 			nacc++;
-			/* a dropped chip-select pad write leaves L's CS low; a later L read (amp_read checks only the OTHER CS, 0158;
+			/* a dropped chip-select pad write leaves L's CS low; a later L read (amp_read checks only the OTHER CS, 0373;
 			 * guess: the a9 reads after the DSP stop) extends the open frame. Measured pre-existing: the same 25 positions with the relock removed. */
 			if (bank_of(wfault_pa, &rr) >= 0 && violations && !strcmp(why_v, "a write frame longer than 10 bytes"))
 				ncs++;
@@ -1544,7 +1544,7 @@ int main(void)
 		CHECK(has("restore=FAILED"), "restore=FAILED");
 		printf("ok: a dropped restore write is loud (!!! RESTORE FAILED, restore=FAILED)\n");
 	}
-	/* ---- patch 0166 A9b: TDM config, AOC open / close callbacks, PLL lock, never PWR_CTRL1 ---- */
+	/* ---- patch 0378 A9b: TDM config, AOC open / close callbacks, PLL lock, never PWR_CTRL1 ---- */
 	{
 		int a9ok;
 
@@ -1596,7 +1596,7 @@ int main(void)
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 		printf("ok: A9 amp error bit: no TDM config, no AOC open\n");
 	}
-	/* ---- patch 0167 (sweetaoc=5): joint L/R poll <= 500 x 1 ms with a tick per ms, st3 snapshots, close on every path ---- */
+	/* ---- patch 0379 (sweetaoc=5): joint L/R poll <= 500 x 1 ms with a tick per ms, st3 snapshots, close on every path ---- */
 	{
 		reset_hw(); tick_need = 20; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0, NULL }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && !tick_bad && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked,
@@ -1622,8 +1622,8 @@ int main(void)
 		printf("ok: A9 play: open failed (no tick, close still called)\n");
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 	}
-	dsp_tests();	/* patch 0169 */
-	/* patch 0172: PWR_CTRL1 and the power words pass only while armed for exactly that pair; never a DSP / init pair through the arm */
+	dsp_tests();	/* patch 0381 */
+	/* patch 0384: PWR_CTRL1 and the power words pass only while armed for exactly that pair; never a DSP / init pair through the arm */
 	CHECK(!amp_write_ok(AMP_REG_PWR_CTRL1, 1u), "PWR_CTRL1 refused unarmed");
 	amp_pwr_row.on = 1; amp_pwr_row.reg = AMP_REG_PWR_CTRL1; amp_pwr_row.val = 1u;
 	CHECK(amp_write_ok(AMP_REG_PWR_CTRL1, 1u), "PWR_CTRL1 := 1 passes armed");

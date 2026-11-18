@@ -1,0 +1,234 @@
+SWEET Trusty version probe (patch 0372, plan 2026-11-14 oneshot-2 step A3), boot-arg sweettrusty=1. Issues only the two version
+fastcalls of the stock Trusty driver's probe (kernel/google-modules/trusty 2494a3e, drivers/trusty/trusty.c:725-750, 773-791, 1109-1111):
+SMC_FC_GET_VERSION_STR 0xBC00000A (length, then one character per call) and SMC_FC_API_VERSION 0xBC00000B with 5. No std-call, no shared
+memory, no MMIO. The logic and its allowlist are in the pure header bsd/dev/sweet_trusty.h (host test shim/trusty_host_test.c).
+Lines: "SWEET TRUSTY: api=N version='...'" or "SWEET TRUSTY: stop <reason> ...", last "SWEET TRUSTY: probe done smc=N".
+Without the boot-arg nothing changes.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 742f5f0..46f78d7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -144,6 +144,7 @@ bsd/dev/sweet_bt_rom.c		standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_mmio_log.c		standard
++bsd/dev/sweet_trusty.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_trusty.c b/bsd/dev/sweet_trusty.c
+new file mode 100644
+index 0000000..81bf80a
+--- /dev/null
++++ b/bsd/dev/sweet_trusty.c
+@@ -0,0 +1,55 @@
++/*
++ * Trusty version probe (patch 0372, plan 2026-11-14 oneshot-2 step A3). Boot-arg sweettrusty=1; without it nothing runs.
++ * Issues only the two version fastcalls that the stock Linux Trusty driver issues first in its probe (see sweet_trusty.h
++ * for the cites): no std-call, no shared memory, no MMIO, no state of ours left behind. Lines:
++ *   "SWEET TRUSTY: api=5 version='...'"                    (pass)
++ *   "SWEET TRUSTY: stop <reason> r0=0x... after N smc"     (anything else; the dependent audio steps are skipped)
++ * The monitor is reached with "smc #0" from EL1 as patches 0063 (PSCI) and 0083 (PMU write) already do on this SoC
++ * (observed: CPUs start, restart works). x0-x3 carry the call, x4-x17 are treated as clobbered (the Trusty ABI returns
++ * x0-x7, trusty-smc-arm64.S:18-35).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++
++#include "sweet_trusty.h"
++
++void sweet_trusty_init(void);
++
++static uint64_t
++sweet_trusty_smc(__unused void *ctx, uint64_t fid, uint64_t a1)
++{
++	register uint64_t x0 __asm__("x0") = fid;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return x0;
++}
++
++void
++sweet_trusty_init(void)
++{
++	static struct swt_res r;        /* 180 bytes: not on the stack */
++	static const struct swt_bus b = { sweet_trusty_smc, NULL };
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweettrusty", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (on != 1) {
++		printf("SWEET TRUSTY: sweettrusty=%u not known (only 1), not touched\n", on);
++		return;
++	}
++	printf("SWEET TRUSTY: probe starts (2 version fastcalls only)\n");
++	if (swt_probe(&b, &r) == SWT_OK) {
++		printf("SWEET TRUSTY: api=%u version='%s'\n", r.api, r.ver);
++	} else {
++		printf("SWEET TRUSTY: stop %s r0=0x%x after %u smc (version so far '%s')\n", swt_ename(r.rc), r.raw, r.nsmc, r.ver);
++	}
++	printf("SWEET TRUSTY: probe done smc=%u\n", r.nsmc);
++}
+diff --git a/bsd/dev/sweet_trusty.h b/bsd/dev/sweet_trusty.h
+new file mode 100644
+index 0000000..5a83111
+--- /dev/null
++++ b/bsd/dev/sweet_trusty.h
+@@ -0,0 +1,128 @@
++/*
++ * Trusty version probe (patch 0372, plan step A3, boot-arg sweettrusty=1). Pure logic, no kernel headers: the host test
++ * (shim/trusty_host_test.c) drives it with a fake monitor.
++ *
++ * Only the two version fastcalls of the stock driver's probe, in its order (kernel/google-modules/trusty 2494a3e,
++ * drivers/trusty/trusty.c:1109-1111): trusty_init_version (:725-750) then trusty_init_api_version (:773-791).
++ *   SMC_FC_GET_VERSION_STR 0xBC00000A (include/linux/trusty/smcall.h:119): r1 = -1 as a 32-bit value returns the length,
++ *     r1 = i returns character i; a result <= 0 (length) or < 0 (character) as a signed 32-bit value is an error.
++ *   SMC_FC_API_VERSION 0xBC00000B (smcall.h:143): r1 = the highest version the client supports (5 =
++ *     TRUSTY_API_VERSION_CURRENT of that tree); returns the selected version; SM_ERR_UNDEFINED_SMC 0xFFFFFFFF (sm_err.h:8)
++ *     means "not implemented".
++ * Fastcalls return directly (no restart loop). r2, r3 are 0 (trusty.c:72-81). No std-call, no memory share, nothing else.
++ * Stock result on this phone (observed, recovery dmesg:642-643): "Project: slider, Build: 15644732, ..." and api 5.
++ */
++#ifndef SWEET_TRUSTY_H
++#define SWEET_TRUSTY_H
++
++#include <stdint.h>
++
++#define SWT_FC_GET_VERSION_STR  0xBC00000Au
++#define SWT_FC_API_VERSION      0xBC00000Bu
++#define SWT_API_WANT            5u              /* TRUSTY_API_VERSION_CURRENT */
++#define SWT_UNDEFINED_SMC       0xFFFFFFFFu     /* SM_ERR_UNDEFINED_SMC */
++#define SWT_VER_MAX             160u            /* bound of ours on the string length (stock: 61 characters); longer = refuse */
++#define SWT_SMC_MAX             (SWT_VER_MAX + 2u)      /* the most monitor calls one probe can make */
++
++enum { SWT_OK = 0, SWT_E_UNDEF, SWT_E_LEN, SWT_E_CHAR, SWT_E_API, SWT_E_ARG };
++
++struct swt_bus {
++	uint64_t (*smc)(void *ctx, uint64_t fid, uint64_t a1);  /* one fastcall: x0 = fid, x1 = a1, x2 = x3 = 0; returns x0 */
++	void *ctx;
++};
++
++struct swt_res {
++	int rc;                         /* SWT_* */
++	uint32_t raw;                   /* the r0 that stopped the probe (rc != SWT_OK), else 0 */
++	uint32_t len, api, nsmc;        /* string length, selected api version, monitor calls made */
++	char ver[SWT_VER_MAX + 1u];     /* printable ASCII only (other bytes become '?'), NUL-terminated */
++};
++
++static inline const char *
++swt_ename(int rc)
++{
++	static const char *const n[] = { "ok", "undefined-smc", "bad-length", "bad-char", "bad-api", "bad-arg" };
++
++	return (rc >= 0 && rc <= SWT_E_ARG) ? n[rc] : "?";
++}
++
++/* The allowlist: the only (fid, a1) pairs the probe may issue. a1 for the string call is -1 or an index below the length. */
++static inline int
++swt_allowed(uint64_t fid, uint64_t a1, uint32_t len)
++{
++	if (fid == SWT_FC_GET_VERSION_STR) {
++		return a1 == 0xFFFFFFFFull || (len != 0u && a1 < len && len <= SWT_VER_MAX);
++	}
++	if (fid == SWT_FC_API_VERSION) {
++		return a1 == SWT_API_WANT;
++	}
++	return 0;
++}
++
++static inline int
++swt_call(const struct swt_bus *b, struct swt_res *r, uint64_t fid, uint64_t a1, uint32_t *out)
++{
++	if (!swt_allowed(fid, a1, r->len) || r->nsmc >= SWT_SMC_MAX) {
++		return -1;
++	}
++	r->nsmc++;
++	*out = (uint32_t)b->smc(b->ctx, fid, a1);       /* trusty_fast_call32: the low 32 bits of r0 */
++	return 0;
++}
++
++static inline int
++swt_stop(struct swt_res *r, int rc, uint32_t raw)
++{
++	r->rc = rc;
++	r->raw = raw;
++	return rc;
++}
++
++/* Version string, then api version. Stops at the first unexpected answer; never repeats a call with other arguments. */
++static inline int
++swt_probe(const struct swt_bus *b, struct swt_res *r)
++{
++	uint32_t v = 0, i;
++
++	if (b == 0 || b->smc == 0 || r == 0) {
++		return SWT_E_ARG;
++	}
++	r->rc = SWT_OK;
++	r->raw = 0;
++	r->len = r->api = r->nsmc = 0;
++	r->ver[0] = 0;
++	if (swt_call(b, r, SWT_FC_GET_VERSION_STR, 0xFFFFFFFFull, &v)) {
++		return swt_stop(r, SWT_E_ARG, 0);
++	}
++	if (v == SWT_UNDEFINED_SMC) {
++		return swt_stop(r, SWT_E_UNDEF, v);
++	}
++	if ((int32_t)v <= 0 || v > SWT_VER_MAX) {
++		return swt_stop(r, SWT_E_LEN, v);
++	}
++	r->len = v;
++	for (i = 0; i < r->len; i++) {
++		if (swt_call(b, r, SWT_FC_GET_VERSION_STR, i, &v)) {
++			return swt_stop(r, SWT_E_ARG, 0);
++		}
++		if ((int32_t)v < 0) {
++			r->ver[i] = 0;
++			return swt_stop(r, SWT_E_CHAR, v);
++		}
++		r->ver[i] = ((v & 0xFFu) >= 0x20u && (v & 0xFFu) < 0x7Fu && v < 0x100u) ? (char)v : '?';
++		r->ver[i + 1u] = 0;
++	}
++	if (swt_call(b, r, SWT_FC_API_VERSION, SWT_API_WANT, &v)) {
++		return swt_stop(r, SWT_E_ARG, 0);
++	}
++	if (v == SWT_UNDEFINED_SMC) {
++		return swt_stop(r, SWT_E_UNDEF, v);
++	}
++	if (v > SWT_API_WANT) {
++		return swt_stop(r, SWT_E_API, v);
++	}
++	r->api = v;
++	return SWT_OK;
++}
++
++#endif /* SWEET_TRUSTY_H */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6fc4876..1c36deb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -114,6 +114,7 @@ extern void sweet_touch_gs101_init(void);
+ extern void sweet_gpu_gs101_init(void);     /* bsd/dev/sweet_gpu_gs101.c, read-only, needs boot-arg sweetgpu= */
+ extern void sweet_bt_init(void);            /* bsd/dev/sweet_bt.c (patch 0189), no-op without the ADT node /bluetooth */
+ extern void sweet_wlan_init(void);          /* bsd/dev/sweet_wlan.c, read-only stage 1, needs boot-arg sweetwlan= and ADT /sweet-wlan */
++extern void sweet_trusty_init(void);        /* bsd/dev/sweet_trusty.c, version fastcalls only, needs boot-arg sweettrusty=1 */
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -1176,6 +1177,7 @@ sweet_ufs_init(void)
+ 	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */
+ 	sweet_wlan_init();            /* no-op without boot-arg sweetwlan= */
+ 	sweet_bt_init();              /* no-op (one GAP line) without the ADT node /bluetooth */
++	sweet_trusty_init();          /* no-op without boot-arg sweettrusty=1 */
+ 	sui_start();                  /* patch 0354: no-op without boot-arg sweetufsirq=1|2; arms from its own thread, after su.ready */
+ 	return 0;
+ }

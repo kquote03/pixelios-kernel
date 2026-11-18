@@ -1,4 +1,4 @@
-/* Host test of the AOC pre-load probe (xnu patch 0161, bsd/dev/sweet_aoc.h) against a fake SoC: reads only, bounds, the AOC
+/* Host test of the AOC pre-load probe (xnu patch 0374, bsd/dev/sweet_aoc.h) against a fake SoC: reads only, bounds, the AOC
  * power-domain gate, a note before and a done (value print) right after every block, no APM SRAM access. */
 #include <stdio.h>
 #include <string.h>

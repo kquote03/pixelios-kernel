@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the stock CS35L41 speaker-protection DSP files into one container for xnu patch 0169 (sweetaoc=6, plan A9e).
+"""Pack the stock CS35L41 speaker-protection DSP files into one container for xnu patch 0381 (sweetaoc=6, plan A9e).
 
   pack_ampfw.py OUT --wmfw cs35l41-dsp1-spk-prot.wmfw --bin-l cs35l41-dsp1-spk-prot.bin --bin-r R-cs35l41-dsp1-spk-prot.bin
 

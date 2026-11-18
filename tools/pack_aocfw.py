@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the stock AOC firmware (/vendor/firmware/aoc.bin) zlib-compressed into one container for xnu patch 0164 (sweetaoc=2, plan A6).
+"""Pack the stock AOC firmware (/vendor/firmware/aoc.bin) zlib-compressed into one container for xnu patch 0376 (sweetaoc=2, plan A6).
 
   pack_aocfw.py OUT --aoc FILE
 

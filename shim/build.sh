@@ -951,6 +951,67 @@ else
 	chk "wlan_registry_host_test (asan compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -o $O/wlan_registry_host_test_asan wlan_registry_host_test.c
 	chk "wlan_registry_host_test (asan)" $O/wlan_registry_host_test_asan
 	chk "xnu patch 0200 == shim/ sources" ../tools/gen-wlan-registry-patch --check
+	# ---- oriole (Pixel 6) audio stack, renumbered 2026-11-18 (docs/research/56-oriole-upstream-port.md); patch files used below, listed for htdigest:
+	#      ../xnu/patches/0372-sweet-trusty-probe.patch ../xnu/patches/0373-sweet-amp-init.patch ../xnu/patches/0374-aoc-pre.patch ../xnu/patches/0375-trusty-tipc.patch
+	#      ../xnu/patches/0376-aoc-load.patch ../xnu/patches/0377-aoc-start.patch ../xnu/patches/0378-aoc-audio.patch ../xnu/patches/0379-aoc-playback.patch
+	#      ../xnu/patches/0380-aoc-reply-match.patch ../xnu/patches/0381-amp-dsp-load.patch ../xnu/patches/0382-amp-dsp-chunk.patch ../xnu/patches/0383-amp-dsp-mpu.patch
+	#      ../xnu/patches/0384-amp-tone.patch ../xnu/patches/0385-aoc-sweetaudio-dev.patch ../xnu/patches/0393-sweetaudio-ep1.patch ../xnu/patches/0394-sweetaudio-polish.patch
+	# Trusty version probe of xnu patch 0372 (new-file hunk of bsd/dev/sweet_trusty.h) against a fake monitor: plain and ASan/UBSan
+	awk '$0=="+++ b/bsd/dev/sweet_trusty.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0372-sweet-trusty-probe.patch > $O/sweet_trusty.h
+	chk "trusty_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/trusty_host_test trusty_host_test.c
+	chk "trusty_host_test" $O/trusty_host_test
+	chk "trusty_asan_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/trusty_asan_host_test trusty_host_test.c
+	chk "trusty_asan_host_test" $O/trusty_asan_host_test
+	# AOC pre-load probe of xnu patch 0374 (bsd/dev/sweet_aoc.h, reads only), Trusty TIPC GET_STATE of patch 0375 (bsd/dev/sweet_tipc.h) and the AOC firmware load of patch 0376 (bsd/dev/sweet_aoc_load.h) against fakes
+	# a 4th field names a later patch whose hunk for the same file is applied on top (0377 extends sweet_tipc.h); 0377 adds the A8 start (bsd/dev/sweet_aoc_start.h)
+	# 0378 (A9) changes sweet_aoc_start.h (the ssmt kept count) and adds sweet_audio.h (AOC queue I/O + commands) and sweet_cs_dsp.h (HALO file parser, read by aoc_audio_host_test)
+	awk '$0=="+++ b/bsd/dev/sweet_cs_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0378-aoc-audio.patch > $O/sweet_cs_dsp.h
+	for hp in "0374-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0375-trusty-tipc:sweet_tipc.h:tipc_host_test:0377-aoc-start" "0376-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0377-aoc-start:sweet_aoc_start.h:aoc_start_host_test:0378-aoc-audio" "0378-aoc-audio:sweet_audio.h:aoc_audio_host_test:0379-aoc-playback+0380-aoc-reply-match+0384-amp-tone"; do
+		IFS=: read -r hpp hph hpt hpx <<<"$hp"
+		awk -v f="+++ b/bsd/dev/$hph" '$0==f{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/$hpp.patch > $O/$hph
+		for px in ${hpx//+/ }; do     # several later patches joined by + are applied in order (0380 on top of 0379)
+			rm -rf $O/hpx && mkdir -p $O/hpx/bsd/dev && cp $O/$hph $O/hpx/bsd/dev/$hph
+			awk -v f="diff --git a/bsd/dev/$hph b/bsd/dev/$hph" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$px.patch > $O/hpx/p.diff
+			chk "$hpt: $px applied to $hph" sh -c "cd $O/hpx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/$hph ../$hph"
+		done
+		chk "$hpt (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/$hpt $hpt.c
+		chk "$hpt" $O/$hpt
+		chk "${hpt}_asan (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -I$O -o $O/${hpt}_asan $hpt.c
+		chk "${hpt}_asan" $O/${hpt}_asan
+	done
+	# /dev/sweetaudio FIFO of xnu patch 0385 (new-file hunk of bsd/dev/sweet_audio_fifo.h): threshold, underrun, play-out, wrap, gain clamp
+	awk '$0=="+++ b/bsd/dev/sweet_audio_fifo.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0385-aoc-sweetaudio-dev.patch > $O/sweet_audio_fifo.h
+	for px in 0393-sweetaudio-ep1 0394-sweetaudio-polish; do      # later gain changes (0393: -15/-6 dB; 0394: -6/0 dB + -3 dBFS clamp)
+		rm -rf $O/hpx && mkdir -p $O/hpx/bsd/dev && cp $O/sweet_audio_fifo.h $O/hpx/bsd/dev/sweet_audio_fifo.h
+		awk -v f="diff --git a/bsd/dev/sweet_audio_fifo.h b/bsd/dev/sweet_audio_fifo.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$px.patch > $O/hpx/p.diff
+		chk "audio_fifo_host_test: $px applied" sh -c "cd $O/hpx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_audio_fifo.h ../sweet_audio_fifo.h"
+	done
+	chk "audio_fifo_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -Werror -I$O -o $O/audio_fifo_host_test audio_fifo_host_test.c
+	chk "audio_fifo_host_test" $O/audio_fifo_host_test
+	# CS35L41 identify + B2 probe writes of xnu patch 0373 (new-file hunk of bsd/dev/sweet_amp.h): against the A1 fake SoC + two fake amps (the 12 stock writes in order, never PWR_CTRL1; A7 OTP unpack vs the Linux logic, + sweet_amp_otp.h)
+	awk '$0=="+++ b/bsd/dev/sweet_amp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0373-sweet-amp-init.patch > $O/sweet_amp.h
+	awk '$0=="+++ b/bsd/dev/sweet_amp_otp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0373-sweet-amp-init.patch > $O/sweet_amp_otp.h
+	# patches 0378 (A9b: TDM config rows, PLL read, AOC callbacks), 0379 (sweetaoc=5: joint L/R poll), 0381 (sweetaoc=6: DSP allowlist, bursts, A9e hook) and
+	# 0384 (sweetaoc=7: armed power words, PWR_CTRL1 only through them, A10 hook) extend sweet_amp.h: their hunks are applied on top, in order
+	rm -rf $O/ampx && mkdir -p $O/ampx/bsd/dev && cp $O/sweet_amp.h $O/ampx/bsd/dev/sweet_amp.h
+	for px in 0378-aoc-audio 0379-aoc-playback 0381-amp-dsp-load 0384-amp-tone; do
+		awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$px.patch > $O/ampx/p.diff
+		chk "amp_xnu_host_test: $px applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
+	done
+	awk '$0=="+++ b/bsd/dev/sweet_amp_pwr.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0384-amp-tone.patch > $O/sweet_amp_pwr.h
+	awk '$0=="+++ b/bsd/dev/sweet_amp_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0381-amp-dsp-load.patch > $O/sweet_amp_dsp.h
+	# patches 0382 (A9f: bursts of <= 480 bytes, failure detail line) and 0383 (A9g: MPU read-back logged, start / run stage line) change sweet_amp_dsp.h
+	rm -rf $O/ampd && mkdir -p $O/ampd/bsd/dev && cp $O/sweet_amp_dsp.h $O/ampd/bsd/dev/sweet_amp_dsp.h
+	for px in 0382-amp-dsp-chunk 0383-amp-dsp-mpu; do
+		awk -v f="diff --git a/bsd/dev/sweet_amp_dsp.h b/bsd/dev/sweet_amp_dsp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$px.patch > $O/ampd/p.diff
+		chk "amp_xnu_host_test: $px applied to sweet_amp_dsp.h" sh -c "cd $O/ampd && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_amp_dsp.h ../sweet_amp_dsp.h"
+	done
+	chk "amp_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I$O -o $O/amp_xnu_host_test amp_xnu_host_test.c
+	chk "amp_xnu_host_test" $O/amp_xnu_host_test
+	chk "amp_xnu_asan_host_test (compile)" gcc -O1 -g -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=all -I$O -o $O/amp_xnu_asan_host_test amp_xnu_host_test.c
+	chk "amp_xnu_asan_host_test" $O/amp_xnu_asan_host_test
+	# every listed mutant of the amp header must fail the host test
+	chk "amp_xnu_mutants" "$PYTHON" ../tools/amp_xnu_mutants.py
 	# the inputs may have been edited while the tests ran: stamp only if the digest is unchanged (otherwise the next build runs them again)
 	if [ -n "$ht_filter" ]; then echo "host tests: filtered by '$ht_filter', no stamp"; npass=$(grep -c . "$O/host-tests.list" 2>/dev/null || echo 0); echo "RESULT: PASS host tests matching '$ht_filter' ($npass test binaries listed)"; exit 0; fi
 	if [ "$(htdigest)" = "$ht" ]; then mkdir -p "$htdir" && : >"$htdir/$ht.ok.$$" && mv -f "$htdir/$ht.ok.$$" "$htdir/$ht.ok"; else echo "host tests: inputs changed while they ran, no stamp"; fi

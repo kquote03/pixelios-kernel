@@ -1,0 +1,224 @@
+SWEET AMP DSP MPU (patch 0383, plan A9g), on top of 0382 (boot-arg sweetaoc=6 + sweetamp=1): run a9f loaded and read back the wmfw + .bin on
+both amps, then stopped L in the MPU step of amp_dsp_start with no detail. The MPU sequence and the 20 access words match stock exactly
+(AMP wm_adsp.c:3098-3126, :246-265; Linux v6.18 cs_dsp.c:2626-2655, :219-245; cs35l41.h:365-391; lock_regions 0xFFFFFFFF cs35l41.c:3728),
+and every pair is in the write allowlist. The one non-stock step was ours: the 20 words were read back and compared to 0xFFFFFFFF, which
+neither driver does (the words are readable + volatile, cs35l41-tables.c:433-459, :716, but only the VIO words are ever read, wm_adsp.c:4486,
+:4515). sweet_amp_dsp.h: the read-back is now a logged value ("SWEET AMP DSP: L|R mpu rb 20/20 not-ffffffff=N [first REG=VAL]"), not a stop;
+a refused (allowlist) or failed (SPI / CS) write or read still stops, and a failed write after the unlock sends LOCK_CONFIG := 0 once (the
+stock lock value) so the MPU is not left unlocked. Every start / run stage stop now prints "SWEET AMP DSP: L|R step=<sub-step> reg=R w=W
+r=V e=0|1|2|ref pwr1=P" (pre-checks, unlock1/2, access, lock, access-read, ccm-start, ccm-en, mbox2-read, hb0-read, hb-read/wN,
+hb-still/wN, post-*/wN). Nothing else written to the amps changes; PWR_CTRL1 stays refused; no mailbox command. No Linux code copied.
+Host test shim/amp_xnu_host_test.c (MPU words reading back other values: logged, core started, pass line; detail lines). BUILT, UNRUN.
+
+diff --git a/bsd/dev/sweet_amp_dsp.h b/bsd/dev/sweet_amp_dsp.h
+index b461ff9..c20d133 100644
+--- a/bsd/dev/sweet_amp_dsp.h
++++ b/bsd/dev/sweet_amp_dsp.h
+@@ -191,7 +191,13 @@ struct amp_dsp_side {
+ 	/* patch 0382: why the failing region / block stopped: fk 1 = SPI write burst, 2 = SPI read burst (fe = AMP_TIMEOUT / AMP_ERROR), 3 = read-back
+ 	 * mismatch; foff = byte offset in the region (the burst start, or the first differing byte), fn = region length, fexp / fgot = the 32-bit word */
+ 	int fk, fe; uint32_t foff, fn, fexp, fgot;
++	/* patch 0383: the last start / run stage stop: sub-step, register, value written (0 = a read), value read, error (AMP_TIMEOUT / AMP_ERROR,
++	 * AMP_DSP_REFUSED = refused by the write allowlist, no frame sent; 0 = a value check) */
++	const char *sstep; uint32_t sreg, sw, sr; int se;
++	/* patch 0383: the 20 MPU access words read after LOCK_CONFIG := 0 (logged, not compared: stock never reads them, see amp_dsp_start) */
++	unsigned mpu_rb, mpu_bad; uint32_t mpu_reg, mpu_got;
+ };
++#define AMP_DSP_REFUSED	(-1)
+ static struct amp_dsp_res { int ran; struct amp_dsp_side a[2]; } amp_dsp_res;
+ static struct amp_dsp_fw amp_dsp_fw_in;		/* set by the glue from AMPFW (container checked); all 0 = no files */
+ static struct swcd_file amp_dsp_pf;
+@@ -400,7 +406,32 @@ static int amp_dsp_load(const struct amp_snap *s, int cs, struct amp_dsp_side *d
+ 	return AMP_OK;
+ }
+ 
+-/* wm_halo_configure_mpu, then wm_halo_start_core; d->started is set before the CCM write is attempted (the stop then runs on every path) */
++/* patch 0383: record why a start / run stage stopped (the detail line of amp_dsp_verdict); returns e, or AMP_ERROR for a value check (e 0) */
++static int amp_dsp_sfail(struct amp_dsp_side *d, const char *step, uint32_t reg, uint32_t w, uint32_t r, int e)
++{
++	d->sstep = step; d->sreg = reg; d->sw = w; d->sr = r; d->se = e;
++	return e ? e : AMP_ERROR;
++}
++
++/* patch 0383: one start-stage control write; a pair the allowlist refuses is named as refused (amp_write would refuse it too, with no frame) */
++static int amp_dsp_sw(const struct amp_snap *s, int cs, struct amp_dsp_side *d, const char *step, uint32_t reg, uint32_t val)
++{
++	int e;
++
++	if (!amp_write_ok(reg, val))
++		return amp_dsp_sfail(d, step, reg, val, 0u, AMP_DSP_REFUSED);
++	e = amp_write(s, cs, reg, val);
++	return e == AMP_OK ? AMP_OK : amp_dsp_sfail(d, step, reg, val, 0u, e);
++}
++
++/* wm_halo_configure_mpu, then wm_halo_start_core; d->started is set before the CCM write is attempted (the stop then runs on every path).
++ * MPU (AMP wm_adsp.c:3098-3126 = Linux v6.18 cs_dsp.c:2626-2655): LOCK_CONFIG 0x2BC3140 := 0x5555, 0xAAAA; XMEM, YMEM, WINDOW, XREG, YREG
++ * ACCESS_0..3 (the 20 words of amp_dsp_mpu_off, AMP wm_adsp.c:246-265, cs35l41.h:365-384) := 0xFFFFFFFF (X/YMEM fixed, the rest lock_regions =
++ * 0xFFFFFFFF, AMP cs35l41.c:3728); LOCK_CONFIG := 0; one regmap_multi_reg_write, no read-back. The words are readable and volatile (AMP
++ * cs35l41-tables.c:433-459, :716 CCM_CORE_CTRL..WDT_STATUS) but neither driver ever reads them (only the VIO words, wm_adsp.c:4486, :4515).
++ * Run a9f stopped L here with no detail; the read-back compare was ours, not stock: now the words are read and logged (mpu rb line), a
++ * mismatch does not stop. A refused / failed write or a failed read still stops; after a failed write past the unlock LOCK_CONFIG := 0 is
++ * sent once (the stock lock value) so the MPU is not left unlocked. */
+ static int amp_dsp_start(const struct amp_snap *s, int cs, struct amp_dsp_side *d)
+ {
+ 	uint32_t rb = 0, i;
+@@ -408,44 +439,59 @@ static int amp_dsp_start(const struct amp_snap *s, int cs, struct amp_dsp_side *
+ 
+ 	d->stage = DS_MPU;
+ 	e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1);
++	if (e != AMP_OK)
++		return amp_dsp_sfail(d, "st1-read", AMP_REG_IRQ1_STATUS1, 0u, d->st1, e);
++	e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
++	if (e != AMP_OK)
++		return amp_dsp_sfail(d, "pwr1-read", AMP_REG_PWR_CTRL1, 0u, d->pwr1, e);
++	if (d->st1 & AMP_ERR_BITS)
++		return amp_dsp_sfail(d, "st1-err", AMP_REG_IRQ1_STATUS1, 0u, d->st1, 0);
++	if (d->pwr1 & AMP_GLOBAL_EN)
++		return amp_dsp_sfail(d, "global-en", AMP_REG_PWR_CTRL1, 0u, d->pwr1, 0);
++	e = amp_dsp_sw(s, cs, d, "unlock1", AMP_DSP_MPU_LOCK, 0x5555u);
+ 	if (e == AMP_OK)
+-		e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1);
+-	if (e != AMP_OK || (d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))
+-		return AMP_ERROR;
+-	e = amp_dsp_w1(s, cs, AMP_DSP_MPU_LOCK, 0x5555u, 0);
+-	if (e == AMP_OK)
+-		e = amp_dsp_w1(s, cs, AMP_DSP_MPU_LOCK, 0xAAAAu, 0);
++		e = amp_dsp_sw(s, cs, d, "unlock2", AMP_DSP_MPU_LOCK, 0xAAAAu);
+ 	for (i = 0; e == AMP_OK && i < 20u; i++)
+-		e = amp_dsp_w1(s, cs, AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], 0xFFFFFFFFu, 0);
++		e = amp_dsp_sw(s, cs, d, "access", AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], 0xFFFFFFFFu);
+ 	if (e == AMP_OK)
+-		e = amp_dsp_w1(s, cs, AMP_DSP_MPU_LOCK, 0u, 0);
+-	for (i = 0; e == AMP_OK && i < 20u; i++) {
+-		e = amp_read(s, cs, AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], &rb);
+-		if (e == AMP_OK && rb != 0xFFFFFFFFu)
+-			e = AMP_ERROR;
+-	}
++		e = amp_dsp_sw(s, cs, d, "lock", AMP_DSP_MPU_LOCK, 0u);
++	else
++		(void)amp_write(s, cs, AMP_DSP_MPU_LOCK, 0u);	/* relock after a failed unlock / access write (best effort, the detail is kept) */
+ 	if (e != AMP_OK)
+ 		return e;
++	for (i = 0; i < 20u; i++) {
++		e = amp_read(s, cs, AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], &rb);
++		if (e != AMP_OK)
++			return amp_dsp_sfail(d, "access-read", AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i], 0xFFFFFFFFu, rb, e);
++		d->mpu_rb++;
++		if (rb != 0xFFFFFFFFu && !d->mpu_bad++) {
++			d->mpu_reg = AMP_DSP_MPU_BASE + amp_dsp_mpu_off[i];
++			d->mpu_got = rb;
++		}
++	}
+ 	d->stage = DS_START;
+ 	d->started = 1;
+ 	e = amp_dsp_rmw(s, cs, AMP_DSP_CCM, AMP_DSP_CORE_RESET | AMP_DSP_CORE_EN, AMP_DSP_CORE_RESET | AMP_DSP_CORE_EN, &d->ccm);
+-	if (e == AMP_OK && !(d->ccm & AMP_DSP_CORE_EN))
+-		e = AMP_ERROR;
+-	if (e == AMP_OK)
+-		e = amp_read(s, cs, AMP_DSP_MBOX2, &d->mbox2);
+-	if (e == AMP_OK)
+-		e = amp_read(s, cs, d->hb_reg, &d->hb0);
++	if (e != AMP_OK)
++		return amp_dsp_sfail(d, "ccm-start", AMP_DSP_CCM, AMP_DSP_CORE_RESET | AMP_DSP_CORE_EN, d->ccm, e);
++	if (!(d->ccm & AMP_DSP_CORE_EN))
++		return amp_dsp_sfail(d, "ccm-en", AMP_DSP_CCM, AMP_DSP_CORE_RESET | AMP_DSP_CORE_EN, d->ccm, 0);
++	e = amp_read(s, cs, AMP_DSP_MBOX2, &d->mbox2);
++	if (e != AMP_OK)
++		return amp_dsp_sfail(d, "mbox2-read", AMP_DSP_MBOX2, 0u, d->mbox2, e);
++	e = amp_read(s, cs, d->hb_reg, &d->hb0);
+ 	d->hb = d->hb0;
+-	if (e == AMP_OK)
+-		d->stage = DS_NOHB;
+-	return e;
++	if (e != AMP_OK)
++		return amp_dsp_sfail(d, "hb0-read", d->hb_reg, 0u, d->hb0, e);
++	d->stage = DS_NOHB;
++	return AMP_OK;
+ }
+ 
+ /* one heartbeat window on both started amps: <= AMP_DSP_HB_POLLS x 1 ms (tick each ms if given), stops once every started amp moved */
+ static void amp_dsp_window(const struct amp_snap *s, int win, void (*tick)(void *), void *ctx)
+ {
+ 	unsigned p;
+-	int cs, more;
++	int cs, more, e;
+ 
+ 	for (p = 0; p < AMP_DSP_HB_POLLS; p++) {
+ 		more = 0;
+@@ -461,7 +507,8 @@ static void amp_dsp_window(const struct amp_snap *s, int win, void (*tick)(void
+ 			if (d->stage != DS_NOHB)
+ 				continue;
+ 			d->polls++;
+-			if (amp_read(s, cs, d->hb_reg, &d->hb) != AMP_OK) {
++			if ((e = amp_read(s, cs, d->hb_reg, &d->hb)) != AMP_OK) {
++				(void)amp_dsp_sfail(d, win == 1 ? "hb-read/w1" : "hb-read/w2", d->hb_reg, 0u, d->hb, e);
+ 				d->stage = DS_ERR;
+ 				continue;
+ 			}
+@@ -473,11 +520,21 @@ static void amp_dsp_window(const struct amp_snap *s, int win, void (*tick)(void
+ 	}
+ 	for (cs = 0; cs < 2; cs++) {	/* after the window: no error bit, GLOBAL_EN still 0 */
+ 		struct amp_dsp_side *d = &amp_dsp_res.a[cs];
++		const int w1 = win == 1;
+ 
+ 		if (!d->started || d->stage == DS_ERR)
+ 			continue;
+-		if (amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1) != AMP_OK || amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1) != AMP_OK ||
+-		    (d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))
++		if (d->stage == DS_NOHB)	/* patch 0383: not a stop yet (window 2 follows), the detail of a heartbeat that never moved */
++			(void)amp_dsp_sfail(d, w1 ? "hb-still/w1" : "hb-still/w2", d->hb_reg, d->hb0, d->hb, 0);
++		if ((e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1)) != AMP_OK)
++			(void)amp_dsp_sfail(d, w1 ? "post-st1-read/w1" : "post-st1-read/w2", AMP_REG_IRQ1_STATUS1, 0u, d->st1, e);
++		else if ((e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1)) != AMP_OK)
++			(void)amp_dsp_sfail(d, w1 ? "post-pwr1-read/w1" : "post-pwr1-read/w2", AMP_REG_PWR_CTRL1, 0u, d->pwr1, e);
++		else if (d->st1 & AMP_ERR_BITS)
++			(void)amp_dsp_sfail(d, w1 ? "post-st1-err/w1" : "post-st1-err/w2", AMP_REG_IRQ1_STATUS1, 0u, d->st1, 0);
++		else if (d->pwr1 & AMP_GLOBAL_EN)
++			(void)amp_dsp_sfail(d, w1 ? "post-global-en/w1" : "post-global-en/w2", AMP_REG_PWR_CTRL1, 0u, d->pwr1, 0);
++		if (e != AMP_OK || (d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))
+ 			d->stage = DS_ERR;
+ 	}
+ }
+@@ -567,6 +624,42 @@ static void amp_dsp_verdict(int restored)
+ 
+ 	amp_dsp_line("L", l);
+ 	amp_dsp_line("R", r);
++	for (int a = 0; a < 2; a++) {	/* patch 0383: the MPU read-back words (logged values) and the start / run stage detail of each amp */
++		const struct amp_dsp_side *f = &amp_dsp_res.a[a];
++
++		if (f->mpu_rb) {
++			p = put_txt(line, sizeof(line), 0, a ? "AMP DSP: R mpu rb " : "AMP DSP: L mpu rb ");
++			p = put_dec(line, sizeof(line), p, f->mpu_rb);
++			p = put_txt(line, sizeof(line), p, "/20 not-ffffffff=");
++			p = put_dec(line, sizeof(line), p, f->mpu_bad);
++			if (f->mpu_bad) {
++				p = put_txt(line, sizeof(line), p, " first ");
++				p = put_hex(line, sizeof(line), p, f->mpu_reg, 8);
++				p = put_txt(line, sizeof(line), p, "=");
++				p = put_hex(line, sizeof(line), p, f->mpu_got, 8);
++			}
++			emit("SWEET", line, p);
++		}
++		if (!f->sstep)
++			continue;
++		/* <= 88 of RAMLOG_LINE_MAX 96: e=0 a value check, 1 timeout, 2 error (SPI / CS), ref = refused by the allowlist */
++		p = put_txt(line, sizeof(line), 0, a ? "AMP DSP: R step=" : "AMP DSP: L step=");
++		p = put_txt(line, sizeof(line), p, f->sstep);
++		p = put_txt(line, sizeof(line), p, " reg=");
++		p = put_hex(line, sizeof(line), p, f->sreg, 8);
++		p = put_txt(line, sizeof(line), p, " w=");
++		p = put_hex(line, sizeof(line), p, f->sw, 8);
++		p = put_txt(line, sizeof(line), p, " r=");
++		p = put_hex(line, sizeof(line), p, f->sr, 8);
++		p = put_txt(line, sizeof(line), p, " e=");
++		if (f->se == AMP_DSP_REFUSED)
++			p = put_txt(line, sizeof(line), p, "ref");
++		else
++			p = put_dec(line, sizeof(line), p, (uint32_t)f->se);
++		p = put_txt(line, sizeof(line), p, " pwr1=");
++		p = put_hex(line, sizeof(line), p, f->pwr1, 8);
++		emit("SWEET", line, p);
++	}
+ 	if (l->stage == DS_RUN && r->stage == DS_RUN && l->stop_ok && r->stop_ok && restored && l->fw_id == r->fw_id && l->fw_ver == r->fw_ver) {
+ 		p = put_txt(line, sizeof(line), 0, "AMP DSP: fw loaded l,r (id ");
+ 		p = put_hexmin(line, sizeof(line), p, l->fw_id);

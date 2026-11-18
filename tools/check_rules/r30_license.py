@@ -9,7 +9,7 @@ from .lib import Finding
 RULE = "R30"
 MAP = "tools/license-map.txt"
 ALLOWED = {"MIT", "ISC", "APSL-2.0", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0"}
-ALLOWED_AT = {"GPL-2.0-only": {"xnu/patches/0158-*"}}	# only the CS35L41 OTP maps (user 2026-11-16, THIRD_PARTY row 22)
+ALLOWED_AT = {"GPL-2.0-only": {"xnu/patches/0373-*"}}	# only the CS35L41 OTP maps (user 2026-11-16, THIRD_PARTY row 22)
 # forbidden tracked material (AGENTS.md rule 4): firmware / Apple payloads / secrets, by basename; ALLOW_TRACKED_BINARY is the exception list (empty)
 FORBIDDEN_NAMES = ["*.img", "*.bin", "*.ipsw", "*.dmg", "*.im4p", "*.im4m", "*.img4", "*.ota", "*.mbn", "*.pem", "*.key", "*.p12",
                    "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", ".env", ".env.*", "*.env", "dyld_shared_cache*", "kernelcache*"]

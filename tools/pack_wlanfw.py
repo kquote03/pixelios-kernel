@@ -9,8 +9,6 @@ Layout (little endian; every offset is 8-byte aligned; the blobs stay outside gi
   0x0c  u32   count
   0x10  entry[count] { char tag[4]; u32 length; u32 offset (from container start); u32 crc32 (zlib) }
 Tags: "FW  ", "NVRM", "CLM ". The container is appended to the boot payload by mkpayload.py --wlanfw.
-The same layout with another magic and tag set carries GPU job captures (tools/pack_gpujob.py, magic "GPUJOBS1", tag "GPUJ");
-pack_container/parse_container are the shared implementation.
 """
 import argparse, struct, sys, zlib
 

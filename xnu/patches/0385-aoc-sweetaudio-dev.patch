@@ -1,0 +1,751 @@
+SWEET AUDIO DEV (patch 0385, plan A11), on top of 0384 (boot-arg sweetaoc=8 + sweetamp=1). USER DECISION 2026-11-18 ("ignore safety checks for
+now. Let's get to something usable in iOS ASAP"). As sweetaoc=7 (HALO load + start, AOC stream, the stock CS35L41 power-up of sweet_amp_pwr.h), but
+without the 75 s delay and, in place of the 5.4 s tone window, a service loop (sweet_amp_pwr.h amp_pwr_serve -> sweet_aoc_start.c swau_cb_serve):
+/dev/sweetaudio (contract audio/sweetaudio/sweetaudio_dev.h, copied as bsd/dev/sweetaudio_dev.h; doc 54 s.4): root:wheel 0666, one writer (EBUSY),
+48 kHz 2 ch S16LE, non-blocking write into an 8192-frame FIFO (sweet_audio_fifo.h), drain from 960 frames and after each underrun, underrun =
+silence, close plays out, ioctls INFO / POS / GAIN (software scale in 1 dB steps, clamped to [-96 dB, -10 dB], default -20 dB) / FLUSH. The AOC
+feed of 0379 (swau_feed, every 1 ms, only what the AOC consumed) takes its PCM from the FIFO (swau_ring.pull) and pads with silence. Kernel
+self-test right after the power-up through the same FIFO: 2 beeps (1 kHz, 0.5 s on / off, -10 dBFS PCM x -20 dB = -30 dBFS as 0384). Amps stay
+on (fed silence) until a software reset: sweet_restart.c calls sweet_audio_stop_hook before sweet_machine_reset (timer, remote, reboot(2); not
+panic), which stops the loop and waits <= 1 s (counter) for the 0384 stock power-down + DSP stop + AOC close + amp restore. No amp register
+access while serving (gpp23 shared with the touch CS, 0378): the 0384 IRQ1_STATUS1 checks of the tone window are left out. Lines "SWEET AUDIO:
+a11: ...", "SWEET AUDIO: dev open/close ...". Host test: shim/audio_fifo_host_test.c (FIFO, start threshold, underrun, close play-out, gain).
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+index 3b628d3..a86ddaf 100644
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -161,6 +161,13 @@ sweet_amp_tone_arm(void (*tone)(void *, int))
+ {
+ 	sa_tone = tone;
+ }
++/* patch 0385 (sweetaoc=8): arm the /dev/sweetaudio service loop in place of the tone window (sweet_amp_pwr.h amp_pwr_serve); NULL = 0384 */
++void sweet_amp_serve_arm(unsigned (*serve)(void *));
++void
++sweet_amp_serve_arm(unsigned (*serve)(void *))
++{
++	amp_pwr_serve = serve;
++}
+ 
+ /* patch 0381 (plan A9e, sweetaoc=6): arm the HALO DSP firmware load for the next sweet_amp_audio_run. The files come from /chosen/memory-map
+  * AMPFW <pa, size> (tools/mkpayload.py --ampfw, container tools/pack_ampfw.py), read through ml_static_ptovirt as AOCFW (patch 0376); the
+diff --git a/bsd/dev/sweet_amp_pwr.h b/bsd/dev/sweet_amp_pwr.h
+index 8c5a877..180c857 100644
+--- a/bsd/dev/sweet_amp_pwr.h
++++ b/bsd/dev/sweet_amp_pwr.h
+@@ -52,6 +52,10 @@ struct amp_pwr_side {
+ 	unsigned pup_polls, pll_polls;
+ };
+ static struct amp_pwr_res { int ran, up, errstop; unsigned tone_ms; struct amp_pwr_side a[2]; } amp_pwr_res;
++/* patch 0385 (sweetaoc=8): non-NULL replaces the tone window: called once after the power-up passed, runs the glue's /dev/sweetaudio feed
++ * until the glue stops it (shutdown hook / ring failure), returns the ms it ran. No amp register access while it runs (the SPI pad gpp23 is
++ * shared with the touch chip select, patch 0378): the IRQ1_STATUS1 checks of the 0384 window are left out; the power-down follows. */
++static unsigned (*amp_pwr_serve)(void *ctx);
+ 
+ /* one armed write (the only way PWR_CTRL1 and the other power words pass amp_write_ok) */
+ static int amp_pwr_w(const struct amp_snap *s, int cs, uint32_t reg, uint32_t val)
+@@ -329,7 +333,9 @@ static void amp_pwr_run(const struct amp_snap *s)
+ 		p = put_txt(line, sizeof(line), p, ", powering down");
+ 	}
+ 	emit("SWEET", line, p);
+-	if (amp_pwr_res.up) {
++	if (amp_pwr_res.up && amp_pwr_serve) {
++		amp_pwr_res.tone_ms = amp_pwr_serve(amp_a9_cb.ctx);	/* patch 0385 */
++	} else if (amp_pwr_res.up) {
+ 		if (amp_a9_cb.tone)
+ 			amp_a9_cb.tone(amp_a9_cb.ctx, 1);
+ 		for (ms = 0; ms < AMP_TONE_MS; ms++) {
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index ee24159..dd44195 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -127,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 8) {
++		sweet_aoc_audio_mode = 8;   /* patch 0385: as 7, but the amps stay on and /dev/sweetaudio feeds the AOC ring until shutdown */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 7) {
+ 		sweet_aoc_audio_mode = 7;   /* patch 0384, step A10: as 6, plus the amp power-up, a 5 s tone (three beeps) and the power-down */
+ 		sweet_aoc_load_start3();
+@@ -156,7 +161,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6, 7), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6, 7, 8), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index 2d2a2a2..077fdf7 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -257,6 +257,305 @@ swau_cb_tone(__unused void *ctx, int on)
+ /* patch 0384: the tone starts this long after "online" (run a9g: online at +117 s, lock screen at +123 s -> tone near +195 s) */
+ #define SWAU_TONE_DELAY_S 75u
+ 
++/* ---- patch 0385 (sweetaoc=8): /dev/sweetaudio (contract sweetaudio_dev.h = audio/sweetaudio/sweetaudio_dev.h, doc 54 s.4). The 0384
++ * power-up runs once; then, instead of the tone window, swau_cb_serve feeds the AOC ring each ms from the FIFO (sweet_audio_fifo.h) until a
++ * software reset asks it to stop (sweet_restart.c sweet_audio_stop_hook) or the ring fails; then the 0384 power-down + restore. The node is
++ * made once the amps are on; open before that = ENOENT, after the path went down = ENXIO, write after = EIO. Kernel self-test right after
++ * the power-up through the same FIFO: 2 beeps (1 kHz, 0.5 s on / 0.5 s off, -10 dBFS PCM x the -20 dB default gain = -30 dBFS as 0384). ---- */
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <mach/mach_time.h>
++#include "sweetaudio_dev.h"
++#include "sweet_audio_fifo.h"
++
++extern void (*sweet_audio_stop_hook)(void);     /* sweet_restart.c (patch 0385) */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_amp_serve_arm(unsigned (*serve)(void *));     /* sweet_amp.c (patch 0385) */
++#endif
++static LCK_GRP_DECLARE(swau_dev_grp, "sweetaudio");
++static LCK_MTX_DECLARE(swau_dev_mtx, &swau_dev_grp);
++static struct swau_fifo swau_ff;
++static int swau_dev_major = -1;
++static volatile int swau_dev_up, swau_dev_down, swau_stop_req, swau_amp_done;
++static int swau_dev_writer;                     /* 0 none, 1 a user writer, 2 the kernel self-test */
++static uint32_t swau_dev_opens;
++#define SWAU_ST_FRAMES  72000u                  /* self-test: beeps at [0, 24000) and [48000, 72000) */
++#define SWAU_STOP_WAIT_MS 1000u
++
++static uint32_t
++swau_selftest_word(uint32_t frame)
++{
++	uint16_t v;
++
++	if (frame >= SWAU_ST_FRAMES || ((frame / 24000u) & 1u)) {
++		return 0u;
++	}
++	v = (uint16_t)(int16_t)(swau_sine48[frame % 48u] * 10);  /* peak 10360 = -10.0 dBFS */
++	return (uint32_t)v | (uint32_t)v << 16;
++}
++
++static int
++swau_dev_open(__unused dev_t dev, int flags, __unused int devtype, struct proc *p)
++{
++	int e = 0;
++
++	if (!(flags & FWRITE)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&swau_dev_mtx);
++	if (!swau_dev_up || swau_dev_down) {
++		e = ENXIO;
++	} else if (swau_dev_writer) {
++		e = EBUSY;
++	} else {
++		swau_dev_writer = 1;
++		swau_fifo_reset(&swau_ff);
++		swau_dev_opens++;
++	}
++	lck_mtx_unlock(&swau_dev_mtx);
++	printf("SWEET AUDIO: dev open pid %d -> %d (open #%u)\n", p ? proc_pid(p) : -1, e, swau_dev_opens);
++	return e;
++}
++
++static int
++swau_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, struct proc *p)
++{
++	uint64_t played;
++	uint32_t un, ov, fill;
++
++	lck_mtx_lock(&swau_dev_mtx);
++	if (swau_dev_writer == 1) {
++		swau_dev_writer = 0;
++		swau_ff.closing = 1;
++	}
++	played = swau_ff.played;
++	un = swau_ff.underruns;
++	ov = swau_ff.overruns;
++	fill = swau_fifo_fill(&swau_ff);
++	lck_mtx_unlock(&swau_dev_mtx);
++	printf("SWEET AUDIO: dev close pid %d: played %llu frames, fifo %u, underruns %u, overruns %u, gain %d mdB\n", p ? proc_pid(p) : -1,
++	    played, fill, un, ov, swau_ff.gain_mdb);
++	return 0;
++}
++
++static int
++swau_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint32_t w[256];
++	int e = 0;
++
++	if (uio_resid(uio) % (user_ssize_t)SWAU_BYTES_PER_FRAME) {
++		return EINVAL;
++	}
++	while (uio_resid(uio) > 0) {
++		uint32_t n = (uint32_t)(uio_resid(uio) / SWAU_BYTES_PER_FRAME), room;
++
++		lck_mtx_lock(&swau_dev_mtx);
++		if (swau_dev_down || !swau_dev_up) {
++			lck_mtx_unlock(&swau_dev_mtx);
++			return EIO;
++		}
++		room = SWAU_FIFO_FRAMES - swau_fifo_fill(&swau_ff);
++		if (n > room) {
++			swau_ff.overruns += n - room;
++		}
++		lck_mtx_unlock(&swau_dev_mtx);
++		if (n > room) {
++			n = room;
++		}
++		if (n > 256u) {
++			n = 256u;
++		}
++		if (n == 0u) {
++			break;                          /* FIFO full: what was taken so far is the result (0 = full) */
++		}
++		e = uiomove((caddr_t)w, (int)(n * SWAU_BYTES_PER_FRAME), uio);
++		if (e) {
++			break;
++		}
++		lck_mtx_lock(&swau_dev_mtx);
++		(void)swau_fifo_push(&swau_ff, w, n);   /* the only writer and the feed only frees: room still holds */
++		lck_mtx_unlock(&swau_dev_mtx);
++	}
++	return e;
++}
++
++static int
++swau_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	int e = 0;
++
++	lck_mtx_lock(&swau_dev_mtx);
++	switch (cmd) {
++	case SWAU_IOC_INFO: {
++		struct swau_info *in = (struct swau_info *)(void *)data;
++
++		bzero(in, sizeof(*in));
++		in->version = SWAU_VERSION;
++		in->rate = SWAU_RATE;
++		in->channels = SWAU_CHANNELS;
++		in->bits = 16;
++		in->fifo_frames = SWAU_FIFO_FRAMES;
++		in->start_frames = SWAU_START_FRAMES;
++		in->flags = swau_dev_up && !swau_dev_down ? SWAU_F_PATH_UP : 0u;
++		in->max_gain_mdb = SWAU_MAX_GAIN_MDB;
++		break;
++	}
++	case SWAU_IOC_POS: {
++		struct swau_pos *ps = (struct swau_pos *)(void *)data;
++
++		bzero(ps, sizeof(*ps));
++		ps->frames_played = swau_ff.played;
++		ps->host_time = mach_absolute_time();
++		ps->fifo_fill = swau_fifo_fill(&swau_ff);
++		ps->underruns = swau_ff.underruns;
++		ps->overruns = swau_ff.overruns;
++		break;
++	}
++	case SWAU_IOC_GAIN:
++		swau_fifo_set_gain(&swau_ff, *(int32_t *)(void *)data);
++		break;
++	case SWAU_IOC_FLUSH:
++		swau_fifo_flush(&swau_ff);
++		break;
++	default:
++		e = ENOTTY;
++		break;
++	}
++	lck_mtx_unlock(&swau_dev_mtx);
++	return e;
++}
++
++static const struct cdevsw swau_cdevsw = {
++	.d_open       = swau_dev_open,
++	.d_close      = swau_dev_close,
++	.d_read       = eno_rdwrt,
++	.d_write      = swau_dev_write,
++	.d_ioctl      = swau_dev_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* the AOC feed's PCM source (swau_feed, each ms) */
++static uint32_t
++swau_dev_pull(__unused void *ctx, uint32_t *w, uint32_t n)
++{
++	uint32_t got;
++
++	lck_mtx_lock(&swau_dev_mtx);
++	got = swau_fifo_pull(&swau_ff, w, n);
++	lck_mtx_unlock(&swau_dev_mtx);
++	return got;
++}
++
++/* sweet_restart.c, before a software reset: stop the feed, wait (bounded, counter only) for the 0384 power-down + restore */
++static void
++swau_stop_hook(void)
++{
++	uint64_t t0 = mach_absolute_time(), lim;
++
++	if (!swau_dev_up || swau_amp_done) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)SWAU_STOP_WAIT_MS * NSEC_PER_MSEC, &lim);
++	swau_stop_req = 1;
++	while (!swau_amp_done && mach_absolute_time() - t0 < lim) {
++	}
++	printf("SWEET AUDIO: stop hook: amps %s\n", swau_amp_done ? "off (power-down + restore done)" : "NOT confirmed off within 1 s");
++}
++
++static void
++swau_cb_notone(__unused void *ctx, __unused int on)
++{
++}
++
++/* the service loop (sweet_amp_pwr.h amp_pwr_serve): runs with both amps powered up and the stream running; returns the ms it ran */
++static unsigned
++swau_cb_serve(__unused void *ctx)
++{
++	static const struct swau_bus ab = { swas_ir32, swas_iw32, swas_isync, swau_doorbell, swas_sleep_ms, NULL, NULL };
++	uint64_t t0 = mach_absolute_time(), ns;
++	uint32_t st = 0, errs0 = swau_r.pb.feed_err, bad = 0, st_done = 0, rx0;
++	uint32_t w[256];
++
++	lck_mtx_lock(&swau_dev_mtx);
++	swau_fifo_reset(&swau_ff);
++	swau_dev_writer = 2;                    /* the self-test owns the FIFO first */
++	lck_mtx_unlock(&swau_dev_mtx);
++	swau_r.pb.pull = swau_dev_pull;
++	swau_r.pb.pull_ctx = NULL;
++	(void)swau_counters(&ab, &swau_r.pb.g);
++	rx0 = swau_r.pb.g.rx;
++	if (swau_dev_major < 0) {
++		swau_dev_major = cdevsw_add(-1, &swau_cdevsw);
++		if (swau_dev_major < 0 || devfs_make_node(makedev(swau_dev_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweetaudio") == NULL) {
++			printf("SWEET AUDIO: a11: /dev/sweetaudio NOT made (major %d); self-test only\n", swau_dev_major);
++		}
++	}
++	swau_dev_up = 1;
++	sweet_audio_stop_hook = swau_stop_hook;
++	printf("SWEET AUDIO: a11: /dev/sweetaudio up (major %d, 0666, 48 kHz 2 ch S16LE, fifo %u, start %u, gain %d mdB, max %d mdB); "
++	    "kernel self-test now: 2 beeps 1 kHz 0.5 s on / 0.5 s off\n", swau_dev_major, SWAU_FIFO_FRAMES, SWAU_START_FRAMES, SWAU_DEF_GAIN_MDB,
++	    SWAU_MAX_GAIN_MDB);
++	while (!swau_stop_req) {
++		swas_sleep_ms(NULL, 1u);
++		if (swau_dev_writer == 2 && st < SWAU_ST_FRAMES) {
++			uint32_t n, k;
++
++			lck_mtx_lock(&swau_dev_mtx);
++			n = SWAU_FIFO_FRAMES - swau_fifo_fill(&swau_ff);
++			n = n > 256u ? 256u : n;
++			n = n > SWAU_ST_FRAMES - st ? SWAU_ST_FRAMES - st : n;
++			for (k = 0; k < n; k++) {
++				w[k] = swau_selftest_word(st + k);
++			}
++			st += swau_fifo_push(&swau_ff, w, n);
++			if (st >= SWAU_ST_FRAMES) {
++				swau_dev_writer = 0;    /* user opens allowed from here (an open drops what is left of the test) */
++				swau_ff.closing = 1;
++			}
++			lck_mtx_unlock(&swau_dev_mtx);
++		}
++		swau_feed(&ab, &swau_r);
++		if (!st_done && st >= SWAU_ST_FRAMES && swau_dev_opens == 0u && swau_ff.played >= SWAU_ST_FRAMES) {
++			st_done = 1;
++			(void)swau_counters(&ab, &swau_r.pb.g);
++			printf("SWEET AUDIO: a11: self-test played %llu frames through the FIFO (pcm bytes into the ring %u, AOC consumed %u bytes since up, "
++			    "underruns %u)\n", swau_ff.played, swau_r.pb.pulled, swau_r.pb.g.rx - rx0, swau_ff.underruns);
++		}
++		if (swau_r.pb.feed_err != errs0) {
++			errs0 = swau_r.pb.feed_err;
++			if (++bad >= 100u) {
++				printf("SWEET AUDIO: a11: AOC ring feed failing (%u errors), path down\n", swau_r.pb.feed_err);
++				break;
++			}
++		} else {
++			bad = 0;
++		}
++	}
++	lck_mtx_lock(&swau_dev_mtx);
++	swau_dev_down = 1;
++	lck_mtx_unlock(&swau_dev_mtx);
++	swau_r.pb.pull = NULL;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	(void)swau_counters(&ab, &swau_r.pb.g);
++	printf("SWEET AUDIO: a11: serve end (%s) after %llu ms: pcm bytes %u, AOC consumed %u bytes, opens %u; power-down follows\n",
++	    swau_stop_req ? "stop request" : "ring failure", ns / NSEC_PER_MSEC, swau_r.pb.pulled, swau_r.pb.g.rx - rx0, swau_dev_opens);
++	return (unsigned)(ns / NSEC_PER_MSEC);
++}
++
+ static void
+ swau_run(struct swas_res *r, uint32_t image_size)
+ {
+@@ -287,16 +586,21 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 		return;
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	if (sweet_aoc_audio_mode == 6 || sweet_aoc_audio_mode == 7) {
++	if (sweet_aoc_audio_mode >= 6) {
+ 		sweet_amp_dsp_arm();
+ 	}
+-	sweet_amp_tone_arm(sweet_aoc_audio_mode == 7 ? swau_cb_tone : NULL);
++	sweet_amp_tone_arm(sweet_aoc_audio_mode == 7 ? swau_cb_tone : sweet_aoc_audio_mode == 8 ? swau_cb_notone : NULL);
++	sweet_amp_serve_arm(sweet_aoc_audio_mode == 8 ? swau_cb_serve : NULL);       /* patch 0385 */
++	if (sweet_aoc_audio_mode == 8) {
++		printf("SWEET AUDIO: a11: amp run starts now (power-up, then /dev/sweetaudio + self-test 2 beeps, amps on until a software reset)\n");
++	}
+ 	if (sweet_aoc_audio_mode >= 5) {
+ 		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, swau_cb_tick, SWAU_PLAY_POLLS, NULL, out);
+ 	} else {
+ 		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, NULL, 0u, NULL, out);
+ 	}
+ #endif
++	swau_amp_done = 1;      /* patch 0385: the power-down + restore ran (the stop hook waits for this) */
+ 	swas_iunmap(NULL);
+ 	for (i = 0; i < swau_r.nx && i < SWAU_NX; i++) {
+ 		swau_x_line(&swau_r.x[i]);
+@@ -310,7 +614,7 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 		printf("SWEET AUDIO: open rc %d (%s) dsp mode %u bound %u unbound %u close rc %d; amp rc %d a9 %u opened %u cfg %u/%u pll %u/%u flags %#x\n",
+ 		    swau_open_rc, swau_open_rc >= 0 && swau_open_rc < SWAU_NSTOP ? swau_stop_name[swau_open_rc] : "not-run", swau_r.dsp_mode,
+ 		    swau_r.bound, swau_r.unbound, swau_close_rc, arc, out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+-		if (sweet_aoc_audio_mode == 7) {        /* patch 0384 */
++		if (sweet_aoc_audio_mode == 7 || sweet_aoc_audio_mode == 8) {        /* patch 0384 (0385: 8) */
+ 			uint32_t f = out[7];
+ 
+ 			printf("SWEET AUDIO: tone %s %u bytes (consumed %u in the %u ms window), amp on %s, pll %s, amp off %s, errors %s%s\n",
+@@ -384,7 +688,7 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
+-		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 7) {
++		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 8) {
+ 			swau_run(&r, image_size);       /* patch 0378, step A9 (5: + stream, patch 0379) */
+ 		}
+ 		return;
+diff --git a/bsd/dev/sweet_audio.h b/bsd/dev/sweet_audio.h
+index 28522a2..833d261 100644
+--- a/bsd/dev/sweet_audio.h
++++ b/bsd/dev/sweet_audio.h
+@@ -137,6 +137,11 @@ struct swau_ring {
+ 	uint32_t rx0, fed, feeds, feed_err, zeroed, reset;
+ 	/* patch 0384 (sweetaoc=7): tone on; fed at the switch-on (frame 0 of the pattern); beep bytes written; rx at switch on / off */
+ 	uint32_t tone, tone_base, tone_bytes, tone_rx0, tone_rx1;
++	/* patch 0385 (sweetaoc=8): the PCM source of each feed (may be NULL = zeros / tone): up to n frames into w, returns the count; the
++	 * rest of the feed is silence. pulled = PCM bytes written from it. */
++	uint32_t (*pull)(void *ctx, uint32_t *w, uint32_t n);
++	void *pull_ctx;
++	uint32_t pulled;
+ };
+ struct swau_res {
+ 	struct swau_svc s;
+@@ -585,7 +590,8 @@ swau_feed(const struct swau_bus *b, struct swau_res *r)
+ {
+ 	struct swau_ring *p = &r->pb;
+ 	struct swau_region *g = &p->g;
+-	uint32_t used, n, k;
++	uint32_t used, n, k, got = 0;
++	uint32_t pcm[SWAU_FEED_MAX / 4u];       /* patch 0385 */
+ 
+ 	if (!r->started || r->stopped) {
+ 		return;
+@@ -606,8 +612,14 @@ swau_feed(const struct swau_bus *b, struct swau_res *r)
+ 	if (n == 0u) {
+ 		return;
+ 	}
++	if (p->pull) {
++		got = p->pull(p->pull_ctx, pcm, n / 4u);
++		if (got > n / 4u) {
++			got = n / 4u;
++		}
++	}
+ 	for (k = 0; k < n; k += 4u) {
+-		uint32_t w = p->tone ? swau_tone_word((p->fed + k - p->tone_base) / 4u) : 0u;
++		uint32_t w = k / 4u < got ? pcm[k / 4u] : p->tone ? swau_tone_word((p->fed + k - p->tone_base) / 4u) : 0u;
+ 
+ 		if (!b->iw32(b->ctx, g->offset + (g->wp + k) % g->size, w)) {
+ 			p->feed_err++;
+@@ -627,6 +639,7 @@ swau_feed(const struct swau_bus *b, struct swau_res *r)
+ 		p->feed_err++;
+ 	}
+ 	p->fed += n;
++	p->pulled += got * 4u;
+ 	p->feeds++;
+ }
+ 
+diff --git a/bsd/dev/sweet_audio_fifo.h b/bsd/dev/sweet_audio_fifo.h
+new file mode 100644
+index 0000000..0d10848
+--- /dev/null
++++ b/bsd/dev/sweet_audio_fifo.h
+@@ -0,0 +1,144 @@
++/*
++ * /dev/sweetaudio FIFO (patch 0385, sweetaoc=8): pure logic, no locks (the glue in sweet_aoc_start.c holds its mutex around every call).
++ * Contract: audio/sweetaudio/sweetaudio_dev.h and docs/research/54-ios-audio-path.md s.4 (48 kHz, 2 ch S16LE, 1 frame = one 32-bit word, L in
++ * the low half as the AOC EP0 ring of patch 0379/0384). 8192-frame FIFO; the drain starts at 960 queued frames and again after each underrun;
++ * an empty FIFO while draining = underrun (the feed pads with silence); after the writer closed, what is left plays out regardless of the start
++ * threshold. Gain: a software scale applied when frames leave the FIFO, in 1 dB steps, clamped to [-96 dB, SWAU_MAX_GAIN_MDB] (user decision
++ * 2026-11-18: <= -10 dBFS equivalent for now, default -20 dB). Host test: shim/audio_fifo_host_test.c.
++ */
++#ifndef SWEET_AUDIO_FIFO_H
++#define SWEET_AUDIO_FIFO_H
++
++#include <stdint.h>
++
++#ifndef SWAU_FIFO_FRAMES                /* the same values as audio/sweetaudio/sweetaudio_dev.h */
++#define SWAU_FIFO_FRAMES        8192u
++#define SWAU_START_FRAMES       960u
++#endif
++#define SWAU_MAX_GAIN_MDB       (-10000)
++#define SWAU_MIN_GAIN_MDB       (-96000)
++#define SWAU_DEF_GAIN_MDB       (-20000)
++
++struct swau_fifo {
++	uint32_t buf[SWAU_FIFO_FRAMES];
++	uint32_t rd, wr;                /* free-running frame counters; fill = wr - rd */
++	uint32_t draining, closing;     /* closing: the writer is gone, play out what is left */
++	uint64_t played;                /* frames taken out (silence not counted) */
++	uint32_t underruns, overruns;   /* overruns: frames refused */
++	int32_t gain_mdb;
++	uint32_t gain_q16;              /* linear factor * 65536 */
++};
++
++/* 65536 * 10^(-k / 20), k = 0..19 */
++static const uint32_t swau_db_q16[20] = {
++	65536, 58409, 52057, 46396, 41350, 36854, 32846, 29274, 26090, 23253,
++	20724, 18471, 16462, 14672, 13076, 11654, 10387, 9257, 8250, 7353,
++};
++
++static int32_t
++swau_gain_clamp(int32_t mdb)
++{
++	return mdb > SWAU_MAX_GAIN_MDB ? SWAU_MAX_GAIN_MDB : mdb < SWAU_MIN_GAIN_MDB ? SWAU_MIN_GAIN_MDB : mdb;
++}
++
++/* the factor of a clamped gain: rounded to whole dB; -96 dB = 0 (mute) */
++static uint32_t
++swau_gain_q16(int32_t mdb)
++{
++	uint32_t db = (uint32_t)(-(swau_gain_clamp(mdb) - 500) / 1000), q;
++
++	if (db >= 96u) {
++		return 0u;
++	}
++	q = swau_db_q16[db % 20u];
++	for (db /= 20u; db; db--) {
++		q /= 10u;
++	}
++	return q;
++}
++
++static void
++swau_fifo_set_gain(struct swau_fifo *f, int32_t mdb)
++{
++	f->gain_mdb = swau_gain_clamp(mdb);
++	f->gain_q16 = swau_gain_q16(f->gain_mdb);
++}
++
++static void
++swau_fifo_reset(struct swau_fifo *f)
++{
++	f->rd = f->wr = 0;
++	f->draining = f->closing = 0;
++	f->played = 0;
++	f->underruns = f->overruns = 0;
++	swau_fifo_set_gain(f, SWAU_DEF_GAIN_MDB);
++}
++
++static uint32_t
++swau_fifo_fill(const struct swau_fifo *f)
++{
++	return f->wr - f->rd;
++}
++
++/* the writer: copies min(n, free) frames, returns the count; never waits */
++static uint32_t
++swau_fifo_push(struct swau_fifo *f, const uint32_t *w, uint32_t n)
++{
++	uint32_t room = SWAU_FIFO_FRAMES - swau_fifo_fill(f), k;
++
++	if (n > room) {
++		f->overruns += n - room;
++		n = room;
++	}
++	for (k = 0; k < n; k++) {
++		f->buf[(f->wr + k) % SWAU_FIFO_FRAMES] = w[k];
++	}
++	f->wr += n;
++	return n;
++}
++
++static uint32_t
++swau_scale_word(uint32_t w, uint32_t q)
++{
++	int32_t l = (int16_t)(w & 0xFFFFu), r = (int16_t)(w >> 16);
++
++	l = (int32_t)(((int64_t)l * (int64_t)q) >> 16);
++	r = (int32_t)(((int64_t)r * (int64_t)q) >> 16);
++	return ((uint32_t)l & 0xFFFFu) | ((uint32_t)r & 0xFFFFu) << 16;
++}
++
++/* the AOC feed: up to n frames (gain applied) into out; returns the count (the caller pads the rest with silence) */
++static uint32_t
++swau_fifo_pull(struct swau_fifo *f, uint32_t *out, uint32_t n)
++{
++	uint32_t fill = swau_fifo_fill(f), k;
++
++	if (!f->draining) {
++		if (fill == 0u || (fill < SWAU_START_FRAMES && !f->closing)) {
++			return 0u;
++		}
++		f->draining = 1;
++	}
++	if (n > fill) {
++		n = fill;
++		f->draining = 0;                /* empty after this pull: wait for the start threshold again */
++		if (!f->closing) {
++			f->underruns++;
++		}
++	}
++	for (k = 0; k < n; k++) {
++		out[k] = swau_scale_word(f->buf[(f->rd + k) % SWAU_FIFO_FRAMES], f->gain_q16);
++	}
++	f->rd += n;
++	f->played += n;
++	return n;
++}
++
++static void
++swau_fifo_flush(struct swau_fifo *f)
++{
++	f->rd = f->wr;
++	f->draining = 0;
++}
++
++#endif /* SWEET_AUDIO_FIFO_H */
+diff --git a/bsd/dev/sweet_restart.c b/bsd/dev/sweet_restart.c
+index e9cf30d..968edf7 100644
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -121,11 +121,23 @@ sweet_restart_test_park_fail(void)
+ 	sweet_machine_reset_x(1, 1);
+ }
+ 
++/* patch 0385: an audio driver that keeps the speaker amps on (sweetaoc=8) powers them down here before a software reset (not on the panic
++ * types); the hook bounds its own wait. */
++void (*sweet_audio_stop_hook)(void);
++static void
++sweet_pre_reset(void)
++{
++	if (sweet_audio_stop_hook != NULL) {
++		sweet_audio_stop_hook();
++	}
++}
++
+ static int
+ sweet_halt_restart(unsigned int type)
+ {
+ 	switch (type) {
+ 	case SWEET_PE_RESTART:
++		sweet_pre_reset();
+ 		/*
+ 		 * Patch 0140 (docs/HANDOFF.md "OPUS DECISION 2026-10-26 #5", review docs/reviews/0140-restart-cause.md): XNU-requested
+ 		 * resets land in the bootloader (fastboot, no Android detour, ~95 s saved). The USB log line of a reboot(2) is printed
+@@ -164,6 +176,7 @@ sweet_restart_poll(void)
+ 	if (sweet_restart_deadline != 0 && mach_absolute_time() >= sweet_restart_deadline) {
+ 		sweet_restart_deadline = 0;
+ 		printf("SWEET RESTART: resetting now (bootloader=%d)\n", sweet_restart_bl);
++		sweet_pre_reset();
+ 		sweet_machine_reset(sweet_restart_bl);
+ 	}
+ }
+@@ -217,6 +230,7 @@ sweet_thermal_reboot_bootloader(void)
+ 		return -1;
+ 	}
+ 	printf("SWEET RESTART: thermal CRIT: clean stop, then reset to the bootloader (patch 0336)\n");
++	sweet_pre_reset();      /* oriole sweetaudio-dev patch: speaker amps down first (bounded) */
+ 	sweet_clean_stop();
+ 	sweet_machine_reset(1);
+ }
+@@ -256,10 +270,12 @@ sweet_remote_thread(void *arg __unused, wait_result_t wr __unused)
+ 		buf[got] = 0;
+ 		if (strcmp(buf, "SWEET-RESET-BL") == 0) {
+ 			printf("SWEET RESTART: remote reset to bootloader\n");
++			sweet_pre_reset();
+ 			sweet_clean_stop();
+ 			sweet_machine_reset(1);
+ 		} else if (strcmp(buf, "SWEET-RESET") == 0) {
+ 			printf("SWEET RESTART: remote restart\n");
++			sweet_pre_reset();
+ 			sweet_clean_stop();
+ 			sweet_machine_reset(0);
+ 		}
+diff --git a/bsd/dev/sweetaudio_dev.h b/bsd/dev/sweetaudio_dev.h
+new file mode 100644
+index 0000000..e2261db
+--- /dev/null
++++ b/bsd/dev/sweetaudio_dev.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * PixOS /dev/sweetaudio: the kernel <-> userland PCM contract (docs/research/54-ios-audio-path.md).
++ * Shared by the kernel driver (copy this header next to the cdev), the SweetAudio.driver HAL plug-in and sweetaudio_tone.
++ *
++ * Format is fixed: 48000 Hz, 2 channels interleaved (L, R), signed 16-bit little endian. 1 frame = 4 bytes.
++ * open(O_WRONLY): attaches the one writer (second opener: EBUSY). ENXIO when the output path (AOC ring + amps) is not up.
++ * write(): whole frames only (len % 4 != 0: EINVAL). Never blocks: copies min(len, free) bytes into the kernel FIFO and
++ *          returns that count (0 = FIFO full, the caller drops). EIO if the path went down after open.
++ * close(): the FIFO plays out (bounded by its size), then the kernel feeds silence again.
++ */
++#ifndef SWEETAUDIO_DEV_H
++#define SWEETAUDIO_DEV_H
++
++#include <stdint.h>
++#include <sys/ioccom.h>
++
++#define SWAU_DEV_PATH        "/dev/sweetaudio"
++#define SWAU_VERSION         1u
++#define SWAU_RATE            48000u
++#define SWAU_CHANNELS        2u
++#define SWAU_BYTES_PER_FRAME 4u
++#define SWAU_FIFO_FRAMES     8192u   /* kernel FIFO capacity (170.7 ms) */
++#define SWAU_START_FRAMES    960u    /* the kernel starts draining once this much is queued (20 ms); refilled after an underrun */
++
++struct swau_info {                   /* SWAU_IOC_INFO */
++	uint32_t version;                /* SWAU_VERSION */
++	uint32_t rate;                   /* SWAU_RATE */
++	uint16_t channels;               /* SWAU_CHANNELS */
++	uint16_t bits;                   /* 16 */
++	uint32_t fifo_frames;            /* SWAU_FIFO_FRAMES */
++	uint32_t start_frames;           /* SWAU_START_FRAMES */
++	uint32_t flags;                  /* SWAU_F_* */
++	int32_t  max_gain_mdb;           /* kernel gain clamp in milli-dB (<= 0), plan rule A-3 */
++	uint32_t reserved[3];
++};
++#define SWAU_F_PATH_UP   0x1u        /* AOC playback ring + amps running */
++#define SWAU_F_SILENCED  0x2u        /* the kernel discards PCM (safety stop); writes still succeed */
++
++struct swau_pos {                    /* SWAU_IOC_POS */
++	uint64_t frames_played;          /* frames taken from the FIFO by the AOC feed since open (silence not counted) */
++	uint64_t host_time;              /* mach_absolute_time() when frames_played was sampled */
++	uint32_t fifo_fill;              /* frames queued now */
++	uint32_t underruns;              /* FIFO-empty events since open */
++	uint32_t overruns;               /* bytes refused (FIFO full) since open / 4 */
++	uint32_t reserved;
++};
++
++#define SWAU_IOC_INFO     _IOR('a', 1, struct swau_info)
++#define SWAU_IOC_POS      _IOR('a', 2, struct swau_pos)
++#define SWAU_IOC_GAIN     _IOW('a', 3, int32_t)      /* requested gain in milli-dB; clamped to [-96000, max_gain_mdb] */
++#define SWAU_IOC_FLUSH    _IO('a', 4)                /* drop what is queued (HAL StopIO) */
++
++#endif

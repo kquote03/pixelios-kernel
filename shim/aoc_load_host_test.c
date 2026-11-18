@@ -1,4 +1,4 @@
-/* Host test of the AOC firmware load (xnu patch 0164, bsd/dev/sweet_aoc_load.h, sweetaoc=2, plan step A6) against a fake SoC:
+/* Host test of the AOC firmware load (xnu patch 0376, bsd/dev/sweet_aoc_load.h, sweetaoc=2, plan step A6) against a fake SoC:
  * PMU, aoc_req, GSA mailbox and a fake carveout. Every case checks the exact list of register writes: good image, wrong sha,
  * wrong length, bad header (two kinds), body larger than the carveout, AOC domain off, corrupted read-back, GSA error code,
  * undocumented GSA reply, mailbox timeout. After a stop nothing more is written (only the documented restores). SHA-256 is

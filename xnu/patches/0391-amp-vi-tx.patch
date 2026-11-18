@@ -1,0 +1,146 @@
+SWEET AMP VI TX (patch 0391, plan A10g), on top of 0390: boot-arg sweetaoc=13. Run a10f (0390) found zeros in every ASPRX1 slot 0..7 at
+ASP width 32 and 16 on both amps while the AOC consumed the tone: the TDM0 data line carries no PCM although BCLK/FSYNC run (PLL locked).
+The one stock speaker-playback difference left on the amp side: the VI feedback the amps transmit on TDM_0_TX (stock mixer defaults ASP TX1
+VMON / TX2 IMON, slots L 0/2, R 1/3; HAL path "hostless-ulC spk-vi"). This level turns ASPTX1/2 on with those slots, plays a 12 s
+continuous tone with the 0389 ASPRX1 detector and meters every 2 s, then turns TX off and restores. Levels <= 12 unchanged.
+
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+index 28fc18e..9044de5 100644
+--- a/bsd/dev/sweet_amp.h
++++ b/bsd/dev/sweet_amp.h
+@@ -363,12 +363,13 @@ static inline __attribute__((always_inline)) int amp_pwr_reg(uint32_t reg)
+ 	return reg == AMP_REG_PWR_CTRL1 || reg == AMP_PWR_CTRL2 || reg == AMP_PWR_MUTE || reg == AMP_PWR_SPE || reg == AMP_PWR_PCMSRC ||
+ 	       reg == AMP_REG_TEST_KEY || reg == AMP_PWR_PATCH || reg == AMP_PWR_MBOX_CMD || reg == AMP_PWR_MBOX_8 || reg == AMP_REG_IRQ1_STATUS1 ||
+ 	       reg == 0x4808u || reg == 0x4840u || reg == 0x4820u || reg == 0x4C44u || reg == AMP_PWR_GAIN || reg == 0x3808u ||	/* 0388: HAL words */
++	       reg == 0x4C48u || reg == 0x4C4Cu || reg == 0x4810u ||	/* 0391: SP_FRAME_TX_SLOT (v6.18 cs35l41.h:83), the VI feedback slots */
+ 	       reg == 0x4C48u || reg == 0x4C4Cu;	/* 0389: DSP1_RX3_SRC / DSP1_RX4_SRC (Linux v6.18 cs35l41.h:95-96), the data detector */
+ }
+ /* patch 0388: read only for the meter lines: PWR_CTRL3 0x201C, BSTCVRT_VCTRL2 0x3804, DSP1_RX1_SRC 0x4C40 (Linux v6.18 cs35l41.h:38, :64, :93) */
+ #define AMP_HAL_RD(reg) ((reg) == 0x201Cu || (reg) == 0x3804u || (reg) == 0x4C40u || \
+ 	/* patch 0389: read only: VPBR_STATUS 0x640C, VBBR_STATUS 0x6410, VOL_STATUS_TO_DSP 0x6450, NGATE1_SRC 0x4C60, NG_CFG 0x6808 (v6.18 cs35l41.h:101, :106-113) */ \
+-	(reg) == 0x640Cu || (reg) == 0x6410u || (reg) == 0x6450u || (reg) == 0x4C60u || (reg) == 0x6808u)
++	(reg) == 0x640Cu || (reg) == 0x6410u || (reg) == 0x6450u || (reg) == 0x4C60u || (reg) == 0x6808u || (reg) == 0x4C20u || (reg) == 0x4C24u)	/* 0391: + ASP_TX1/2_SRC */
+ static inline __attribute__((always_inline)) int amp_pwr_ok(uint32_t reg, uint32_t val)
+ {
+ 	return amp_pwr_row.on && reg == amp_pwr_row.reg && val == amp_pwr_row.val && amp_pwr_reg(reg);
+diff --git a/bsd/dev/sweet_amp_pwr.h b/bsd/dev/sweet_amp_pwr.h
+index 6ce04e9..54b18cf 100644
+--- a/bsd/dev/sweet_amp_pwr.h
++++ b/bsd/dev/sweet_amp_pwr.h
+@@ -575,11 +575,49 @@ static unsigned amp_pwr_diag4_run(const struct amp_snap *s)
+ 	amp_pwr_diag_snap(s, "end");
+ 	return ms;
+ }
++/* ---- patch 0391 (sweetaoc=13, amp_pwr_diag 5): run a10f found zeros in every ASPRX1 slot (0..7, width 32 and 16). Stock speaker playback
++ * also runs the amps' VI feedback on TDM_0_TX (mixer defaults "ASP TX1 Source" VMON, "ASP TX2 Source" IMON, "ASPTX1 Slot Position" 0 / R 1,
++ * "ASPTX2 Slot Position" 2 / R 3; path "hostless-ulC spk-vi" = NoHost1 TX Mixer TDM_0_TX, sends nothing to the AOC, aoc_alsa_hw.c:1640-1642).
++ * Here: SP_FRAME_TX_SLOT 0x4810 [0x3F3F] := L 0x0200 / R 0x0301, ASP_TX1/2_SRC left at the reset VMON 0x18 / IMON 0x19 (v6.18
++ * cs35l41-lib.c:40-41, read back), SP_TX_WL reset 24 (:37), SP_ENABLES 0x4800 ASPTX1 bit 0 + ASPTX2 bit 1 (cs35l41.c:553-554) on, a
++ * continuous tone (pattern 9), DAC + RX3/RX4 on ASPRX1 (the 0389 detector), meters every 2 s for 12 s (tags T1..T6); then the TX bits off,
++ * the TX slots back to the reset 0x0100, RX3/RX4 VMON/IMON, DAC source DSP. ---- */
++static unsigned amp_pwr_diag5_run(const struct amp_snap *s)
++{
++	static const char *tag[6] = { "T1", "T2", "T3", "T4", "T5", "T6" };
++	static const uint32_t tx[4] = { 0x4810u, 0x4C20u, 0x4C24u, AMP_PWR_SPE };
++	unsigned ms = 0, k;
++	int cs;
++
++	for (cs = 0; cs < 2; cs++) {
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_PCMSRC, 0x7Fu, 0x08u, NULL);
++		(void)amp_pwr_rmw(s, cs, 0x4810u, 0x3F3Fu, cs ? 0x0301u : 0x0200u, NULL);
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_SPE, 0x3u, 0x3u, NULL);
++		amp_pwr_diag_line(s, cs, "vi txslot/tx1/tx2/spe ", "on", tx, 4u, 0);
++	}
++	amp_pwr_d3_src(s, 0x08u, 0x08u);
++	con_str("SWEET", "AUDIO: pattern 9 starts now (continuous tone, amp VI TX on, 12 s)");
++	amp_a9_cb.tone(amp_a9_cb.ctx, 9);
++	for (k = 0; k < 6u; k++)
++		ms += amp_pwr_d3_wait(s, 2000u, 1900u, tag[k], 0u, NULL);
++	amp_a9_cb.tone(amp_a9_cb.ctx, 0);
++	for (cs = 0; cs < 2; cs++) {
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_SPE, 0x3u, 0u, NULL);
++		(void)amp_pwr_rmw(s, cs, 0x4810u, 0x3F3Fu, 0x0100u, NULL);
++	}
++	amp_pwr_d3_src(s, 0x18u, 0x19u);
++	for (cs = 0; cs < 2; cs++)
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_PCMSRC, 0x7Fu, AMP_PCMSRC_DSP, NULL);
++	amp_pwr_diag_snap(s, "end");
++	return ms;
++}
+ static unsigned amp_pwr_diag_run(const struct amp_snap *s)
+ {
+ 	unsigned ms = 0;
+ 	int cs;
+ 
++	if (amp_pwr_diag == 5)
++		return amp_pwr_diag5_run(s);
+ 	if (amp_pwr_diag == 4)
+ 		return amp_pwr_diag4_run(s);
+ 	if (amp_pwr_diag == 3)
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index 266deb4..b82d786 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -127,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 13) {
++		sweet_aoc_audio_mode = 13;  /* patch 0391: as 12, with the amp VI feedback (ASPTX1/2 VMON/IMON) on TDM_0_TX and a 12 s continuous tone */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 12) {
+ 		sweet_aoc_audio_mode = 12;  /* patch 0390: as 10, DSP bypassed, detector on ASPRX1, ASP width / slot scan with a continuous tone */
+ 		sweet_aoc_load_start3();
+@@ -181,7 +186,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1 to 12), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1 to 13), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index 0e6138f..f455e94 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -225,7 +225,7 @@ swau_cb_open(__unused void *ctx)
+ 	printf("SWEET AUDIO: service %u hdr %#x flags %#x irq %u up off %#x size %u slots %u tx %u rx %u down off %#x size %u slots %u tx %u rx %u\n",
+ 	    swau_as->ctl_index, swau_r.s.hdr, swau_r.s.flags, swau_r.s.irq, swau_r.s.r[0].offset, swau_r.s.r[0].size, swau_r.s.r[0].slots,
+ 	    swau_r.s.r[0].tx, swau_r.s.r[0].rx, swau_r.s.r[1].offset, swau_r.s.r[1].size, swau_r.s.r[1].slots, swau_r.s.r[1].tx, swau_r.s.r[1].rx);
+-	if (sweet_aoc_audio_mode >= 9 && sweet_aoc_audio_mode <= 12 && swau_open_rc == SWAU_OK) {    /* patch 0386 (0388: 10, 0389: 11): read-only AOC queries with the stream running */
++	if (sweet_aoc_audio_mode >= 9 && sweet_aoc_audio_mode <= 13 && swau_open_rc == SWAU_OK) {    /* patch 0386 (0388: 10, 0389: 11): read-only AOC queries with the stream running */
+ 		b.say(b.ctx, "a10 diag: AOC queries (read only): GET_DSP_STATE, GET_SINK_PROCESSING_STATE 0, GET_SINKS_BITMAPS, GET_PARAMETER 16/0/0 (EP0 volume), 16/2/0 (ASP mode)");
+ 		swau_query(&b, &swau_r);
+ 	}
+@@ -602,6 +602,10 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 			swau_pb_index = i;
+ 		}
+ 	}
++	if (sweet_aoc_audio_mode == 13) {       /* patch 0391 */
++		printf("SWEET AUDIO: a10g: in 20 s: HAL amp words, amp VI feedback TX on (VMON/IMON, TDM_0_TX slots 0-3), detector on ASPRX1, pattern 9 = 12 s continuous tone\n");
++		swas_sleep_ms(NULL, 20000u);
++	}
+ 	if (sweet_aoc_audio_mode == 12) {       /* patch 0390 */
+ 		printf("SWEET AUDIO: a10f: in 20 s: HAL amp words, DSP bypassed, detector on ASPRX1, pattern 9 = 16 s continuous tone, ASP width 32 then 16, ASPRX1 slot 0..7, 1 s each\n");
+ 		swas_sleep_ms(NULL, 20000u);
+@@ -631,7 +635,7 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 	if (sweet_aoc_audio_mode >= 6) {
+ 		sweet_amp_dsp_arm();
+ 	}
+-	sweet_amp_diag_arm(sweet_aoc_audio_mode == 9 ? 1 : sweet_aoc_audio_mode == 10 ? 2 : sweet_aoc_audio_mode == 11 ? 3 : sweet_aoc_audio_mode == 12 ? 4 : 0);   /* 0390: 4 = slot / width scan */   /* patch 0386 (0388: 2 = HAL words + meters, 0389: 3 = data detector + AOC ASP bypass) */
++	sweet_amp_diag_arm(sweet_aoc_audio_mode == 9 ? 1 : sweet_aoc_audio_mode == 10 ? 2 : sweet_aoc_audio_mode == 11 ? 3 : sweet_aoc_audio_mode == 12 ? 4 : sweet_aoc_audio_mode == 13 ? 5 : 0);   /* 0390: 4 = slot / width scan */   /* patch 0386 (0388: 2 = HAL words + meters, 0389: 3 = data detector + AOC ASP bypass) */
+ 	sweet_amp_aocp_arm(sweet_aoc_audio_mode == 11 ? swau_cb_aocp : NULL);   /* patch 0389 */
+ 	sweet_amp_tone_arm(sweet_aoc_audio_mode == 7 || sweet_aoc_audio_mode >= 9 ? swau_cb_tone : sweet_aoc_audio_mode == 8 ? swau_cb_notone : NULL);
+ 	sweet_amp_serve_arm(sweet_aoc_audio_mode == 8 ? swau_cb_serve : NULL);       /* patch 0385 */
+@@ -732,7 +736,7 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
+-		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 12) {
++		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 13) {
+ 			swau_run(&r, image_size);       /* patch 0378, step A9 (5: + stream, patch 0379) */
+ 		}
+ 		return;

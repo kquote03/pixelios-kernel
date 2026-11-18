@@ -1,0 +1,725 @@
+SWEET AMP TONE (patch 0384, plan A10), on top of 0383 (boot-arg sweetaoc=7 + sweetamp=1). USER DECISION 2026-11-18 ("Change that rule and ignore
+safety checks for now"): the rule "PLL locked + reviewed calibration before GLOBAL_EN" and the tone bounds are lifted for this level only. As
+sweetaoc=6 (HALO fw load + start, AOC stream), then, while both cores run and the stream runs: the stock CS35L41 power-up in DAPM order (PCM
+Source DSP, boost enable, ASPRX1/2 + unmute, VMON/IMON/VPMON/VBSTMON/TEMPMON ADCs, DSP1 RESUME mailbox, AMP_EN, pup patch, MBOX_8 := 0,
+GLOBAL_EN, 1 ms, PUP_DONE <= 100 ms, PLL_LOCK <= 100 ms, IRQ1_STATUS1 error bits), a 5.4 s tone window (the glue feeds three 1 s beeps of a 1 kHz
+sine, 1 s apart, -30.0 dBFS, into audio_playback0; IRQ1_STATUS1 of both amps every 50 ms, an error bit ends it), then the stock power-down
+(mute, ADCs off, AMP_EN off, PAUSE, MBOX_8 := 0, GLOBAL_EN := 0 + PDN_DONE <= 100 ms, pdn patch, ASPRX off, mixer words back, read back) on
+every path after the first write; then the 0381 window 2, DSP stop, SOURCE off, BIND2 off, amp reset (restore). Sources cited in
+bsd/dev/sweet_amp_pwr.h (AMP cs35l41.c / cs35l41.h / tables, Linux v6.18 cs35l41-lib.c, DAPM soc-dapm.c ordering). PWR_CTRL1 and the power
+words pass amp_write_ok only while armed by amp_pwr_w for exactly that (register, value); levels <= 6 never arm it. The tone starts 75 s after
+"AOC online" (SWAU_TONE_DELAY_S). Lines: "SWEET AUDIO: amp on l,r pll ...", "SWEET AUDIO: tone played N bytes ..., amp off l,r, errors none",
+"SWEET AMP: L|R pwr ..." (IRQ1_STATUS1 pre/up/tone/end, IRQ1_STATUS3, mailbox status, PUP/PLL/PDN, end PWR_CTRL1/2, SP_ENABLES, volume words).
+Host tests: aoc_audio_host_test (tone pattern), amp_xnu_host_test (PWR_CTRL1 armed-only). No Linux code copied.
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+index ed7f26c..3b628d3 100644
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -151,6 +151,16 @@ sweet_amp_init(void)
+  * 5/6 PLL locked L/R, 7 bits: 1 L error, 2 R error, 4 L GLOBAL_EN, 8 R GLOBAL_EN, 16 L PLL_UNLOCK, 32 R PLL_UNLOCK. */
+ /* patch 0379 (sweetaoc=5): + tick (once per poll ms, may be NULL) and polls (0 = the 0378 per-amp poll; else the joint poll, <= 500) */
+ int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx, uint32_t out[8]);
++/* patch 0384 (plan A10, sweetaoc=7): arm the power-up / tone / power-down (sweet_amp_pwr.h) for the next run; tone(ctx, 1 / 0) switches the
++ * glue's sine on / off. Needs the DSP stage (sweet_amp_dsp_arm). out[7] adds: 64 / 128 L / R powered up (GLOBAL_EN), 256 / 512 L / R off after,
++ * 1024 / 2048 L / R error bit, 4096 / 8192 L / R PUP_DONE; out[5] / [6] = the PLL lock after GLOBAL_EN. */
++static void (*sa_tone)(void *, int);
++void sweet_amp_tone_arm(void (*tone)(void *, int));
++void
++sweet_amp_tone_arm(void (*tone)(void *, int))
++{
++	sa_tone = tone;
++}
+ 
+ /* patch 0381 (plan A9e, sweetaoc=6): arm the HALO DSP firmware load for the next sweet_amp_audio_run. The files come from /chosen/memory-map
+  * AMPFW <pa, size> (tools/mkpayload.py --ampfw, container tools/pack_ampfw.py), read through ml_static_ptovirt as AOCFW (patch 0376); the
+@@ -205,10 +215,10 @@ sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(voi
+ 			return -1;
+ 		}
+ 	}
+-	printf("SWEET AMP: a9 run (sweetaoc=%s): identify, init, %sTDM config, %sAOC open%s, PLL lock, %sAOC close, restore\n",
+-	    sa_dsp ? "6" : polls ? "5" : "4", sa_dsp ? "DSP load, " : "", sa_dsp ? "DSP start + heartbeat, " : "", polls ? " + stream start (silence)" : "",
+-	    sa_dsp ? "heartbeat, DSP stop, " : "");
+-	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx, tick, polls, sa_dsp };	/* patch 0381: sa_dsp from sweet_amp_dsp_arm */
++	printf("SWEET AMP: a9 run (sweetaoc=%s): identify, init, %sTDM config, %sAOC open%s, PLL lock, %s%sAOC close, restore\n",
++	    sa_tone && sa_dsp ? "7" : sa_dsp ? "6" : polls ? "5" : "4", sa_dsp ? "DSP load, " : "", sa_dsp ? "DSP start + heartbeat, " : "",
++	    polls ? " + stream start (silence)" : "", sa_tone && sa_dsp ? "power-up, tone, power-down, " : "", sa_dsp ? "heartbeat, DSP stop, " : "");
++	amp_a9_cb = (struct amp_a9_cb){ 1, open, close, ctx, tick, polls, sa_dsp, sa_dsp ? sa_tone : NULL };	/* 0381: sa_dsp; 0384: sa_tone */
+ 	rc = amp_init_run();
+ 	amp_a9_cb = (struct amp_a9_cb){ 0 };
+ 	out[0] = (uint32_t)rc;
+@@ -218,7 +228,14 @@ sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(voi
+ 		out[3 + i] = (uint32_t)amp_a9_res.a[i].cfg;
+ 		out[5 + i] = (uint32_t)amp_a9_res.a[i].locked;
+ 		out[7] |= (amp_a9_res.a[i].err ? 1u : 0u) << i | (amp_a9_res.a[i].gen ? 4u : 0u) << i | (amp_a9_res.a[i].unlock ? 16u : 0u) << i;
++		if (amp_pwr_res.ran) {		/* patch 0384 */
++			const struct amp_pwr_side *d = &amp_pwr_res.a[i];
++
++			out[5 + i] = (uint32_t)d->locked;
++			out[7] |= (amp_pwr_res.up ? 64u : 0u) << i | (d->off ? 256u : 0u) << i | (d->err ? 1024u : 0u) << i | (d->pup ? 4096u : 0u) << i;
++		}
+ 	}
++	out[2] |= amp_pwr_res.ran ? amp_pwr_res.tone_ms << 8 : 0u;	/* patch 0384: the tone window in ms (bits 8..), bit 0 = opened */
+ 	printf("SWEET AMP: a9 verdict run %s\n", rc == 0 ? "PASS" : "FAIL (see the AMP lines)");
+ 	return rc;
+ }
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+index 076c29b..b228a5b 100644
+--- a/bsd/dev/sweet_amp.h
++++ b/bsd/dev/sweet_amp.h
+@@ -343,18 +343,44 @@ static inline __attribute__((always_inline)) int amp_dsp_rd_ok(uint32_t reg)
+ 	       (reg >= AMP_DSP_SCRATCH1 && reg <= AMP_DSP_SCRATCH1 + 0x18u && !(reg & 7u)) || (reg >= 0x4C50u && reg <= 0x4C5Cu && !(reg & 3u));
+ }
+ 
+-/* a (register, value) pair the init may write: the 12 of AMP_INIT_SEQ, the four OTP test-key words, a register an OTP map row names; never PWR_CTRL1 */
++/* ---- patch 0384 (A10, sweetaoc=7): the power-up / power-down words of sweet_amp_pwr.h (sources there). A write passes only while armed
++ * by amp_pwr_w for exactly one amp_write (register and value both armed), and only for these registers. PWR_CTRL1 passes nowhere else. ---- */
++#define AMP_PWR_CTRL2		0x00002018u	/* PWR_CTRL2 (AMP cs35l41.h:43) */
++#define AMP_PWR_MUTE		0x00002024u	/* AMP_OUT_MUTE (:46) */
++#define AMP_PWR_SPE		0x00004800u	/* SP_ENABLES (:85) */
++#define AMP_PWR_PCMSRC		0x00004C00u	/* DAC_PCM1_SRC (:94) */
++#define AMP_PWR_PATCH		0x00002084u	/* the pup / pdn patch word (AMP cs35l41.c:2168-2182) */
++#define AMP_PWR_MBOX_CMD	0x00013020u	/* DSP_VIRT1_MBOX_1 = CSPL_MBOX_CMD_DRV (:186, :798) */
++#define AMP_PWR_MBOX_8		0x0001303Cu	/* DSP_VIRT1_MBOX_8 (:193) */
++#define AMP_PWR_DIGVOL		0x00006000u	/* AMP_DIG_VOL_CTRL (:109): read only */
++#define AMP_PWR_GAIN		0x00006C04u	/* AMP_GAIN_CTRL (:120): read only */
++#define AMP_PUP_DONE		0x01000000u	/* IRQ1_STATUS1 PUP_DONE (:676) */
++#define AMP_PDN_DONE		0x00800000u	/* PDN_DONE (:674) */
++#define AMP_ADC_BITS		0x00003700u	/* PWR_CTRL2 VPMON 8, VBSTMON 9, TEMPMON 10, VMON 12, IMON 13 (AMP cs35l41.c:2462-2466) */
++static struct { int on; uint32_t reg, val; } amp_pwr_row;
++static inline __attribute__((always_inline)) int amp_pwr_reg(uint32_t reg)
++{
++	return reg == AMP_REG_PWR_CTRL1 || reg == AMP_PWR_CTRL2 || reg == AMP_PWR_MUTE || reg == AMP_PWR_SPE || reg == AMP_PWR_PCMSRC ||
++	       reg == AMP_REG_TEST_KEY || reg == AMP_PWR_PATCH || reg == AMP_PWR_MBOX_CMD || reg == AMP_PWR_MBOX_8 || reg == AMP_REG_IRQ1_STATUS1;
++}
++static inline __attribute__((always_inline)) int amp_pwr_ok(uint32_t reg, uint32_t val)
++{
++	return amp_pwr_row.on && reg == amp_pwr_row.reg && val == amp_pwr_row.val && amp_pwr_reg(reg);
++}
++
++/* a (register, value) pair the init may write: the 12 of AMP_INIT_SEQ, the four OTP test-key words, a register an OTP map row names; PWR_CTRL1
++ * only as the armed power word of patch 0384 */
+ static inline __attribute__((always_inline)) int amp_write_ok(uint32_t reg, uint32_t val)
+ {
+ 	int ok = 0;
+ 
+ 	if (reg == AMP_REG_PWR_CTRL1)
+-		return 0;
++		return amp_pwr_ok(reg, val);
+ #define AMP_W_OK(r, v) ok |= (reg == (r) && val == (v));
+ 	AMP_INIT_SEQ(AMP_W_OK)
+ #undef AMP_W_OK
+ 	ok |= reg == AMP_REG_TEST_KEY && (val == AMP_OTP_KEY_UNLOCK1 || val == AMP_OTP_KEY_UNLOCK2 || val == AMP_OTP_KEY_LOCK1 || val == AMP_OTP_KEY_LOCK2);
+-	return ok || amp_otp_reg_ok(reg) || amp_a9_ok(reg, val) || amp_dsp_ctl_ok(reg, val);	/* patch 0378: + the armed A9 row; 0381: + DSP */
++	return ok || amp_otp_reg_ok(reg) || amp_a9_ok(reg, val) || amp_dsp_ctl_ok(reg, val) || amp_pwr_ok(reg, val);	/* 0378: A9 row; 0381: DSP; 0384 */
+ }
+ 
+ /* a register an armed read may name: the seven of the A1 / A7 reads, OTPID, OTP_MEM0..31, a register an OTP map row names */
+@@ -363,7 +389,8 @@ static inline __attribute__((always_inline)) int amp_read_ok(uint32_t reg)
+ 	return reg == AMP_REG_IRQ1_STATUS4 || reg == AMP_REG_IRQ1_STATUS3 || reg == AMP_REG_DEVID || reg == AMP_REG_REVID || reg == AMP_REG_IRQ1_STATUS1 ||
+ 	       reg == AMP_REG_IRQ1_MASK1 || reg == AMP_REG_CCM_CORE || reg == AMP_OTP_REG_OTPID ||
+ 	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg) || amp_a9_read_ok(reg) ||
+-	       amp_dsp_rd_ok(reg);	/* patch 0381 */
++	       amp_dsp_rd_ok(reg) ||	/* patch 0381 */
++	       (amp_pwr_reg(reg) && reg != AMP_REG_TEST_KEY && reg != AMP_PWR_PATCH) || reg == AMP_PWR_DIGVOL || reg == AMP_PWR_GAIN;	/* patch 0384 */
+ }
+ 
+ /* byte `pos` of the 10-byte write frame of (reg, val): the address with bit 31 clear, 2 pad bytes 0, the value, all big endian */
+@@ -1304,7 +1331,9 @@ static int bring_up(const struct amp_snap *s)
+ /* ---- A9b run (patch 0378): called by amp_init_run between the init of both amps and the restore, only when the AOC glue armed amp_a9_cb ---- */
+ /* patch 0379: polls != 0 selects the joint L/R poll (bound min(polls, AMP_A9_PLL_POLLS_MAX)); tick (may be NULL) runs once per poll ms */
+ /* patch 0381 (sweetaoc=6): dsp = 1 adds the HALO firmware load / start / heartbeat / stop of sweet_amp_dsp.h around the AOC open */
+-struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; void (*tick)(void *ctx); unsigned polls; int dsp; };
++/* patch 0384 (sweetaoc=7): tone (may be NULL) = the glue's tone switch; non-NULL adds the power-up / tone / power-down of sweet_amp_pwr.h */
++struct amp_a9_cb { int on; int (*open)(void *ctx); void (*close)(void *ctx); void *ctx; void (*tick)(void *ctx); unsigned polls; int dsp;
++		   void (*tone)(void *ctx, int on); };
+ static struct amp_a9_cb amp_a9_cb;
+ #include "sweet_amp_dsp.h"
+ 
+@@ -1312,6 +1341,7 @@ struct amp_a9_side { int cfg, locked, unlock, gen, err; unsigned writes, skipped
+ /* patch 0379: IRQ1_STATUS3 as last read at these poll counts (0 = not reached) */
+ static const unsigned amp_a9_snap_at[AMP_A9_NSNAP] = { 1u, 10u, 100u, 250u, 500u };
+ static struct amp_a9_res { int ran, opened; struct amp_a9_side a[2]; } amp_a9_res;
++#include "sweet_amp_pwr.h"
+ 
+ /* one row: read, merge, write only if it changes (regmap_update_bits; a plain write row always writes), read back the field.
+  * IRQ1_STATUS3 (write-1-to-clear) is not compared after its write. */
+@@ -1497,6 +1527,11 @@ static void amp_a9_part(const struct amp_snap *s, int il, int ir)
+ 		amp_a9_pll(s, 0, "L", &amp_a9_res.a[0]);
+ 		amp_a9_pll(s, 1, "R", &amp_a9_res.a[1]);
+ 	}
++	amp_pwr_res = (struct amp_pwr_res){ 0 };
++	if (amp_a9_res.opened && amp_a9_cb.tone && amp_a9_cb.dsp && amp_dsp_res.a[0].stage == DS_RUN && amp_dsp_res.a[1].stage == DS_RUN)
++		amp_pwr_run(s);			/* patch 0384 (sweetaoc=7): power-up, tone, power-down while the stream and both cores run */
++	else if (amp_a9_cb.tone)
++		say("a10: ", "no power-up: AOC stream or a HALO core not running (DSP lines)");
+ 	if (amp_a9_cb.dsp) {		/* patch 0381: window 2 with the stream (fed each ms), then stop every started core, before the AOC close */
+ 		amp_dsp_window(s, 2, amp_a9_res.opened ? amp_a9_cb.tick : 0, amp_a9_cb.ctx);
+ 		amp_dsp_stop(s, 0, &amp_dsp_res.a[0]);
+diff --git a/bsd/dev/sweet_amp_pwr.h b/bsd/dev/sweet_amp_pwr.h
+new file mode 100644
+index 0000000..8c5a877
+--- /dev/null
++++ b/bsd/dev/sweet_amp_pwr.h
+@@ -0,0 +1,371 @@
++/*
++ * CS35L41 power-up, tone window, power-down (patch 0384, plan A10, boot-arg sweetaoc=7 with sweetamp=1). Included by sweet_amp.h; run by
++ * amp_a9_part between the A9 PLL poll (the AOC stream of zeros runs) and the DSP window 2 / stop, only when the glue armed the tone
++ * (sweet_amp_tone_arm) and both HALO cores run (heartbeat moved). USER DECISION 2026-11-18: the old rule "PLL locked + reviewed calibration
++ * before GLOBAL_EN" is lifted for this level; the stock order is kept. AMP = google-modules amplifiers cs35l41 (cs35l41.c, cs35l41.h,
++ * cs35l41-tables.c); v6.18 = Linux v6.18 sound/soc/codecs/cs35l41-lib.c + include/sound/cs35l41.h; DAPM = soc-dapm.c dapm_up_seq /
++ * dapm_down_seq / dapm_seq_compare (read from the Linux 7.3.4 source tree, :76-156, :1787-1817: sorted by type seq, then reg, then component).
++ * Power-up, the DAPM order of SPK <- Main AMP <- CLASS H <- PCM Source "DSP" <- DSP1 <- VMON / IMON / VPMON / VBSTMON / TEMPMON ADC <- ASPRX1
++ * (AMP cs35l41.c:2560-2582); each step on L, then R (same seq and reg: sorted by component):
++ *   mixer words: DAC_PCM1_SRC 0x4C00 [0x7F] := 0x32 "DSP" (AMP cs35l41.c:1132-1138, cs35l41.h:94, :633); Boost Converter Enable PWR_CTRL2
++ *     0x2018 BST_EN [0x30] := 2 << 4 (v6.18 cs35l41-lib.c:1164, cs35l41.h:680-682; AMP control cs35l41.c:1799)
++ *   seq 5 aif_in: SP_ENABLES 0x4800 ASPRX1 bit 16 + ASPRX2 bit 17 (AMP cs35l41.c:2451-2456; DSP RX2 Source default ASPRX2, tables.c:80);
++ *     POST_PMU AMP_OUT_MUTE 0x2024 [0x10] := 0 (cs35l41_mute_amp, cs35l41.c:2378-2387, cs35l41.h:46, :672)
++ *   seq 11 adc: PWR_CTRL2 VPMON 8, VBSTMON 9, TEMPMON 10, VMON 12, IMON 13 (cs35l41.c:2462-2466)
++ *   seq 12 out_drv DSP1 (NOPM sorts first) POST_PMU: MBOX_2 0x13004 RUNNING 0 / PAUSED 1 -> VIRT1_MBOX_1 0x13020 := RESUME 2, MBOX_2 polled
++ *     <= 5 x 1 ms for RUNNING (cs35l41.c:283-306, :1023-1055; cs35l41.h:179, :186, :810-820)
++ *   seq 12 out_drv Main AMP: PWR_CTRL2 AMP_EN bit 0 (cs35l41.c:2469); POST_PMU: pup patch TEST_KEY 0x40 := 0x55, 0xAA, 0x2084 := 0x002F1AA0,
++ *     0x40 := 0xCC, 0x33 (:2168-2174, :2280-2282); VIRT1_MBOX_8 0x1303C := gpi_global_en 0 (:2286-2290, :4167); PWR_CTRL1 GLOBAL_EN := 1
++ *     (:2292-2294); 1 ms (:2296); then IRQ1_STATUS1 PUP_DONE 0x01000000 polled <= 100 x 1 ms and cleared W1C (v6.18 cs35l41-lib.c:1286-1293,
++ *     cs35l41.h:676); IRQ1_STATUS3 PLL_LOCK <= 100 x 1 ms (ours: logged, not a stop); IRQ1_STATUS1 & AMP_ERR_BITS must be 0.
++ * Tone window: <= AMP_TONE_MS x 1 ms, the AOC tick each ms, IRQ1_STATUS1 of both amps every AMP_TONE_CHECK_MS; an error bit ends it.
++ * Power-down (every amp that was written, every path): mute first (AMP_OUT_MUTE := 0x10, the ASPRX PRE_PMD mute :2378-2383, here first);
++ *   then the DAPM down order: seq 3 adc bits := 0; seq 5 Main AMP AMP_EN := 0, POST_PMD (:2300-2351): VIRT1_MBOX_1 := PAUSE 1 (MBOX_2 <= 5 x 1 ms
++ *   for PAUSED) if RESUME was sent, VIRT1_MBOX_8 := 0, if GLOBAL_EN: := 0, PDN_DONE 0x00800000 polled <= 100 x 1 ms, cleared; pdn patch (0x2084
++ *   := 0x002F1AA3, :2176-2182); seq 12 aif_in SP_ENABLES bits := 0; then the mixer words back to the values read before; PWR_CTRL1/2 and
++ *   SP_ENABLES read back. restore() puts both amps back in reset after this anyway.
++ * Not written: hibernate (never entered), the volume ramp (manual_ramp 0), AMP_DIG_VOL_CTRL / AMP_GAIN_CTRL (reset defaults 0x8000 = 0 dB,
++ *   0x273, tables.c:89, :100; read and logged). The level is the PCM level (the glue's sine at about -30 dBFS).
++ */
++#ifndef SWEET_AMP_PWR_H
++#define SWEET_AMP_PWR_H
++
++#define AMP_PCMSRC_DSP		0x32u
++#define AMP_BST_EN_FIELD	0x20u		/* CS35L41_BST_EN_DEFAULT 2 << CS35L41_BST_EN_SHIFT 4 */
++#define AMP_BST_EN_MASK		0x30u
++#define AMP_ASPRX_EN		0x00030000u	/* ASP_RX1_EN bit 16, ASP_RX2_EN bit 17 */
++#define AMP_MUTE_BIT		0x10u
++#define AMP_AMP_EN		0x1u
++#define AMP_MBOX_RESUME		2u
++#define AMP_MBOX_PAUSE		1u
++#define AMP_MBOX_STS_RUNNING	0u
++#define AMP_MBOX_STS_PAUSED	1u
++#define AMP_MBOX_POLLS		5u
++#define AMP_PUP_POLLS		100u
++#define AMP_TONE_MS		5400u		/* the glue's pattern is 5 s; + the AOC ring (80 ms) and margin */
++#define AMP_TONE_CHECK_MS	50u
++
++struct amp_pwr_side {
++	int touched, resumed, gen, pup, locked, err, paused, pdn, off;
++	const char *fail;			/* the first step that stopped the power-up (NULL = none) */
++	uint32_t pcm0, pwr2_0, st1_pre, sts0, sts, st1_up, st3, st1_tone, st1_end, pwr1_end, pwr2_end, spe_end, vol, gain;
++	unsigned pup_polls, pll_polls;
++};
++static struct amp_pwr_res { int ran, up, errstop; unsigned tone_ms; struct amp_pwr_side a[2]; } amp_pwr_res;
++
++/* one armed write (the only way PWR_CTRL1 and the other power words pass amp_write_ok) */
++static int amp_pwr_w(const struct amp_snap *s, int cs, uint32_t reg, uint32_t val)
++{
++	int e;
++
++	amp_pwr_row.on = 1;
++	amp_pwr_row.reg = reg;
++	amp_pwr_row.val = val;
++	e = amp_write(s, cs, reg, val);
++	amp_pwr_row.on = 0;
++	amp_pwr_row.reg = amp_pwr_row.val = 0;
++	return e;
++}
++
++/* regmap_update_bits: read, write only if it changes, read the field back */
++static int amp_pwr_rmw(const struct amp_snap *s, int cs, uint32_t reg, uint32_t mask, uint32_t field, uint32_t *old)
++{
++	uint32_t o = 0, rb = 0;
++	int e = amp_read(s, cs, reg, &o);
++
++	if (old)
++		*old = o;
++	if (e != AMP_OK || ((o & ~mask) | field) == o)
++		return e;
++	e = amp_pwr_w(s, cs, reg, (o & ~mask) | field);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, reg, &rb);
++	if (e == AMP_OK && (rb & mask) != field)
++		e = AMP_ERROR;
++	return e;
++}
++
++/* cs35l41_set_cspl_mbox_cmd: VIRT1_MBOX_1 := cmd, MBOX_2 <= 5 x 1 ms for the expected status (the last one read in *sts) */
++static int amp_pwr_mbox(const struct amp_snap *s, int cs, uint32_t cmd, uint32_t want, uint32_t *sts)
++{
++	int e = amp_pwr_w(s, cs, AMP_PWR_MBOX_CMD, cmd);
++
++	for (unsigned i = 0; e == AMP_OK && i < AMP_MBOX_POLLS; i++) {
++		if (wait_ms(1u))
++			return AMP_TIMEOUT;
++		e = amp_read(s, cs, AMP_DSP_MBOX2, sts);
++		if (e == AMP_OK && *sts == want)
++			return AMP_OK;
++	}
++	return e == AMP_OK ? AMP_ERROR : e;
++}
++
++static int amp_pwr_fail(struct amp_pwr_side *d, const char *step, int e)
++{
++	if (!d->fail)
++		d->fail = step;
++	return e == AMP_OK ? AMP_ERROR : e;
++}
++
++/* power-up step st of one amp (stock order above); d->touched is set before its first write */
++static int amp_pwr_step(const struct amp_snap *s, int cs, unsigned st, struct amp_pwr_side *d)
++{
++	uint32_t v = 0;
++	int e = AMP_OK;
++	unsigned i;
++
++	switch (st) {
++	case 0:		/* pre: no error bit, GLOBAL_EN 0, the DSP mailbox status, the volume words (logged) */
++		e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1_pre);
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &v);
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_DSP_MBOX2, &d->sts0);
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_PWR_DIGVOL, &d->vol);
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_PWR_GAIN, &d->gain);
++		if (e != AMP_OK || (d->st1_pre & AMP_ERR_BITS) || (v & AMP_GLOBAL_EN))
++			return amp_pwr_fail(d, "pre", e);
++		return AMP_OK;
++	case 1:		/* mixer: PCM Source DSP, boost enable */
++		d->touched = 1;
++		e = amp_pwr_rmw(s, cs, AMP_PWR_PCMSRC, 0x7Fu, AMP_PCMSRC_DSP, &d->pcm0);
++		if (e == AMP_OK)
++			e = amp_pwr_rmw(s, cs, AMP_PWR_CTRL2, AMP_BST_EN_MASK, AMP_BST_EN_FIELD, &d->pwr2_0);
++		return e == AMP_OK ? AMP_OK : amp_pwr_fail(d, "mixer", e);
++	case 2:		/* aif_in ASPRX1 / ASPRX2, POST_PMU unmute */
++		e = amp_pwr_rmw(s, cs, AMP_PWR_SPE, AMP_ASPRX_EN, AMP_ASPRX_EN, NULL);
++		if (e == AMP_OK)
++			e = amp_pwr_rmw(s, cs, AMP_PWR_MUTE, AMP_MUTE_BIT, 0u, NULL);
++		return e == AMP_OK ? AMP_OK : amp_pwr_fail(d, "asprx", e);
++	case 3:		/* adc */
++		e = amp_pwr_rmw(s, cs, AMP_PWR_CTRL2, AMP_ADC_BITS, AMP_ADC_BITS, NULL);
++		return e == AMP_OK ? AMP_OK : amp_pwr_fail(d, "adc", e);
++	case 4:		/* DSP1 POST_PMU: RESUME */
++		e = amp_read(s, cs, AMP_DSP_MBOX2, &d->sts0);
++		if (e != AMP_OK || (d->sts0 != AMP_MBOX_STS_RUNNING && d->sts0 != AMP_MBOX_STS_PAUSED))
++			return amp_pwr_fail(d, "mbox-sts", e);
++		d->resumed = 1;
++		e = amp_pwr_mbox(s, cs, AMP_MBOX_RESUME, AMP_MBOX_STS_RUNNING, &d->sts);
++		return e == AMP_OK ? AMP_OK : amp_pwr_fail(d, "resume", e);
++	case 5:		/* Main AMP: AMP_EN, POST_PMU pup patch, MBOX_8 := 0, GLOBAL_EN, 1 ms */
++		e = amp_pwr_rmw(s, cs, AMP_PWR_CTRL2, AMP_AMP_EN, AMP_AMP_EN, NULL);
++		if (e == AMP_OK)
++			e = amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0x55u);
++		if (e == AMP_OK)
++			e = amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0xAAu);
++		if (e == AMP_OK)
++			e = amp_pwr_w(s, cs, AMP_PWR_PATCH, 0x002F1AA0u);
++		if (e == AMP_OK)
++			e = amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0xCCu);
++		if (e == AMP_OK)
++			e = amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0x33u);
++		if (e == AMP_OK)
++			e = amp_pwr_w(s, cs, AMP_PWR_MBOX_8, 0u);
++		if (e == AMP_OK) {
++			d->gen = 1;	/* from here the power-down clears GLOBAL_EN if it reads set */
++			e = amp_pwr_rmw(s, cs, AMP_REG_PWR_CTRL1, AMP_GLOBAL_EN, AMP_GLOBAL_EN, NULL);
++		}
++		if (e == AMP_OK && wait_ms(1u))
++			e = AMP_TIMEOUT;
++		return e == AMP_OK ? AMP_OK : amp_pwr_fail(d, "global-en", e);
++	case 6:		/* PUP_DONE, clear it; PLL lock; error bits */
++		for (i = 0; e == AMP_OK && i < AMP_PUP_POLLS && !d->pup; i++) {
++			e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1_up);
++			d->pup_polls = i + 1u;
++			d->pup = e == AMP_OK && (d->st1_up & AMP_PUP_DONE);
++			if (e == AMP_OK && !d->pup && wait_ms(1u))
++				e = AMP_TIMEOUT;
++		}
++		if (e == AMP_OK && d->pup)
++			e = amp_pwr_w(s, cs, AMP_REG_IRQ1_STATUS1, AMP_PUP_DONE);
++		for (i = 0; e == AMP_OK && i < AMP_PUP_POLLS && !d->locked; i++) {
++			e = amp_read(s, cs, AMP_REG_IRQ1_STATUS3, &d->st3);
++			d->pll_polls = i + 1u;
++			d->locked = e == AMP_OK && (d->st3 & AMP_PLL_LOCK);
++			if (e == AMP_OK && !d->locked && wait_ms(1u))
++				e = AMP_TIMEOUT;
++		}
++		if (e == AMP_OK)
++			e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1_up);
++		if (e != AMP_OK || (d->st1_up & AMP_ERR_BITS)) {
++			d->err = 1;
++			return amp_pwr_fail(d, "post-st1", e);
++		}
++		return AMP_OK;
++	}
++	return AMP_ERROR;
++}
++#define AMP_PWR_NSTEP	7u
++
++/* the stock power-down of one amp that was written (each write best effort: the next one still runs) */
++static void amp_pwr_down_mute(const struct amp_snap *s, int cs, struct amp_pwr_side *d)
++{
++	if (d->touched)
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_MUTE, AMP_MUTE_BIT, AMP_MUTE_BIT, NULL);
++}
++static void amp_pwr_down_adc(const struct amp_snap *s, int cs, struct amp_pwr_side *d)
++{
++	if (d->touched)
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_CTRL2, AMP_ADC_BITS, 0u, NULL);
++}
++static void amp_pwr_down_amp(const struct amp_snap *s, int cs, struct amp_pwr_side *d)
++{
++	uint32_t v = 0, sts = 0;
++	unsigned i;
++
++	if (!d->touched)
++		return;
++	(void)amp_pwr_rmw(s, cs, AMP_PWR_CTRL2, AMP_AMP_EN, 0u, NULL);
++	if (d->resumed)
++		d->paused = amp_pwr_mbox(s, cs, AMP_MBOX_PAUSE, AMP_MBOX_STS_PAUSED, &sts) == AMP_OK;
++	(void)amp_pwr_w(s, cs, AMP_PWR_MBOX_8, 0u);
++	if (amp_read(s, cs, AMP_REG_PWR_CTRL1, &v) == AMP_OK && (v & AMP_GLOBAL_EN)) {
++		(void)amp_pwr_rmw(s, cs, AMP_REG_PWR_CTRL1, AMP_GLOBAL_EN, 0u, NULL);
++		for (i = 0; i < AMP_PUP_POLLS && !d->pdn; i++) {
++			if (amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &v) != AMP_OK)
++				break;
++			d->pdn = (v & AMP_PDN_DONE) != 0u;
++			if (!d->pdn && wait_ms(1u))
++				break;
++		}
++		(void)amp_pwr_w(s, cs, AMP_REG_IRQ1_STATUS1, AMP_PDN_DONE);
++	}
++	(void)amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0x55u);
++	(void)amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0xAAu);
++	(void)amp_pwr_w(s, cs, AMP_PWR_PATCH, 0x002F1AA3u);
++	(void)amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0xCCu);
++	(void)amp_pwr_w(s, cs, AMP_REG_TEST_KEY, 0x33u);
++}
++static void amp_pwr_down_aif(const struct amp_snap *s, int cs, struct amp_pwr_side *d)
++{
++	int e;
++
++	if (!d->touched)
++		return;
++	(void)amp_pwr_rmw(s, cs, AMP_PWR_SPE, AMP_ASPRX_EN, 0u, NULL);
++	(void)amp_pwr_rmw(s, cs, AMP_PWR_CTRL2, AMP_BST_EN_MASK, d->pwr2_0 & AMP_BST_EN_MASK, NULL);
++	(void)amp_pwr_rmw(s, cs, AMP_PWR_PCMSRC, 0x7Fu, d->pcm0 & 0x7Fu, NULL);
++	e = amp_read(s, cs, AMP_REG_PWR_CTRL1, &d->pwr1_end);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_PWR_CTRL2, &d->pwr2_end);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_PWR_SPE, &d->spe_end);
++	if (e == AMP_OK)
++		e = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1_end);
++	d->off = e == AMP_OK && !(d->pwr1_end & AMP_GLOBAL_EN) && !(d->pwr2_end & (AMP_AMP_EN | AMP_ADC_BITS)) && !(d->spe_end & AMP_ASPRX_EN);
++}
++
++static void amp_pwr_line(const char *name, const struct amp_pwr_side *d)
++{
++	char line[RAMLOG_LINE_MAX];
++	unsigned p = put_txt(line, sizeof(line), 0, name);
++
++	p = put_txt(line, sizeof(line), p, " pwr up=");
++	p = put_txt(line, sizeof(line), p, d->fail ? d->fail : "ok");
++	p = put_txt(line, sizeof(line), p, " st1 ");
++	p = put_hexmin(line, sizeof(line), p, d->st1_pre);
++	p = put_txt(line, sizeof(line), p, "/");
++	p = put_hexmin(line, sizeof(line), p, d->st1_up);
++	p = put_txt(line, sizeof(line), p, "/");
++	p = put_hexmin(line, sizeof(line), p, d->st1_tone);
++	p = put_txt(line, sizeof(line), p, "/");
++	p = put_hexmin(line, sizeof(line), p, d->st1_end);
++	p = put_txt(line, sizeof(line), p, " st3=");
++	p = put_hexmin(line, sizeof(line), p, d->st3);
++	p = put_txt(line, sizeof(line), p, " mbox ");
++	p = put_hexmin(line, sizeof(line), p, d->sts0);
++	p = put_txt(line, sizeof(line), p, "->");
++	p = put_hexmin(line, sizeof(line), p, d->sts);
++	emit("AMP", line, p);
++	p = put_txt(line, sizeof(line), 0, name);
++	p = put_txt(line, sizeof(line), p, " pwr pup=");
++	p = put_dec(line, sizeof(line), p, (uint32_t)d->pup);
++	p = put_txt(line, sizeof(line), p, "/");
++	p = put_dec(line, sizeof(line), p, d->pup_polls);
++	p = put_txt(line, sizeof(line), p, " pll=");
++	p = put_dec(line, sizeof(line), p, (uint32_t)d->locked);
++	p = put_txt(line, sizeof(line), p, "/");
++	p = put_dec(line, sizeof(line), p, d->pll_polls);
++	p = put_txt(line, sizeof(line), p, " pdn=");
++	p = put_dec(line, sizeof(line), p, (uint32_t)d->pdn);
++	p = put_txt(line, sizeof(line), p, " paused=");
++	p = put_dec(line, sizeof(line), p, (uint32_t)d->paused);
++	p = put_txt(line, sizeof(line), p, " end pwr1=");
++	p = put_hexmin(line, sizeof(line), p, d->pwr1_end);
++	p = put_txt(line, sizeof(line), p, " pwr2=");
++	p = put_hexmin(line, sizeof(line), p, d->pwr2_end);
++	p = put_txt(line, sizeof(line), p, " spe=");
++	p = put_hexmin(line, sizeof(line), p, d->spe_end);
++	p = put_txt(line, sizeof(line), p, " vol=");
++	p = put_hexmin(line, sizeof(line), p, d->vol);
++	p = put_txt(line, sizeof(line), p, " g=");
++	p = put_hexmin(line, sizeof(line), p, d->gain);
++	emit("AMP", line, p);
++}
++
++/* power-up both (step by step, L then R), the tone window, power-down both; the power-down runs on every path after the first step */
++static void amp_pwr_run(const struct amp_snap *s)
++{
++	struct amp_pwr_side *l = &amp_pwr_res.a[0], *r = &amp_pwr_res.a[1];
++	char line[RAMLOG_LINE_MAX];
++	unsigned st, p, ms;
++	int cs, e = AMP_OK;
++
++	amp_pwr_res = (struct amp_pwr_res){ 0 };
++	amp_pwr_res.ran = 1;
++	for (st = 0; e == AMP_OK && st < AMP_PWR_NSTEP; st++)
++		for (cs = 0; e == AMP_OK && cs < 2; cs++)
++			e = amp_pwr_step(s, cs, st, &amp_pwr_res.a[cs]);
++	amp_pwr_res.up = e == AMP_OK;
++	p = put_txt(line, sizeof(line), 0, amp_pwr_res.up ? "AUDIO: amp on l,r pll " : "AUDIO: amp power-up STOPPED at ");
++	if (amp_pwr_res.up) {
++		p = put_txt(line, sizeof(line), p, l->locked && r->locked ? "locked l,r" : l->locked ? "locked l only" : r->locked ? "locked r only" :
++		    "NOT locked l,r");
++	} else {
++		p = put_txt(line, sizeof(line), p, l->fail ? "L " : "R ");
++		p = put_txt(line, sizeof(line), p, l->fail ? l->fail : r->fail ? r->fail : "?");
++		p = put_txt(line, sizeof(line), p, ", powering down");
++	}
++	emit("SWEET", line, p);
++	if (amp_pwr_res.up) {
++		if (amp_a9_cb.tone)
++			amp_a9_cb.tone(amp_a9_cb.ctx, 1);
++		for (ms = 0; ms < AMP_TONE_MS; ms++) {
++			if (wait_ms(1u))
++				break;
++			if (amp_a9_cb.tick)
++				amp_a9_cb.tick(amp_a9_cb.ctx);
++			if ((ms + 1u) % AMP_TONE_CHECK_MS)
++				continue;
++			for (cs = 0; cs < 2; cs++) {
++				struct amp_pwr_side *d = &amp_pwr_res.a[cs];
++
++				if (amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &d->st1_tone) != AMP_OK || (d->st1_tone & AMP_ERR_BITS))
++					d->err = 1;
++			}
++			if (l->err || r->err) {
++				amp_pwr_res.errstop = 1;
++				ms++;
++				break;
++			}
++		}
++		amp_pwr_res.tone_ms = ms;
++		if (amp_a9_cb.tone)
++			amp_a9_cb.tone(amp_a9_cb.ctx, 0);
++	}
++	/* the stock power-down, each stage on L then R */
++	amp_pwr_down_mute(s, 0, l);
++	amp_pwr_down_mute(s, 1, r);
++	amp_pwr_down_adc(s, 0, l);
++	amp_pwr_down_adc(s, 1, r);
++	amp_pwr_down_amp(s, 0, l);
++	amp_pwr_down_amp(s, 1, r);
++	amp_pwr_down_aif(s, 0, l);
++	amp_pwr_down_aif(s, 1, r);
++	amp_pwr_line("L", l);
++	amp_pwr_line("R", r);
++}
++
++#endif /* SWEET_AMP_PWR_H */
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index 20ce38b..ee24159 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -127,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 7) {
++		sweet_aoc_audio_mode = 7;   /* patch 0384, step A10: as 6, plus the amp power-up, a 5 s tone (three beeps) and the power-down */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 6) {
+ 		sweet_aoc_audio_mode = 6;   /* patch 0381, step A9e: as 5, plus the CS35L41 HALO DSP firmware load / start / heartbeat / stop (AMPFW) */
+ 		sweet_aoc_load_start3();
+@@ -151,7 +156,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6, 7), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index c589471..2d2a2a2 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -170,6 +170,7 @@ int sweet_aoc_audio_mode;                       /* set by sweet_aoc.c for sweeta
+ extern int sweet_amp_audio_run(int (*open)(void *), void (*close)(void *), void (*tick)(void *), unsigned polls, void *ctx,
+     uint32_t out[8]);   /* sweet_amp.c (patch 0378, + tick / polls patch 0379) */
+ extern void sweet_amp_dsp_arm(void);            /* sweet_amp.c (patch 0381): AMPFW checked, DSP stage armed for the next run */
++extern void sweet_amp_tone_arm(void (*tone)(void *, int));     /* sweet_amp.c (patch 0384): power-up / tone / power-down armed */
+ #endif
+ /* patch 0379 (sweetaoc=5): + the audio_playback0 ring (zeroed, reset, fed zeros each poll ms), EP_SETUP, SOURCE on / off (sweet_audio.h) */
+ #define SWAU_PLAY_POLLS 500u    /* = AMP_A9_PLL_POLLS_MAX of sweet_amp.h */
+@@ -244,6 +245,18 @@ swau_cb_tick(__unused void *ctx)
+ 	swau_feed(&b, &swau_r);
+ }
+ 
++/* patch 0384 (sweetaoc=7): the tone switch, called by the amp code once on (after the power-up passed) and once off */
++static void
++swau_cb_tone(__unused void *ctx, int on)
++{
++	static const struct swau_bus ab = { swas_ir32, swas_iw32, swas_isync, swau_doorbell, swas_sleep_ms, NULL, NULL };
++
++	swau_tone(&ab, &swau_r, on);
++}
++
++/* patch 0384: the tone starts this long after "online" (run a9g: online at +117 s, lock screen at +123 s -> tone near +195 s) */
++#define SWAU_TONE_DELAY_S 75u
++
+ static void
+ swau_run(struct swas_res *r, uint32_t image_size)
+ {
+@@ -264,14 +277,20 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 			swau_pb_index = i;
+ 		}
+ 	}
++	if (sweet_aoc_audio_mode == 7) {
++		printf("SWEET AUDIO: a10: tone in %u s (then 3 beeps of 1 kHz, 1 s on / 1 s off, about -30 dBFS, both speakers)\n", SWAU_TONE_DELAY_S);
++		swas_sleep_ms(NULL, SWAU_TONE_DELAY_S * 1000u);
++		printf("SWEET AUDIO: a10: amp run starts now (beeps about 2 s from here)\n");
++	}
+ 	if (!swas_imap(NULL, SWAS_CARVE_PA + image_size, SWAS_IPC_LEN)) {
+ 		printf("SWEET AUDIO: stop ipc-map-failed, nothing written\n");
+ 		return;
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	if (sweet_aoc_audio_mode == 6) {
++	if (sweet_aoc_audio_mode == 6 || sweet_aoc_audio_mode == 7) {
+ 		sweet_amp_dsp_arm();
+ 	}
++	sweet_amp_tone_arm(sweet_aoc_audio_mode == 7 ? swau_cb_tone : NULL);
+ 	if (sweet_aoc_audio_mode >= 5) {
+ 		arc = sweet_amp_audio_run(swau_cb_open, swau_cb_close, swau_cb_tick, SWAU_PLAY_POLLS, NULL, out);
+ 	} else {
+@@ -291,6 +310,17 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 		printf("SWEET AUDIO: open rc %d (%s) dsp mode %u bound %u unbound %u close rc %d; amp rc %d a9 %u opened %u cfg %u/%u pll %u/%u flags %#x\n",
+ 		    swau_open_rc, swau_open_rc >= 0 && swau_open_rc < SWAU_NSTOP ? swau_stop_name[swau_open_rc] : "not-run", swau_r.dsp_mode,
+ 		    swau_r.bound, swau_r.unbound, swau_close_rc, arc, out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++		if (sweet_aoc_audio_mode == 7) {        /* patch 0384 */
++			uint32_t f = out[7];
++
++			printf("SWEET AUDIO: tone %s %u bytes (consumed %u in the %u ms window), amp on %s, pll %s, amp off %s, errors %s%s\n",
++			    (f & 192u) == 192u ? "played" : "NOT played", swau_r.pb.tone_bytes, swau_r.pb.tone_rx1 - swau_r.pb.tone_rx0, out[2] >> 8,
++			    (f & 192u) == 192u ? "l,r" : "NO", out[5] && out[6] ? "locked l,r" : out[5] ? "l only" : out[6] ? "r only" : "NOT locked",
++			    (f & 768u) == 768u ? "l,r" : (f & 256u) ? "l only" : (f & 512u) ? "r only" : "NOT confirmed",
++			    (f & 3072u) == 0u ? "none" : (f & 3072u) == 3072u ? "l,r" : (f & 1024u) ? "l" : "r",
++			    arc == 0 && swau_close_rc == SWAU_OK && swau_r.stopped ? "" : " (run / close not clean: see the AMP lines)");
++			return;
++		}
+ 		if (arc == 0 && out[2] && swau_open_rc == SWAU_OK && swau_close_rc == SWAU_OK && swau_r.started && swau_r.stopped && out[3] && out[4] &&
+ 		    !(out[7] & 0xFu)) {
+ 			if (out[5] && out[6]) {
+@@ -354,7 +384,7 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
+-		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 6) {
++		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 7) {
+ 			swau_run(&r, image_size);       /* patch 0378, step A9 (5: + stream, patch 0379) */
+ 		}
+ 		return;
+diff --git a/bsd/dev/sweet_audio.h b/bsd/dev/sweet_audio.h
+index 32d6190..28522a2 100644
+--- a/bsd/dev/sweet_audio.h
++++ b/bsd/dev/sweet_audio.h
+@@ -135,6 +135,8 @@ struct swau_ring {
+ 	uint32_t hdr, flags, irq;
+ 	struct swau_region g;
+ 	uint32_t rx0, fed, feeds, feed_err, zeroed, reset;
++	/* patch 0384 (sweetaoc=7): tone on; fed at the switch-on (frame 0 of the pattern); beep bytes written; rx at switch on / off */
++	uint32_t tone, tone_base, tone_bytes, tone_rx0, tone_rx1;
+ };
+ struct swau_res {
+ 	struct swau_svc s;
+@@ -531,7 +533,53 @@ swau_ring_prime(const struct swau_bus *b, struct swau_ring *p)
+ 	return SWAU_OK;
+ }
+ 
+-/* one feed of ZEROS: what the AOC consumed since, at most SWAU_FEED_MAX bytes; no wait. Called each poll ms while the stream runs. */
++/* patch 0384 (sweetaoc=7): the test tone. 1 kHz at 48 kHz = 48 samples per period, amplitude 1036 = 32767 * 10^(-30 / 20) (-30.0 dBFS);
++ * three beeps of 1 s, 1 s apart: frames [0, 48000), [96000, 144000), [192000, 240000), then silence. S16_LE, the same sample on both channels
++ * (EP_SETUP 2 ch 16 bit: L in the low half of the 32-bit frame, R in the high half). */
++#define SWAU_TONE_FRAMES	240000u
++#define SWAU_TONE_SR		48000u
++static const int16_t swau_sine48[48] = {
++	0, 135, 268, 396, 518, 631, 733, 822, 897, 957, 1001, 1027, 1036, 1027, 1001, 957, 897, 822, 733, 631, 518, 396, 268, 135,
++	0, -135, -268, -396, -518, -631, -733, -822, -897, -957, -1001, -1027, -1036, -1027, -1001, -957, -897, -822, -733, -631, -518, -396, -268, -135,
++};
++static uint32_t
++swau_tone_word(uint32_t frame)
++{
++	uint16_t v;
++
++	if (frame >= SWAU_TONE_FRAMES || ((frame / SWAU_TONE_SR) & 1u)) {
++		return 0u;
++	}
++	v = (uint16_t)swau_sine48[frame % 48u];
++	return (uint32_t)v | (uint32_t)v << 16;
++}
++
++/* patch 0384: the tone switch (the amp code calls it once on, once off); the rx counter at each switch for the consumed count */
++static void
++swau_tone(const struct swau_bus *b, struct swau_res *r, int on)
++{
++	struct swau_ring *p = &r->pb;
++
++	if (!r->started || r->stopped) {
++		return;
++	}
++	if (on) {
++		p->tone_base = p->fed;
++		p->tone = 1;
++	} else {
++		p->tone = 0;
++	}
++	if (swau_counters(b, &p->g)) {
++		if (on) {
++			p->tone_rx0 = p->tone_rx1 = p->g.rx;
++		} else {
++			p->tone_rx1 = p->g.rx;
++		}
++	}
++}
++
++/* one feed of ZEROS (patch 0384: of the tone pattern while the tone is on): what the AOC consumed since, at most SWAU_FEED_MAX bytes; no
++ * wait. Called each poll ms while the stream runs. */
+ static void
+ swau_feed(const struct swau_bus *b, struct swau_res *r)
+ {
+@@ -559,10 +607,15 @@ swau_feed(const struct swau_bus *b, struct swau_res *r)
+ 		return;
+ 	}
+ 	for (k = 0; k < n; k += 4u) {
+-		if (!b->iw32(b->ctx, g->offset + (g->wp + k) % g->size, 0u)) {
++		uint32_t w = p->tone ? swau_tone_word((p->fed + k - p->tone_base) / 4u) : 0u;
++
++		if (!b->iw32(b->ctx, g->offset + (g->wp + k) % g->size, w)) {
+ 			p->feed_err++;
+ 			return;         /* tx not advanced: the AOC sees nothing new */
+ 		}
++		if (w) {
++			p->tone_bytes += 4u;
++		}
+ 	}
+ 	b->isync(b->ctx);
+ 	if (!b->iw32(b->ctx, g->base + 12u, g->tx + n) || !b->iw32(b->ctx, g->base + 20u, (g->wp + n) % g->size)) {

@@ -1,5 +1,5 @@
 /*
- * Host test of the Trusty TIPC GET_STATE step (xnu patch 0162, bsd/dev/sweet_tipc.h) against a fake Trusty that checks
+ * Host test of the Trusty TIPC GET_STATE step (xnu patch 0375, bsd/dev/sweet_tipc.h) against a fake Trusty that checks
  * the wire formats it receives (FF-A share descriptor, virtio status/features/vring handles, TIPC connect/data/disconnect)
  * the way the stock Linux driver builds them (docs/research/50). Also: the allowlist, bounds, and teardown on every stop.
  */
@@ -18,7 +18,7 @@ struct fake {
 	/* injections */
 	uint32_t api, ffa_ver, getdescr_ret_neg, num_vdev, dfeat, conn_status, herr, state, never_online, share_fail_at;
 	uint32_t intr_descr, fiq_start, busy_reset, nopint, msgmax, cpu_idle_start, reclaim_deny, reset_idle_fail, reply_src, reply_dst;
-	uint32_t seq, seq_st[4], seq_err[4], subs[4];   /* patch 0165: hwmgr sequence replies, subs received */
+	uint32_t seq, seq_st[4], seq_err[4], subs[4];   /* patch 0377: hwmgr sequence replies, subs received */
 	/* state */
 	uint64_t now;
 	uint32_t mapped, unmapped, nsh, started, stopped, resets, online_sent, conn, got_req, got_disc, errors, pending;
@@ -448,7 +448,7 @@ main(void)
 		reset();
 		CHECK(swtp_run(&bad, &r) == SWTP_E_ARG && F.nc == 0, "misaligned arena refused");
 	}
-	/* patch 0165: GET_STATE, START, GET_STATE (gated on LOADED) */
+	/* patch 0377: GET_STATE, START, GET_STATE (gated on LOADED) */
 	{
 		static const uint8_t seq[3] = { 0, 1, 0 }, bad[2] = { 0, 4 }, twice[3] = { 0, 1, 1 }, first[1] = { 1 };
 		struct swtp_bus sb = { fsmc, fnow, fdelay, NULL, arena, PA0, seq, 3 };

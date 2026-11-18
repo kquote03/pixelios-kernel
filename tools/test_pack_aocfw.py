@@ -1,4 +1,4 @@
-"""tools/pack_aocfw.py: AOCFWZB1 container of the stock aoc.bin (xnu patch 0164, sweetaoc=2), mkpayload --aocfw, build-xnu-image.sh/xrun --aocfw.
+"""tools/pack_aocfw.py: AOCFWZB1 container of the stock aoc.bin (xnu patch 0376, sweetaoc=2), mkpayload --aocfw, build-xnu-image.sh/xrun --aocfw.
 The layout must match what bsd/dev/sweet_aoc_load.h (swal_container) reads; the pinned identity must be the one of docs/research/50."""
 import os
 import re
@@ -43,7 +43,7 @@ class PackAocfw(unittest.TestCase):
         self.assertIn(p.AOC_SHA.hex(), note)
         self.assertIn('15,158,976', note)
         self.assertEqual(p.AOC_LEN, 15158976)
-        patch = open(os.path.join(ROOT, 'xnu', 'patches', '0164-aoc-load.patch')).read()
+        patch = open(os.path.join(ROOT, 'xnu', 'patches', '0376-aoc-load.patch')).read()
         self.assertIn('#define SWAL_FW_LEN       15158976u', patch)
         m = re.search(r'swal_fw_sha\[32\] = \{(.*?)\};', patch, re.S)
         got = bytes(int(x, 16) for x in re.findall(r'0x([0-9a-f]{2})', m.group(1).replace('\n+', '\n')))

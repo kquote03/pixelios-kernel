@@ -1,0 +1,986 @@
+SWEET AOC start + service discovery (patch 0377, plan 2026-11-14 oneshot-2 step A8), boot-arg sweetaoc=3 (1 = A4 reads, 2 = A6 load).
+sweetaoc=3 runs the A6 load of patch 0376 unchanged; after "gsa load ok", in the same thread (bsd/dev/sweet_aoc_start.c, pure logic
+bsd/dev/sweet_aoc_start.h, host test shim/aoc_start_host_test.c, cites docs/research/50 s.6 and the stock DT/source): chipid read
+(GS101, rev 0x11 as stock), aoc_req/SysMMU read, the parameter block of aoc_pass_fw_information at carveout + image_size (22
+entries; board id 0x20302, rev 0x10000 from the stock DT aoc-board-cfg "o6"), the SSMT bypass of aoc_configure_ssmt (64 writes,
+restored on every stop where the AOC was not started), then over the patch 0375 transport hwmgr.aoc GET_STATE, START (only after
+a LOADED reply; gate in bsd/dev/sweet_tipc.h, which gains an optional sub sequence; sweettrusty=2 unchanged), GET_STATE; poll the
+control block magic 0xA0C00A0C <= 5 s; read the service table (read only), aoc_req := 0 as aoc_did_become_online. No SysMMU or
+S2MPU write, no mailbox write, no AOC reset, no audio path, no amp. Lines: "SWEET AOC: online services=N ..." + one line per
+service, or "SWEET AOC: start stop <why>" with a read-only dump of the AOC mailbox, aoc_req and the SysMMU. No retry.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 00ae328..a13b1cf 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -148,6 +148,7 @@ bsd/dev/sweet_amp.c			standard
+ bsd/dev/sweet_trusty.c		standard
+ bsd/dev/sweet_aoc.c		standard
+ bsd/dev/sweet_aoc_load.c	standard
++bsd/dev/sweet_aoc_start.c	standard
+ bsd/dev/sweet_tipc.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index 260153c..b947b20 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -23,6 +23,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern volatile uint32_t sweet_usblog_sent;             /* sweet_usb.c (this patch): datagrams sent by the USB log */
+ void sweet_aoc_init(void);
+ extern void sweet_aoc_load_start(void);              /* bsd/dev/sweet_aoc_load.c (patch 0376), sweetaoc=2 */
++extern void sweet_aoc_load_start3(void);             /* same file (patch 0377), sweetaoc=3: load, then AOC start */
+ 
+ #define SWA_WAIT_USB_MS   300000u
+ #define SWA_SETTLE_MS     500u
+@@ -125,12 +126,16 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 3) {
++		sweet_aoc_load_start3();    /* patch 0377, step A8: the A6 load, then param block, SSMT, hwmgr START, ready, services */
++		return;
++	}
+ 	if (on == 2) {
+ 		sweet_aoc_load_start();     /* patch 0376, step A6: LOAD_AOC_FW_IMG only (bsd/dev/sweet_aoc_load.c) */
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_load.c b/bsd/dev/sweet_aoc_load.c
+index a4f69e6..23b9693 100644
+--- a/bsd/dev/sweet_aoc_load.c
++++ b/bsd/dev/sweet_aoc_load.c
+@@ -41,6 +41,9 @@ extern void flush_dcache64(addr64_t, unsigned, int);            /* osfmk/arm/cac
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern volatile uint32_t sweet_usblog_sent;                     /* sweet_usb.c (patch 0374) */
+ void sweet_aoc_load_start(void);
++void sweet_aoc_load_start3(void);
++extern void sweet_aoc_start_after_load(uint32_t image_size);   /* bsd/dev/sweet_aoc_start.c (patch 0377), sweetaoc=3 */
++static int swal_mode = 2;      /* 3 = patch 0377: after "gsa load ok" go on with the AOC start (step A8) */
+ 
+ #define SWAL_WAIT_USB_MS  300000u
+ #define SWAL_SETTLE_MS    300u
+@@ -276,7 +279,7 @@ swal_thread(__unused void *arg, __unused wait_result_t wr)
+ 	for (ms = 0; sweet_usblog_sent == 0 && ms < SWAL_WAIT_USB_MS; ms += 100u) {
+ 		swal_sleep_ms(NULL, 100);
+ 	}
+-	printf("SWEET AOC: load start after %u ms (usb log %s); GSA command 90 only, no AOC start\n", ms, sweet_usblog_sent ? "up" : "NOT up");
++	printf("SWEET AOC: load start after %u ms (usb log %s); GSA command 90 only, %s\n", ms, sweet_usblog_sent ? "up" : "NOT up", swal_mode == 3 ? "then the A8 start (sweetaoc=3)" : "no AOC start");
+ 	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
+ 	    SecureDTGetProperty(mm, "AOCFW", &p, &psize) != kSuccess || psize != 2 * sizeof(uint64_t)) {
+ 		printf("SWEET AOC: load stop no-AOCFW (xrun --aocfw), nothing touched\n");
+@@ -325,6 +328,9 @@ swal_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	if (rc == SWAL_OK) {
+ 		printf("SWEET AOC: gsa load ok (err 0, rsp_argc %u, %u ms)\n", r.rsp_argc, r.waited_ms);
++		if (swal_mode == 3) {
++			sweet_aoc_start_after_load(r.sb_image_size);   /* patch 0377: same thread, right after the load (aoc.c:635-651) */
++		}
+ 		return;
+ 	}
+ 	en = swal_gsa_err_name(r.rsp_err);
+@@ -347,3 +353,11 @@ sweet_aoc_load_start(void)
+ 	thread_deallocate(th);
+ 	printf("SWEET AOC: load armed (sweetaoc=2), starts once the USB log is up\n");
+ }
++
++/* patch 0377 (plan A8, sweetaoc=3): the A6 load above, unchanged, then sweet_aoc_start_after_load on success */
++void
++sweet_aoc_load_start3(void)
++{
++	swal_mode = 3;
++	sweet_aoc_load_start();
++}
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+new file mode 100644
+index 0000000..234f634
+--- /dev/null
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -0,0 +1,206 @@
++/*
++ * AOC start + service discovery (patch 0377, plan 2026-11-14 oneshot-2 step A8), boot-arg sweetaoc=3. Called by the A6 load
++ * thread (sweet_aoc_load.c, patch 0376, unchanged path) right after "gsa load ok". Glue for the pure sequence in
++ * sweet_aoc_start.h (all cites there; host test shim/aoc_start_host_test.c):
++ *   - windows: ml_io_map (device) for aoc_req, SSMT, AOC mailbox, AOC SysMMU, chipid (5 small windows of the io submap);
++ *     the IPC window (4 MiB at carveout + image_size) write-combined through ml_io_map_unmappable, as patch 0376 maps the
++ *     body (stock: devm_ioremap_wc, aoc.c:2614), removed on every exit;
++ *   - the hwmgr sequence: sweet_tipc_aoc_start (sweet_tipc.c, patch 0375 transport + 0377 sequence);
++ *   - kAOCRandSeed from read_random (stock get_random_u32, aoc.c:485).
++ * Lines "SWEET AOC: <step>" before each hardware step (300 ms settle so the USB log carries it), the result
++ * "SWEET AOC: online services=N" + one line per service, or "SWEET AOC: start stop <why>" with the read-only dump.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/random.h>
++#include <machine/machine_routines.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <vm/vm_kern.h>
++#include <mach/vm_param.h>
++#include <vm/memory_types.h>
++#include <arm/memory_types.h>            /* VM_WIMG_WCOMB */
++#include <stdint.h>
++
++#include "sweet_aoc_start.h"
++#include "sweet_tipc.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);   /* osfmk/arm64/machine_routines.c:1574 */
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern int sweet_tipc_aoc_start(struct swtp_res *r);                             /* sweet_tipc.c (patch 0377) */
++void sweet_aoc_start_after_load(uint32_t image_size);
++
++#define SWAS_SETTLE_MS 300u
++
++static const uint64_t swas_win_pa[SWAS_NWIN] = { SWAS_REQ_PA, SWAS_SSMT_PA, SWAS_MBOX_PA, SWAS_MMU_PA, SWAS_CHIPID_PA };
++static vm_offset_t swas_va[SWAS_NWIN], swas_ipc_va;
++static int swas_chan;
++
++static int
++swas_map(int w)
++{
++	if (w < 0 || w >= SWAS_NWIN) {
++		return 0;
++	}
++	if (swas_va[w] == 0) {
++		swas_va[w] = ml_io_map((vm_offset_t)swas_win_pa[w], (vm_size_t)swas_win_len[w]);
++	}
++	return swas_va[w] != 0;
++}
++
++static int
++swas_r32(__unused void *ctx, int w, uint32_t off, uint32_t *v)
++{
++	if (w < 0 || w >= SWAS_NWIN || (off & 3u) || off > swas_win_len[w] - 4u || !swas_map(w)) {
++		return 0;
++	}
++	*v = *(volatile uint32_t *)(swas_va[w] + off);
++	return 1;
++}
++
++static int
++swas_w32(__unused void *ctx, int w, uint32_t off, uint32_t v)
++{
++	if (w < 0 || w >= SWAS_NWIN || (off & 3u) || off > swas_win_len[w] - 4u || !swas_map(w)) {
++		return 0;
++	}
++	*(volatile uint32_t *)(swas_va[w] + off) = v;
++	__builtin_arm_dsb(0xF);
++	return 1;
++}
++
++static int
++swas_imap(__unused void *ctx, uint64_t pa, uint32_t len)
++{
++	if (swas_ipc_va != 0 || len != SWAS_IPC_LEN || pa < SWAS_CARVE_PA || pa + len > SWAS_CARVE_PA + SWAS_HEAP_LOW) {
++		return 0;
++	}
++	swas_ipc_va = ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)len, VM_WIMG_WCOMB);
++	return swas_ipc_va != 0;
++}
++
++static void
++swas_iunmap(__unused void *ctx)
++{
++	if (swas_ipc_va != 0) {
++		__builtin_arm_dsb(0xF);
++		ml_io_unmap(swas_ipc_va, SWAS_IPC_LEN);
++		swas_ipc_va = 0;
++	}
++}
++
++static int
++swas_ir32(__unused void *ctx, uint32_t off, uint32_t *v)
++{
++	if (swas_ipc_va == 0 || (off & 3u) || off > SWAS_IPC_LEN - 4u) {
++		return 0;
++	}
++	*v = *(volatile uint32_t *)(swas_ipc_va + off);
++	return 1;
++}
++
++static int
++swas_iw32(__unused void *ctx, uint32_t off, uint32_t v)
++{
++	if (swas_ipc_va == 0 || (off & 3u) || off > SWAS_IPC_LEN - 4u) {
++		return 0;
++	}
++	*(volatile uint32_t *)(swas_ipc_va + off) = v;
++	return 1;
++}
++
++static void
++swas_isync(__unused void *ctx)
++{
++	__builtin_arm_dsb(0xF);
++}
++
++static void
++swas_sleep_ms(__unused void *ctx, uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&swas_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++swas_say(void *ctx, const char *what)
++{
++	printf("SWEET AOC: %s\n", what);
++	swas_sleep_ms(ctx, SWAS_SETTLE_MS);
++}
++
++static uint32_t
++swas_rand32(__unused void *ctx)
++{
++	uint32_t v = 0;
++
++	read_random(&v, sizeof(v));
++	return v;
++}
++
++static void
++swas_tipc(__unused void *ctx, struct swas_tipc *t)
++{
++	static struct swtp_res tr;
++	uint32_t i;
++
++	t->rc = sweet_tipc_aoc_start(&tr);
++	t->why = swtp_ename(t->rc);
++	t->n = tr.nst <= 3u ? tr.nst : 3u;
++	for (i = 0; i < 3u; i++) {
++		t->st[i] = tr.sts[i];
++		t->err[i] = tr.herrs[i];
++	}
++	t->start_sent = tr.start_sent;
++	t->start_replied = tr.start_replied;
++}
++
++void
++sweet_aoc_start_after_load(uint32_t image_size)
++{
++	static struct swas_res r;
++	static struct swas_bus b;
++	uint32_t i;
++	int rc;
++
++	printf("SWEET AOC: start (A8): image_size %#x, param block, SSMT bypass, hwmgr START, ready <= 5 s, services (read only)\n",
++	    image_size);
++	b = (struct swas_bus){ swas_r32, swas_w32, swas_imap, swas_iunmap, swas_ir32, swas_iw32, swas_isync, swas_tipc,
++		               swas_sleep_ms, swas_say, swas_rand32, NULL };
++	rc = swas_run(&b, &r, image_size);
++	swas_iunmap(NULL);
++	printf("SWEET AOC: chip prod %#x rev %#x type %#x; pre aoc_req %u/%u sysmmu ctrl %#x cfg %#x st %#x\n", r.chip_prod,
++	    r.chip_rev, r.chip_type, r.req, r.req_st, r.mmu_ctrl, r.mmu_cfg, r.mmu_st);
++	printf("SWEET AOC: param words %u bad %u; ssmt bypass found %u/64 wrote %u restored %u\n", SWAS_PARAM_WORDS, r.param_bad,
++	    r.ssmt_bypass_found, r.ssmt_wrote, r.ssmt_restored);
++	printf("SWEET AOC: hwmgr rc %d (%s) replies %u state %u/%u/%u err %u/%u/%u start sent %u replied %u\n", r.t.rc,
++	    r.t.why ? r.t.why : "-", r.t.n, r.t.st[0], r.t.st[1], r.t.st[2], r.t.err[0], r.t.err[1], r.t.err[2], r.t.start_sent,
++	    r.t.start_replied);
++	printf("SWEET AOC: magic %#x after %u ms\n", r.magic, r.waited_ms);
++	if (r.dumped) {
++		printf("SWEET AOC: dump mbox intsr0 %#x intmr1 %#x intsr1 %#x intmsr1 %#x; aoc_req %u/%u; sysmmu ctrl %#x cfg %#x st %#x\n",
++		    r.d_intsr0, r.d_intmr1, r.d_intsr1, r.d_intmsr1, r.d_req, r.d_req_st, r.d_mmu_ctrl, r.d_mmu_cfg, r.d_mmu_st);
++	}
++	if (rc == SWAS_OK || rc == SWAS_E_NOCTL || rc == SWAS_E_SVC) {
++		printf("SWEET AOC: fw %#x '%s' services %u size %u offset %#x\n", r.fw_version, r.fw_name, r.services, r.service_size,
++		    r.services_offset);
++	}
++	if (rc == SWAS_OK || rc == SWAS_E_NOCTL) {
++		for (i = 0; i < r.services; i++) {
++			printf("SWEET AOC: service %u %s flags %#x type %u irq %u\n", i, r.names[i], r.flags[i],
++			    (r.flags[i] & 0x70000u) >> 16, (r.flags[i] & 0x00F80000u) >> 19);
++		}
++	}
++	if (rc == SWAS_OK) {
++		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
++		    r.req_released);
++		return;
++	}
++	printf("SWEET AOC: start stop %s (code %d, bad index %d why %u), no retry\n",
++	    rc > 0 && rc < SWAS_NSTOP ? swas_stop_name[rc] : "?", rc, (int)r.bad_index, r.bad_why);
++}
+diff --git a/bsd/dev/sweet_aoc_start.h b/bsd/dev/sweet_aoc_start.h
+new file mode 100644
+index 0000000..a926c16
+--- /dev/null
++++ b/bsd/dev/sweet_aoc_start.h
+@@ -0,0 +1,423 @@
++/*
++ * AOC start + service discovery (patch 0377, plan 2026-11-14 oneshot-2 step A8), boot-arg sweetaoc=3: runs only after the
++ * unchanged A6 load (patch 0376) answered "gsa load ok". Pure logic, no kernel headers: the host test
++ * shim/aoc_start_host_test.c drives it with a fake SoC, a fake TIPC peer and a fake AOC control block / service table.
++ * Sources pinned in docs/research/50 (aoc = google-modules/aoc ac69293, ipc = aoc-ipc 1fe9b9c, gsa = soc/gs 2040787,
++ * ref = stock capture 20261114T072643Z: dt/base/aoc@19000000, iomem.txt, dmesg.clean).
++ *
++ * Order (aoc_fw_callback after the load, aoc.c:635-663, and aoc_did_become_online, aoc.c:1322-1395):
++ *   1. chipid 0x10000000 (ref dt chipid@10000000), READ ONLY: word +0x0 and +0x10 as gs_chipid_get_chipid_info
++ *      (gs-chipid.c:359-394, drv_data_gs101 :115-126): product = w0 & 0xFFFFF000 must be GS101 0x09845000 (:71),
++ *      revision = (w0 & 0xF) << 4 | (w10 >> 16 & 0xF) must be 0x11 (stock "CPU_REV[0x11]", ref dmesg:534), type = w0 & 0xFF.
++ *      A mismatch stops here, nothing written.
++ *   2. READ ONLY: aoc_req 0x175D0000 +0x00/+0x40 (aoc_v1.c:87-106) must read 1/1 (left so by the A6 load); AOC SysMMU
++ *      0x1A090000 CTRL/CFG/STATUS (+0/+4/+8, samsung-iommu.h:191-193 as patch 0374). The stock driver programs no SysMMU
++ *      mapping in the GSA path (iommu_map only in the non-GSA branch, aoc.c:620-633, 1251-1289) and never touches the AOC
++ *      S2MPU 0x1A0B0000 (docs/research/50 s.6.5): neither is written here.
++ *   3. IPC window = carveout 0x94000000 + image_size (superbin header, _aoc_fw_ipc_offset aoc_firmware.c:268-272; A6
++ *      measured 0x1400000), mapped SWAS_IPC_LEN. WRITE the parameter block (aoc_pass_fw_information aoc.c:384-399:
++ *      magic 0x0a0cda7a aoc.h:322, count, 12 + 12*count, then {key, 4, value}; the 22 keys in the order of aoc.c:503-526,
++ *      keys aoc.h:325-347), barrier, read back.
++ *   4. WRITE the SSMT bypass (aoc_configure_ssmt aoc_v1.c:317-338, done by stock at probe, aoc.c:2656): SSMT 0x1A060000
++ *      (ref dt aoc reg[3] "ssmt_aoc" size 0x5000, iomem:60), NS_READ_PID(n) 0x4000+4n and NS_WRITE_PID(n) 0x4200+4n
++ *      (aoc_v1.c:23-24) := 0x80000000 (SSMT_BYPASS_VALUE :22) for n = 0..32 except 31. Found values are read first and
++ *      written back on every stop on which the AOC was not started (START not sent, or START answered with an error).
++ *   5. Trusty hwmgr.aoc over the patch 0375 transport: GET_STATE (0), START (1) only if that reply was err 0 / state
++ *      LOADED (1) (aoc.c:1587 expects LOADED after a load), GET_STATE (0) (gsa_aoc.h:60-64, 80-86; gsa_core.c:97-131;
++ *      the gate is enforced in sweet_tipc.h too). err != 0 or a state outside {0, 1, 2}: stop (H9), no retry.
++ *   6. ready: poll the control block magic 0xA0C00A0C at ipc + 0 (aoc_fw_ready aoc.c:201-203, AOC_MAGIC
++ *      aoc_ipc_core_internal.h:61) every 10 ms for at most 5000 ms (aoc_monitor_online armed at 5 s, aoc.c:660). Polled:
++ *      the AOC mailbox interrupt (mailbox-wc.c:122-148) is not unmasked. No ready: dump READ ONLY the AOC mailbox
++ *      0x176A0000 (gs101-aoc.dtsi:9-19, ref iomem:56 / interrupts:7; INTSR0 0x2C, INTMR1 0x48, INTSR1 0x4C, INTMSR1 0x50,
++ *      mailbox-wc.c:22-34), aoc_req and the SysMMU, stop. Stock would reset the AOC here (aoc.c:1305-1320): not done.
++ *   7. discovery, READ ONLY (struct aoc_control_block, aoc_ipc_core_internal.h:62-72: services @24, service_size @28,
++ *      services_offset @32, fw_version_name @36): 1 <= services <= 200 (AOC_MAX_ENDPOINTS aoc.h:300), service i at
++ *      ipc + services_offset + i * service_size (aoc_service_core.c:343-347), header name[32] + flags (:93-98), the table
++ *      inside the mapped window; names non-empty, < 32 bytes, unique (service_names_are_valid aoc.c:228-260).
++ *   8. online: aoc_req := 0 (request_aoc_on(false) in aoc_did_become_online, aoc.c:1335). No audio path, no amp.
++ * The glue prints one line (say) before every hardware step, so a stall names it.
++ */
++#ifndef SWEET_AOC_START_H
++#define SWEET_AOC_START_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define SWAS_CARVE_PA      0x94000000ull           /* ref dmesg:21, aoc.c:459-460 */
++#define SWAS_CARVE_LEN     0x03000000u
++#define SWAS_HEAP_LOW      0x02BEC000u             /* lowest DMA heap (capture) offset, aoc.c:2338-2368, aoc.h:42-44 */
++#define SWAS_AOC_IOVA      0x98000000u             /* AOC_BINARY_DRAM_BASE aoc.h:318, aoc_dram_translate_to_aoc aoc.c:187-198 */
++#define SWAS_IPC_LEN       0x00400000u             /* our window: control block + service table */
++
++#define SWAS_REQ_PA        0x175D0000ull
++#define SWAS_SSMT_PA       0x1A060000ull
++#define SWAS_MBOX_PA       0x176A0000ull
++#define SWAS_MMU_PA        0x1A090000ull
++#define SWAS_CHIPID_PA     0x10000000ull
++enum { SWAS_W_REQ = 0, SWAS_W_SSMT, SWAS_W_MBOX, SWAS_W_MMU, SWAS_W_CHIPID, SWAS_NWIN };
++static const uint32_t swas_win_len[SWAS_NWIN] = { 0x1000u, 0x5000u, 0x1000u, 0x1000u, 0x1000u };
++
++#define SWAS_GS101_PRODUCT 0x09845000u
++#define SWAS_STOCK_REV     0x11u
++#define SWAS_SSMT_BYPASS   0x80000000u
++#define SWAS_SSMT_RD(n)    (0x4000u + 4u * (n))
++#define SWAS_SSMT_WR(n)    (0x4200u + 4u * (n))
++#define SWAS_NSSMT         32u                     /* stream ids 0..32 without 31 */
++#define SWAS_PARAM_MAGIC   0x0a0cda7au
++#define SWAS_NPARAM        22u
++#define SWAS_PARAM_WORDS   (3u + 3u * SWAS_NPARAM)
++#define SWAS_AOC_MAGIC     0xA0C00A0Cu
++#define SWAS_READY_MS      5000u
++#define SWAS_POLL_MS       10u
++#define SWAS_MAX_SVC       200u
++#define SWAS_NAME          32u
++#define SWAS_SVC_MIN       (SWAS_NAME + 4u + 2u * 28u)     /* sizeof(struct aoc_ipc_service_header), packed */
++
++/* DT values of the stock oriole node (ref dt/base/aoc@19000000; dts-rav gs101-oriole-audio.dtsi:12-16):
++ * aoc-board-cfg "o6" (only logged, aoc.c:426-440), aoc-board-id 0x20302, aoc-board-rev 0x10000, force-vnom 0, no gnss-type,
++ * no wifi-chip (dt_property -> 0, aoc.c:493-497). */
++#define SWAS_BOARD_ID      0x00020302u
++#define SWAS_BOARD_REV     0x00010000u
++
++/* the TIPC sequence result (glue copies it from struct swtp_res of sweet_tipc.h) */
++struct swas_tipc {
++	int rc;                         /* 0 = all three replies err 0 */
++	const char *why;                /* transport stop name */
++	uint32_t n;                     /* replies received */
++	uint32_t st[3], err[3];         /* per reply: state, err */
++	uint32_t start_sent, start_replied;
++};
++
++struct swas_bus {
++	int (*r32)(void *ctx, int w, uint32_t off, uint32_t *v);       /* 1 ok */
++	int (*w32)(void *ctx, int w, uint32_t off, uint32_t v);        /* 1 ok */
++	int (*imap)(void *ctx, uint64_t pa, uint32_t len);              /* map the IPC window; 1 ok */
++	void (*iunmap)(void *ctx);
++	int (*ir32)(void *ctx, uint32_t off, uint32_t *v);              /* IPC window word; 1 ok */
++	int (*iw32)(void *ctx, uint32_t off, uint32_t v);
++	void (*isync)(void *ctx);                                       /* barrier after the IPC writes */
++	void (*tipc)(void *ctx, struct swas_tipc *t);                   /* GET_STATE, START (gated), GET_STATE */
++	void (*sleep_ms)(void *ctx, uint32_t ms);
++	void (*say)(void *ctx, const char *what);
++	uint32_t (*rand32)(void *ctx);
++	void *ctx;
++};
++
++enum {
++	SWAS_OK = 0, SWAS_E_ARGS, SWAS_E_IMAGE, SWAS_E_CHIP, SWAS_E_READ, SWAS_E_REQ, SWAS_E_MAP, SWAS_E_PARAM, SWAS_E_SSMT,
++	SWAS_E_TIPC, SWAS_E_UNDOC, SWAS_E_NOREADY, SWAS_E_SVC, SWAS_E_NOCTL, SWAS_NSTOP
++};
++static const char *const swas_stop_name[SWAS_NSTOP] = { "ok", "bad-args", "bad-image-size", "chipid-mismatch",
++	"read-failed", "aoc_req-not-on", "ipc-map-failed", "param-readback", "ssmt-readback", "tipc", "undocumented-reply",
++	"no-ready", "malformed-service-table", "no-audio_output_control" };
++
++struct swas_res {
++	int stage;
++	uint32_t image_size, chip0, chip10, chip_rev, chip_type, chip_prod, rand;
++	uint32_t req, req_st, mmu_ctrl, mmu_cfg, mmu_st;
++	uint32_t ssmt_found[2 * SWAS_NSSMT], ssmt_bypass_found, ssmt_wrote, ssmt_restored;
++	uint32_t param[SWAS_PARAM_WORDS], param_bad;
++	struct swas_tipc t;
++	uint32_t magic, waited_ms, dumped;
++	uint32_t d_intsr0, d_intmr1, d_intsr1, d_intmsr1, d_req, d_req_st, d_mmu_ctrl, d_mmu_cfg, d_mmu_st;
++	uint32_t fw_version, services, service_size, services_offset, bad_index, bad_why;
++	char fw_name[49];
++	char names[SWAS_MAX_SVC][SWAS_NAME];
++	uint32_t flags[SWAS_MAX_SVC];
++	uint32_t ctl_index, has_ctl, req_released;
++};
++
++/* the 22 entries of aoc.c:503-526, in that order */
++static inline void
++swas_params(struct swas_res *r)
++{
++	const uint32_t ah = SWAS_AOC_IOVA;
++	const uint32_t kv[SWAS_NPARAM][2] = {
++		{ 0x1001u, SWAS_BOARD_ID },             /* kAOCBoardID, aoc_board_config_parse aoc.c:401-440 */
++		{ 0x1002u, SWAS_BOARD_REV },            /* kAOCBoardRevision */
++		{ 0x1003u, 0u },                        /* kAOCSRAMRepaired: aoc_sram_was_repaired() false, aoc.c:367 */
++		{ 0x1005u, (uint32_t)SWAS_CARVE_PA },   /* kAOCCarveoutAddress: dram_resource.start (CPU PA), aoc.c:479 */
++		{ 0x1006u, SWAS_CARVE_LEN },            /* kAOCCarveoutSize */
++		{ 0x1007u, ah + SWAS_CARVE_LEN - 0x400000u },                     /* sensor heap (AOC view) */
++		{ 0x1008u, 0x400000u },                 /* SENSOR_DIRECT_HEAP_SIZE SZ_4M aoc.h:42 */
++		{ 0x100Cu, ah + SWAS_CARVE_LEN - 0x400000u - 0x4000u },           /* playback heap */
++		{ 0x100Du, 0x4000u },                   /* PLAYBACK_HEAP_SIZE SZ_16K aoc.h:43 */
++		{ 0x100Eu, ah + SWAS_CARVE_LEN - 0x400000u - 0x4000u - 0x10000u }, /* capture heap */
++		{ 0x100Fu, 0x10000u },                  /* CAPTURE_HEAP_SIZE SZ_64K aoc.h:44 */
++		{ 0x1009u, 0u },                        /* kAOCForceVNOM: DT force-vnom 0, sysfs flag default 0 */
++		{ 0x100Au, 0u },                        /* kAOCDisableMM (sysfs flag, kzalloc default 0) */
++		{ 0x100Bu, 0u },                        /* kAOCEnableUART (same) */
++		{ 0x1010u, 0u },                        /* kAOCForceSpeakerUltrasonic (same) */
++		{ 0x1011u, r->rand },                   /* kAOCRandSeed get_random_u32(), aoc.c:485 */
++		{ 0x1012u, r->chip_rev },               /* kAOCChipRevision gs_chipid_get_revision */
++		{ 0x1013u, r->chip_type },              /* kAOCChipType gs_chipid_get_type */
++		{ 0x1014u, 0u },                        /* kAOCGnssType: no DT gnss-type */
++		{ 0x1015u, 0u },                        /* kAOCVolteReleaseMif (sysfs flag default 0) */
++		{ 0x1016u, r->chip_prod },              /* kAOCChipProductId gs_chipid_get_product_id */
++		{ 0x1017u, 0u },                        /* kAOCWifiChip: no DT wifi-chip */
++	};
++	uint32_t i;
++
++	r->param[0] = SWAS_PARAM_MAGIC;
++	r->param[1] = SWAS_NPARAM;
++	r->param[2] = 12u + SWAS_NPARAM * 12u;
++	for (i = 0; i < SWAS_NPARAM; i++) {
++		r->param[3u + 3u * i] = kv[i][0];
++		r->param[4u + 3u * i] = 4u;
++		r->param[5u + 3u * i] = kv[i][1];
++	}
++}
++
++static inline uint32_t
++swas_ssmt_off(uint32_t k)       /* k = 0..63: read PIDs then write PIDs, stream ids 0..30, 32 */
++{
++	uint32_t sid = k % SWAS_NSSMT;
++
++	sid = sid < 31u ? sid : 32u;
++	return k < SWAS_NSSMT ? SWAS_SSMT_RD(sid) : SWAS_SSMT_WR(sid);
++}
++
++static inline void
++swas_ssmt_restore(const struct swas_bus *b, struct swas_res *r)
++{
++	uint32_t k;
++
++	if (!r->ssmt_wrote || r->ssmt_restored) {
++		return;
++	}
++	b->say(b->ctx, "ssmt: writing back the values found (AOC not started)");
++	for (k = 0; k < 2u * SWAS_NSSMT; k++) {
++		(void)b->w32(b->ctx, SWAS_W_SSMT, swas_ssmt_off(k), r->ssmt_found[k]);
++	}
++	r->ssmt_restored = 1;
++}
++
++static inline void
++swas_dump(const struct swas_bus *b, struct swas_res *r)
++{
++	b->say(b->ctx, "dump (read only): aoc mailbox 0x176A0000, aoc_req, sysmmu");
++	(void)b->r32(b->ctx, SWAS_W_MBOX, 0x2Cu, &r->d_intsr0);
++	(void)b->r32(b->ctx, SWAS_W_MBOX, 0x48u, &r->d_intmr1);
++	(void)b->r32(b->ctx, SWAS_W_MBOX, 0x4Cu, &r->d_intsr1);
++	(void)b->r32(b->ctx, SWAS_W_MBOX, 0x50u, &r->d_intmsr1);
++	(void)b->r32(b->ctx, SWAS_W_REQ, 0x00u, &r->d_req);
++	(void)b->r32(b->ctx, SWAS_W_REQ, 0x40u, &r->d_req_st);
++	(void)b->r32(b->ctx, SWAS_W_MMU, 0x0u, &r->d_mmu_ctrl);
++	(void)b->r32(b->ctx, SWAS_W_MMU, 0x4u, &r->d_mmu_cfg);
++	(void)b->r32(b->ctx, SWAS_W_MMU, 0x8u, &r->d_mmu_st);
++	r->dumped = 1;
++}
++
++static inline int
++swas_stop(const struct swas_bus *b, struct swas_res *r, int code, int mapped)
++{
++	swas_ssmt_restore(b, r);
++	if (mapped) {
++		b->iunmap(b->ctx);
++	}
++	return r->stage = code;
++}
++
++/* the AOC side is untrusted input: every offset is bounds-checked against the mapped window */
++static inline int
++swas_discover(const struct swas_bus *b, struct swas_res *r)
++{
++	uint32_t i, j, k, v, base;
++
++	if (!b->ir32(b->ctx, 4u, &r->fw_version) || !b->ir32(b->ctx, 24u, &r->services) ||
++	    !b->ir32(b->ctx, 28u, &r->service_size) || !b->ir32(b->ctx, 32u, &r->services_offset)) {
++		return SWAS_E_READ;
++	}
++	for (i = 0; i < 48u; i += 4u) {
++		if (!b->ir32(b->ctx, 36u + i, &v)) {
++			return SWAS_E_READ;
++		}
++		for (k = 0; k < 4u; k++) {
++			uint8_t c = (uint8_t)(v >> (8u * k));
++			r->fw_name[i + k] = (char)((c >= 0x20u && c < 0x7Fu) || c == 0 ? c : '?');
++		}
++	}
++	r->fw_name[48] = 0;
++	r->bad_index = 0xFFFFFFFFu;
++	if (r->services == 0u || r->services > SWAS_MAX_SVC) {
++		r->bad_why = 1;
++		return SWAS_E_SVC;
++	}
++	if (r->service_size < SWAS_SVC_MIN || r->service_size > 0x10000u || (r->service_size & 3u) || (r->services_offset & 3u) ||
++	    r->services_offset < 140u || r->services_offset > SWAS_IPC_LEN ||
++	    (uint64_t)r->services * r->service_size > (uint64_t)SWAS_IPC_LEN - r->services_offset) {
++		r->bad_why = 2;
++		return SWAS_E_SVC;
++	}
++	for (i = 0; i < r->services; i++) {
++		base = r->services_offset + i * r->service_size;
++		for (j = 0; j < SWAS_NAME; j += 4u) {
++			if (!b->ir32(b->ctx, base + j, &v)) {
++				return SWAS_E_READ;
++			}
++			for (k = 0; k < 4u; k++) {
++				r->names[i][j + k] = (char)(uint8_t)(v >> (8u * k));
++			}
++		}
++		if (!b->ir32(b->ctx, base + SWAS_NAME, &r->flags[i])) {
++			return SWAS_E_READ;
++		}
++		for (k = 0; k < SWAS_NAME && r->names[i][k]; k++) {
++			uint8_t c = (uint8_t)r->names[i][k];
++			if (c < 0x20u || c >= 0x7Fu) {
++				r->bad_index = i;
++				r->bad_why = 3;
++				return SWAS_E_SVC;
++			}
++		}
++		if (k == 0 || k == SWAS_NAME) {                 /* empty or not terminated, aoc.c:241-246 */
++			r->bad_index = i;
++			r->bad_why = k ? 4 : 5;
++			r->names[i][SWAS_NAME - 1] = 0;
++			return SWAS_E_SVC;
++		}
++		for (j = 0; j < i; j++) {                       /* unique, aoc.c:250-260 */
++			for (k = 0; k < SWAS_NAME && r->names[i][k] == r->names[j][k] && r->names[i][k]; k++) {
++			}
++			if (k < SWAS_NAME && r->names[i][k] == r->names[j][k]) {
++				r->bad_index = i;
++				r->bad_why = 6;
++				return SWAS_E_SVC;
++			}
++		}
++		{
++			static const char ctl[] = "audio_output_control";
++			for (k = 0; k < sizeof(ctl) && r->names[i][k] == ctl[k]; k++) {
++			}
++			if (k == sizeof(ctl) && !r->has_ctl) {
++				r->has_ctl = 1;
++				r->ctl_index = i;
++			}
++		}
++	}
++	return SWAS_OK;
++}
++
++/* The whole A8 step after a successful A6 load. Returns SWAS_OK only with ready + a valid table holding audio_output_control. */
++static inline int
++swas_run(const struct swas_bus *b, struct swas_res *r, uint32_t image_size)
++{
++	uint32_t i, v, ms;
++	int rc;
++
++	if (b == 0 || r == 0 || !b->r32 || !b->w32 || !b->imap || !b->iunmap || !b->ir32 || !b->iw32 || !b->isync || !b->tipc ||
++	    !b->sleep_ms || !b->say || !b->rand32) {
++		return SWAS_E_ARGS;
++	}
++	*r = (struct swas_res){ 0 };
++	r->image_size = image_size;
++	if (image_size < 0x1000u || (image_size & 0xFFFu) || image_size > SWAS_HEAP_LOW - SWAS_IPC_LEN) {
++		return r->stage = SWAS_E_IMAGE;
++	}
++	/* 1. chipid, read only */
++	b->say(b->ctx, "chipid 0x10000000: reading +0x0 and +0x10 (read only)");
++	if (!b->r32(b->ctx, SWAS_W_CHIPID, 0x0u, &r->chip0) || !b->r32(b->ctx, SWAS_W_CHIPID, 0x10u, &r->chip10)) {
++		return r->stage = SWAS_E_READ;
++	}
++	r->chip_prod = r->chip0 & 0xFFFFF000u;
++	r->chip_type = r->chip0 & 0xFFu;
++	r->chip_rev = ((r->chip0 & 0xFu) << 4) | ((r->chip10 >> 16) & 0xFu);
++	if (r->chip_prod != SWAS_GS101_PRODUCT || r->chip_rev != SWAS_STOCK_REV) {
++		return r->stage = SWAS_E_CHIP;
++	}
++	/* 2. pre-start state, read only */
++	b->say(b->ctx, "aoc_req 0x175D0000 and sysmmu 0x1A090000: reading (read only)");
++	if (!b->r32(b->ctx, SWAS_W_REQ, 0x00u, &r->req) || !b->r32(b->ctx, SWAS_W_REQ, 0x40u, &r->req_st) ||
++	    !b->r32(b->ctx, SWAS_W_MMU, 0x0u, &r->mmu_ctrl) || !b->r32(b->ctx, SWAS_W_MMU, 0x4u, &r->mmu_cfg) ||
++	    !b->r32(b->ctx, SWAS_W_MMU, 0x8u, &r->mmu_st)) {
++		return r->stage = SWAS_E_READ;
++	}
++	if (r->req != 1u || r->req_st != 1u) {
++		return r->stage = SWAS_E_REQ;
++	}
++	/* 3. parameter block */
++	b->say(b->ctx, "ipc: mapping carveout + image_size");
++	if (!b->imap(b->ctx, SWAS_CARVE_PA + image_size, SWAS_IPC_LEN)) {
++		return r->stage = SWAS_E_MAP;
++	}
++	r->rand = b->rand32(b->ctx);
++	swas_params(r);
++	b->say(b->ctx, "ipc: writing the parameter block (22 entries, 276 bytes, aoc.c:384-399)");
++	for (i = 0; i < SWAS_PARAM_WORDS; i++) {
++		if (!b->iw32(b->ctx, 4u * i, r->param[i])) {
++			return swas_stop(b, r, SWAS_E_PARAM, 1);
++		}
++	}
++	b->isync(b->ctx);
++	for (i = 0; i < SWAS_PARAM_WORDS; i++) {
++		if (!b->ir32(b->ctx, 4u * i, &v) || v != r->param[i]) {
++			r->param_bad = i + 1u;
++			return swas_stop(b, r, SWAS_E_PARAM, 1);
++		}
++	}
++	/* 4. SSMT bypass */
++	b->say(b->ctx, "ssmt 0x1A060000: reading NS_READ/WRITE_PID 0..32 (not 31)");
++	for (i = 0; i < 2u * SWAS_NSSMT; i++) {
++		if (!b->r32(b->ctx, SWAS_W_SSMT, swas_ssmt_off(i), &r->ssmt_found[i])) {
++			return swas_stop(b, r, SWAS_E_READ, 1);
++		}
++		r->ssmt_bypass_found += r->ssmt_found[i] == SWAS_SSMT_BYPASS;
++	}
++	b->say(b->ctx, "ssmt: writing 0x80000000 to the 64 PID registers (aoc_configure_ssmt, aoc_v1.c:317-338)");
++	r->ssmt_wrote = 1;
++	for (i = 0; i < 2u * SWAS_NSSMT; i++) {
++		(void)b->w32(b->ctx, SWAS_W_SSMT, swas_ssmt_off(i), SWAS_SSMT_BYPASS);
++	}
++	for (i = 0; i < 2u * SWAS_NSSMT; i++) {
++		if (!b->r32(b->ctx, SWAS_W_SSMT, swas_ssmt_off(i), &v) || v != SWAS_SSMT_BYPASS) {
++			return swas_stop(b, r, SWAS_E_SSMT, 1);
++		}
++	}
++	/* 5. GET_STATE, START, GET_STATE */
++	b->say(b->ctx, "tipc: hwmgr.aoc GET_STATE, START (only if LOADED), GET_STATE");
++	r->t = (struct swas_tipc){ 0 };
++	b->tipc(b->ctx, &r->t);
++	if (r->t.start_sent && !(r->t.start_replied && r->t.n >= 2u && r->t.err[1] != 0u)) {
++		r->ssmt_restored = 1;           /* the AOC may run: its routing stays (stock never undoes it) */
++	}
++	for (i = 0; i < r->t.n && i < 3u; i++) {
++		if (r->t.st[i] > 2u) {
++			swas_dump(b, r);
++			return swas_stop(b, r, SWAS_E_UNDOC, 1);
++		}
++	}
++	if (r->t.rc != 0 || r->t.n != 3u || r->t.st[0] != 1u || !r->t.start_replied || r->t.err[0] || r->t.err[1] || r->t.err[2]) {
++		swas_dump(b, r);
++		return swas_stop(b, r, SWAS_E_TIPC, 1);
++	}
++	/* 6. ready, bounded */
++	b->say(b->ctx, "ready: polling magic 0xA0C00A0C at ipc + 0, at most 5000 ms (aoc.c:201-203, 660)");
++	for (ms = 0;; ms += SWAS_POLL_MS) {
++		if (!b->ir32(b->ctx, 0u, &r->magic)) {
++			return swas_stop(b, r, SWAS_E_READ, 1);
++		}
++		if (r->magic == SWAS_AOC_MAGIC || ms >= SWAS_READY_MS) {
++			break;
++		}
++		b->sleep_ms(b->ctx, SWAS_POLL_MS);
++	}
++	r->waited_ms = ms;
++	if (r->magic != SWAS_AOC_MAGIC) {
++		swas_dump(b, r);
++		return swas_stop(b, r, SWAS_E_NOREADY, 1);
++	}
++	/* 7. service discovery, read only */
++	b->say(b->ctx, "ready; reading the control block and service table (read only)");
++	rc = swas_discover(b, r);
++	if (rc != SWAS_OK) {
++		swas_dump(b, r);
++		return swas_stop(b, r, rc, 1);
++	}
++	/* 8. online: release the power request as stock does */
++	b->say(b->ctx, "online: aoc_req := 0 (aoc_did_become_online, aoc.c:1335)");
++	r->req_released = (uint32_t)b->w32(b->ctx, SWAS_W_REQ, 0x00u, 0u);
++	b->iunmap(b->ctx);
++	return r->stage = r->has_ctl ? SWAS_OK : SWAS_E_NOCTL;
++}
++
++#endif /* SWEET_AOC_START_H */
+diff --git a/bsd/dev/sweet_tipc.c b/bsd/dev/sweet_tipc.c
+index 7057c34..9341ae5 100644
+--- a/bsd/dev/sweet_tipc.c
++++ b/bsd/dev/sweet_tipc.c
+@@ -20,6 +20,7 @@
+ 
+ extern vm_offset_t kvtophys(vm_offset_t);
+ void sweet_tipc_run(void);
++int sweet_tipc_aoc_start(struct swtp_res *r);
+ 
+ static void
+ swtp_smc_hw(__unused void *ctx, uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3, struct swtp_ret *out)
+@@ -58,10 +59,10 @@ swtp_delay_hw(__unused void *ctx, uint32_t us)
+ 	delay((int)us);
+ }
+ 
+-void
+-sweet_tipc_run(void)
++/* patch 0377: the 0375 run with an optional hwmgr sub sequence (sweet_tipc.h); subs == NULL is the A5 run unchanged */
++static int
++swtp_go(const uint8_t *subs, uint32_t nsubs, struct swtp_res *rp)
+ {
+-	static struct swtp_res r;
+ 	static struct swtp_bus b;
+ 	vm_offset_t va = 0;
+ 	vm_size_t len = round_page(SWTP_ARENA);
+@@ -69,11 +70,11 @@ sweet_tipc_run(void)
+ 	vm_size_t i;
+ 	int rc;
+ 
+-	printf("SWEET TRUSTY: tipc starts (FF-A shares, virtio, one TIPC port com.android.trusty.gsa.hwmgr.aoc, GET_STATE only)\n");
++	printf("SWEET TRUSTY: tipc starts (FF-A shares, virtio, one TIPC port com.android.trusty.gsa.hwmgr.aoc, %s)\n", subs ? "hwmgr GET_STATE, START, GET_STATE" : "GET_STATE only");
+ 	if (kmem_alloc_contig(kernel_map, &va, len, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+ 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || va == 0) {
+ 		printf("SWEET TRUSTY: tipc stop no-memory (nothing sent to the secure world)\n");
+-		return;
++		return SWTP_E_ARG;
+ 	}
+ 	pa = (uint64_t)kvtophys(va);
+ 	for (i = 0; i < len && pa != 0; i += PAGE_SIZE) {
+@@ -83,7 +84,7 @@ sweet_tipc_run(void)
+ 	}
+ 	if (pa == 0 || (pa & (SWTP_PG - 1u))) {
+ 		printf("SWEET TRUSTY: tipc stop memory-not-contiguous (nothing sent to the secure world)\n");
+-		return;
++		return SWTP_E_ARG;
+ 	}
+ 	b.smc = swtp_smc_hw;
+ 	b.now_us = swtp_now_hw;
+@@ -91,26 +92,50 @@ sweet_tipc_run(void)
+ 	b.ctx = NULL;
+ 	b.arena = (uint8_t *)va;
+ 	b.arena_pa = pa;
++	b.subs = subs;
++	b.nsubs = nsubs;
+ 	printf("SWEET TRUSTY: tipc arena %u bytes at pa %#llx\n", (unsigned)SWTP_ARENA, (unsigned long long)pa);
+-	rc = swtp_run(&b, &r);
++	rc = swtp_run(&b, rp);
+ 	printf("SWEET TRUSTY: tipc api=%u ffa=%#x id=%#x descr=%u vdev nid=%u dfeat=%#x gfeat=%#x cfg=%u msgmax=%u\n",
+-	    r.api, r.ffa_ver, r.ffa_id, r.descr_sz, r.vdev_nid, r.dfeat, r.gfeat, r.cfg_len, r.msg_max);
++	    rp->api, rp->ffa_ver, rp->ffa_id, rp->descr_sz, rp->vdev_nid, rp->dfeat, rp->gfeat, rp->cfg_len, rp->msg_max);
+ 	printf("SWEET TRUSTY: tipc vring0 num=%u align=%u nid=%u size=%u vring1 num=%u align=%u nid=%u size=%u\n",
+-	    r.vr_num[0], r.vr_align[0], r.vr_nid[0], r.vr_size[0], r.vr_num[1], r.vr_align[1], r.vr_nid[1], r.vr_size[1]);
+-	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.descr_w[0],
+-	    r.descr_w[1], r.descr_w[2], r.descr_w[3], r.descr_w[4], r.descr_w[5], r.descr_w[6], r.descr_w[7], r.descr_w[8],
+-	    r.descr_w[9], r.descr_w[10], r.descr_w[11]);
+-	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", r.descr_w[12],
+-	    r.descr_w[13], r.descr_w[14], r.descr_w[15], r.descr_w[16], r.descr_w[17], r.descr_w[18], r.descr_w[19],
+-	    r.descr_w[20], r.descr_w[21], r.descr_w[22], r.descr_w[23]);
+-	printf("SWEET TRUSTY: tipc online=%u connected=%u remote=%u max_msg=%u reply src=%u dst=%u\n", r.online, r.connected, r.remote,
+-	    r.max_msg, r.rsrc, r.rdst);
++	    rp->vr_num[0], rp->vr_align[0], rp->vr_nid[0], rp->vr_size[0], rp->vr_num[1], rp->vr_align[1], rp->vr_nid[1], rp->vr_size[1]);
++	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", rp->descr_w[0],
++	    rp->descr_w[1], rp->descr_w[2], rp->descr_w[3], rp->descr_w[4], rp->descr_w[5], rp->descr_w[6], rp->descr_w[7], rp->descr_w[8],
++	    rp->descr_w[9], rp->descr_w[10], rp->descr_w[11]);
++	printf("SWEET TRUSTY: tipc descr %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", rp->descr_w[12],
++	    rp->descr_w[13], rp->descr_w[14], rp->descr_w[15], rp->descr_w[16], rp->descr_w[17], rp->descr_w[18], rp->descr_w[19],
++	    rp->descr_w[20], rp->descr_w[21], rp->descr_w[22], rp->descr_w[23]);
++	printf("SWEET TRUSTY: tipc online=%u connected=%u remote=%u max_msg=%u reply src=%u dst=%u\n", rp->online, rp->connected, rp->remote,
++	    rp->max_msg, rp->rsrc, rp->rdst);
+ 	if (rc == SWTP_OK) {
+-		printf("SWEET TRUSTY: hwmgr.aoc state=%u\n", r.state);
++		printf("SWEET TRUSTY: hwmgr.aoc state=%u\n", rp->state);
+ 	} else {
+-		printf("SWEET TRUSTY: tipc stop %s at stage %d r0=0x%x r2=0x%x (hwmgr err=%u state=%u)\n", swtp_ename(rc), r.stage,
+-		    r.raw, r.raw2, r.herr, r.state);
++		printf("SWEET TRUSTY: tipc stop %s at stage %d r0=0x%x r2=0x%x (hwmgr err=%u state=%u)\n", swtp_ename(rc), rp->stage,
++		    rp->raw, rp->raw2, rp->herr, rp->state);
+ 	}
+ 	printf("SWEET TRUSTY: tipc done smc=%u shares=%u reclaimed=%u teardown_bad=%u td_r0=0x%x td_mask=%#x reset_r0=0x%x t=%llu us\n",
+-	    r.nsmc, r.nshare, r.nreclaim, r.td_bad, r.td_raw, r.td_mask, r.reset_r0, (unsigned long long)r.t_us);
++	    rp->nsmc, rp->nshare, rp->nreclaim, rp->td_bad, rp->td_raw, rp->td_mask, rp->reset_r0, (unsigned long long)rp->t_us);
++	if (subs) {
++		printf("SWEET TRUSTY: hwmgr.aoc seq replies=%u state %u/%u/%u err %u/%u/%u start_sent=%u start_replied=%u\n", rp->nst,
++		    rp->sts[0], rp->sts[1], rp->sts[2], rp->herrs[0], rp->herrs[1], rp->herrs[2], rp->start_sent, rp->start_replied);
++	}
++	return rc;
++}
++
++void
++sweet_tipc_run(void)
++{
++	static struct swtp_res r;
++
++	(void)swtp_go(NULL, 0, &r);
++}
++
++/* patch 0377 (plan A8, sweetaoc=3): GET_STATE, START (gated on LOADED in sweet_tipc.h), GET_STATE; called once per boot */
++int
++sweet_tipc_aoc_start(struct swtp_res *r)
++{
++	static const uint8_t seq[3] = { SWTP_AOC_GET_STATE, SWTP_AOC_START, SWTP_AOC_GET_STATE };
++
++	return swtp_go(seq, 3u, r);
+ }
+diff --git a/bsd/dev/sweet_tipc.h b/bsd/dev/sweet_tipc.h
+index 0c7a45c..9d20bfd 100644
+--- a/bsd/dev/sweet_tipc.h
++++ b/bsd/dev/sweet_tipc.h
+@@ -4,6 +4,10 @@
+  * (kernel/google-modules/trusty 2494a3e = "tru", docs/research/50 sections 1-4) with ONE connection to
+  * "com.android.trusty.gsa.hwmgr.aoc" and ONE request, HWMGR_CMD_STATE_CMD (1) with sub GSA_AOC_GET_STATE (0)
+  * (gsa hwmgr-ipc.h:12-38, gsa_core.c:97-131, gsa_aoc.h:80-86), then tears everything down. Plan rule A-1 allowlist only.
++ * Patch 0377 (step A8, sweetaoc=3): the bus may name a sequence of up to 3 subs (bus->subs), each GSA_AOC_GET_STATE (0) or
++ * GSA_AOC_START (1); START is sent at most once and only right after a GET_STATE reply with err 0 and state
++ * GSA_AOC_STATE_LOADED (1) (aoc.c:1587, gsa_aoc.h:60-64), else SWTP_E_GATE and nothing more is sent. Any other sub is
++ * refused (SWTP_E_ALLOW). Without bus->subs the single GET_STATE of patch 0375 is unchanged.
+  *
+  * Secure-world calls, in order (each issued at most once with the arguments shown; the std-call engine may repeat the SAME
+  * call on SM_ERR_BUSY up to 5 times and issues SMC_SC_RESTART_FIQ / SMC_SC_RESTART_LAST as tru:trusty.c:115-291 does):
+@@ -79,13 +83,16 @@
+ #define SWTP_HWMGR_STATE_CMD    1u
+ #define SWTP_HWMGR_RESP         0x80000000u
+ #define SWTP_AOC_GET_STATE      0u
++#define SWTP_AOC_START          1u              /* GSA_AOC_START, gsa_aoc.h:80-86 (patch 0377) */
++#define SWTP_AOC_LOADED         1u              /* GSA_AOC_STATE_LOADED, gsa_aoc.h:60-64 */
++#define SWTP_NSUB_MAX           3u
+ static const char swtp_port[] = "com.android.trusty.gsa.hwmgr.aoc";
+ 
+ /* bounds of ours */
+ #define SWTP_PG                 4096u
+ #define SWTP_BUF                4096u           /* msg_buf_max_size default PAGE_SIZE (trusty-ipc.c:41-42); others refused */
+ #define SWTP_NRX                4u              /* rx buffers posted (Linux posts the ring size; fewer is legal virtio) */
+-#define SWTP_NTX                3u              /* connect, GET_STATE, disconnect */
++#define SWTP_NTX                (2u + SWTP_NSUB_MAX)   /* connect, up to 3 hwmgr requests, disconnect */
+ #define SWTP_VRING_MAX          (4u * SWTP_PG)
+ #define SWTP_QSZ_MAX            64u
+ #define SWTP_CALL_US            2000000u
+@@ -115,11 +122,13 @@ struct swtp_bus {
+ 	void *ctx;
+ 	uint8_t *arena;         /* SWTP_ARENA bytes, 4 KiB aligned, physically contiguous (checked by the glue) */
+ 	uint64_t arena_pa;
++	const uint8_t *subs;    /* patch 0377: hwmgr STATE_CMD subs in order (0 = GET_STATE, 1 = START), NULL = one GET_STATE */
++	uint32_t nsubs;
+ };
+ 
+ enum {
+ 	SWTP_OK = 0, SWTP_E_ARG, SWTP_E_ALLOW, SWTP_E_TIME, SWTP_E_SMC, SWTP_E_API, SWTP_E_FFA, SWTP_E_SHARE,
+-	SWTP_E_DESCR, SWTP_E_VIRTIO, SWTP_E_ONLINE, SWTP_E_CONN, SWTP_E_REPLY, SWTP_E_HWMGR, SWTP_E_RX, SWTP_E_N
++	SWTP_E_DESCR, SWTP_E_VIRTIO, SWTP_E_ONLINE, SWTP_E_CONN, SWTP_E_REPLY, SWTP_E_HWMGR, SWTP_E_RX, SWTP_E_GATE, SWTP_E_N
+ };
+ 
+ struct swtp_res {
+@@ -132,6 +141,7 @@ struct swtp_res {
+ 	uint32_t nsmc, nshare, nreclaim, td_bad, td_raw;   /* teardown: failed calls, first r0 */
+ 	uint32_t reset_r0, td_mask;     /* r0 of the probe VDEV_RESET; failed teardown calls 1 reset 2 reclaim 4 stop 8 descr 16 unmap */
+ 	uint32_t rsrc, rdst;            /* header src/dst of the GET_STATE reply */
++	uint32_t nst, sts[SWTP_NSUB_MAX], herrs[SWTP_NSUB_MAX], start_sent, start_replied;   /* patch 0377: per reply */
+ 	uint64_t h[SWTP_MAXSH];
+ 	uint64_t t_us;
+ 	/* private */
+@@ -144,7 +154,7 @@ static inline const char *
+ swtp_ename(int rc)
+ {
+ 	static const char *const n[] = { "ok", "bad-arg", "not-allowlisted", "timeout", "smc-error", "bad-api",
+-		"ffa", "share", "descriptor", "virtio", "not-online", "connect", "no-reply", "hwmgr-error", "bad-rx" };
++		"ffa", "share", "descriptor", "virtio", "not-online", "connect", "no-reply", "hwmgr-error", "bad-rx", "start-gate" };
+ 
+ 	return (rc >= 0 && rc < SWTP_E_N) ? n[rc] : "?";
+ }
+@@ -719,23 +729,49 @@ swtp_body(const struct swtp_bus *b, struct swtp_res *r)
+ 		return swtp_fail(r, SWTP_E_CONN, r->max_msg, 2);
+ 	}
+ 	r->stage = 9;                           /* HWMGR_CMD_STATE_CMD / GSA_AOC_GET_STATE (gsa_core.c:97-131) */
+-	w[0] = SWTP_HWMGR_STATE_CMD;
+-	w[1] = SWTP_AOC_GET_STATE;
+-	if (swtp_send(b, r, r->remote, w, 2, 0)) {
+-		return r->rc;
+-	}
+-	if (swtp_recv(b, r, &m, SWTP_E_REPLY)) {
+-		return r->rc;
+-	}
+-	r->rsrc = m.src;                        /* src is not checked: Linux routes by dst only (trusty-ipc.c:2071-2080) */
+-	r->rdst = m.dst;
+-	if (m.dst != SWTP_LOCAL_ADDR || m.len != 12u || m.w[0] != (SWTP_HWMGR_STATE_CMD | SWTP_HWMGR_RESP)) {
+-		return swtp_fail(r, SWTP_E_REPLY, m.len, m.w[0]);
+-	}
+-	r->herr = m.w[1];
+-	r->state = m.w[2];
+-	if (r->herr != 0u) {
+-		return swtp_fail(r, SWTP_E_HWMGR, r->herr, r->state);
++	{
++		static const uint8_t one[1] = { SWTP_AOC_GET_STATE };
++		const uint8_t *subs = b->subs ? b->subs : one;
++		uint32_t ns = b->subs ? b->nsubs : 1u, k;
++
++		if (ns == 0u || ns > SWTP_NSUB_MAX) {
++			return swtp_fail(r, SWTP_E_ARG, ns, 3);
++		}
++		for (k = 0; k < ns; k++) {
++			if (subs[k] != SWTP_AOC_GET_STATE && subs[k] != SWTP_AOC_START) {
++				return swtp_fail(r, SWTP_E_ALLOW, subs[k], k);
++			}
++			if (subs[k] == SWTP_AOC_START) {     /* once, and only right after a LOADED reply with err 0 */
++				if (r->start_sent || r->nst != k || k == 0u || r->herrs[k - 1u] != 0u || r->sts[k - 1u] != SWTP_AOC_LOADED) {
++					return swtp_fail(r, SWTP_E_GATE, k, k ? r->sts[k - 1u] : 0xFFFFFFFFu);
++				}
++				r->start_sent = 1;
++			}
++			w[0] = SWTP_HWMGR_STATE_CMD;
++			w[1] = subs[k];
++			if (swtp_send(b, r, r->remote, w, 2, 0)) {
++				return r->rc;
++			}
++			if (swtp_recv(b, r, &m, SWTP_E_REPLY)) {
++				return r->rc;
++			}
++			r->rsrc = m.src;                /* src is not checked: Linux routes by dst only (trusty-ipc.c:2071-2080) */
++			r->rdst = m.dst;
++			if (m.dst != SWTP_LOCAL_ADDR || m.len != 12u || m.w[0] != (SWTP_HWMGR_STATE_CMD | SWTP_HWMGR_RESP)) {
++				return swtp_fail(r, SWTP_E_REPLY, m.len, m.w[0]);
++			}
++			r->herr = m.w[1];
++			r->state = m.w[2];
++			r->herrs[k] = r->herr;
++			r->sts[k] = r->state;
++			r->nst = k + 1u;
++			if (subs[k] == SWTP_AOC_START) {
++				r->start_replied = 1;
++			}
++			if (r->herr != 0u) {
++				return swtp_fail(r, SWTP_E_HWMGR, r->herr, r->state);
++			}
++		}
+ 	}
+ 	return SWTP_OK;
+ }

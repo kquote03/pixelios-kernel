@@ -1,4 +1,4 @@
-/* Host test of the Trusty version probe (xnu patch 0156, bsd/dev/sweet_trusty.h) against a fake monitor. */
+/* Host test of the Trusty version probe (xnu patch 0372, bsd/dev/sweet_trusty.h) against a fake monitor. */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>

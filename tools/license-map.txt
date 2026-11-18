@@ -21,6 +21,7 @@ xnu/patches/0101-*	APSL-2.0 AND MIT	apple-xnu + idea/code from ios-flame 0121 (M
 xnu/patches/0088-*	APSL-2.0 AND MIT	apple-xnu + structure modelled on ios-sweet 0060 (touch driver: MMIO read helper, thread loop, sweettouchdelay boot-arg; audit 0300 F1), THIRD_PARTY row 2
 xnu/patches/0157-*	APSL-2.0 AND MIT	apple-xnu + structure modelled on ios-sweet 0028 (read-only block device, buf_* loop; audit 0300 F1), THIRD_PARTY row 2
 xnu/patches/0173-*	APSL-2.0 AND MIT	apple-xnu + DWC3 soft reset, event buffer, EP0 config and SWEET USB: strings from ios-sweet 0073 (audit 0300 F1), THIRD_PARTY row 2
+xnu/patches/0373-*	APSL-2.0 AND GPL-2.0-only	apple-xnu + bsd/dev/sweet_amp_otp.h: CS35L41 OTP maps from Linux v6.18 cs35l41-lib.c (Cirrus Logic), THIRD_PARTY row 22
 xnu/patches/*	APSL-2.0	apple-xnu modifications written by this project, xnu/patches/NOTICE.md, THIRD_PARTY row 5
 xnu/patches-archive/006[023]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3 (retired, byte-identical to sweet 0060/0062/0063), THIRD_PARTY rows 2,5
 xnu/patches-archive/*.patch	APSL-2.0	apple-xnu modifications written by this project (retired), THIRD_PARTY row 5

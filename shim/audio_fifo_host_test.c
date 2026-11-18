@@ -1,5 +1,5 @@
-/* Host test of the /dev/sweetaudio FIFO (xnu patch 0173, bsd/dev/sweet_audio_fifo.h, sweetaoc=8): push bound + overrun count, the 960-frame
- * start threshold, underrun = silence + restart threshold, close play-out below the threshold, wrap, flush, gain clamp (0182: <= 0 dB, default
+/* Host test of the /dev/sweetaudio FIFO (xnu patch 0385, bsd/dev/sweet_audio_fifo.h, sweetaoc=8): push bound + overrun count, the 960-frame
+ * start threshold, underrun = silence + restart threshold, close play-out below the threshold, wrap, flush, gain clamp (0394: <= 0 dB, default
  * -6 dB, -96 dB = mute), the -3 dBFS sample clamp and the per-channel scale. */
 #include <stdio.h>
 #include <stdint.h>

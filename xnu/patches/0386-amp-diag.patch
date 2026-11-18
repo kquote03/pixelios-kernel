@@ -1,0 +1,337 @@
+SWEET AMP DIAG (patch 0386, plan A10b), on top of 0385 (boot-arg sweetaoc=9 + sweetamp=1). The user heard nothing in run a10 (three -30 dBFS
+beeps). As sweetaoc=7 (20 s after "online" instead of 75 s), with: (1) AOC read-only queries while the stream runs (sweet_audio.h swau_query:
+GET_DSP_STATE 233, GET_SINK_PROCESSING_STATE 234 sink 0, GET_SINKS_BITMAPS 245, GET_PARAMETER 211 block 16 comp 0 key 0 = the EP0 volume on the
+speaker sink, block 16 comp 2 key 0 = the speaker mixer ASP mode; ids / structs google-modules aoc aoc-interface-gs101.h, getters
+alsa/aoc_alsa_hw.c, aoc_alsa_ctl.c); every reply's bytes 8..19 are logged; (2) in place of the tone window an A/B window (sweet_amp_pwr.h
+amp_pwr_diag_run): phase A = DAC_PCM1_SRC 0x32 (DSP1TX1, the 0384 path), 3 long beeps (1.5 s on / 1 s off, 1 kHz + 500 Hz, -12 dBFS); 2 s gap;
+phase B = DAC_PCM1_SRC 0x08 (ASPRX1, Linux v6.18 cs35l41.h:645, the reset default cs35l41-tables.c:74: the HALO DSP bypassed), 2 long beeps;
+then 0x32 back, the 0384 power-down. IRQ1_STATUS1..4 + IRQ1_RAW_STATUS1..4 (v6.18 cs35l41.h:118-131, now readable), MBOX_2 and DAC_PCM1_SRC of
+both amps at 0.75 s into each phase and at the end ("SWEET AMP: L|R diag A|B|end ..."). Gated: levels <= 8 unchanged.
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+index a86ddaf..2aa6b11 100644
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -168,6 +168,13 @@ sweet_amp_serve_arm(unsigned (*serve)(void *))
+ {
+ 	amp_pwr_serve = serve;
+ }
++/* patch 0386 (sweetaoc=9): arm the A/B diagnostic window (sweet_amp_pwr.h amp_pwr_diag_run) in place of the tone window */
++void sweet_amp_diag_arm(int on);
++void
++sweet_amp_diag_arm(int on)
++{
++	amp_pwr_diag = on;
++}
+ 
+ /* patch 0381 (plan A9e, sweetaoc=6): arm the HALO DSP firmware load for the next sweet_amp_audio_run. The files come from /chosen/memory-map
+  * AMPFW <pa, size> (tools/mkpayload.py --ampfw, container tools/pack_ampfw.py), read through ml_static_ptovirt as AOCFW (patch 0376); the
+diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h
+index b228a5b..dab83ac 100644
+--- a/bsd/dev/sweet_amp.h
++++ b/bsd/dev/sweet_amp.h
+@@ -390,7 +390,8 @@ static inline __attribute__((always_inline)) int amp_read_ok(uint32_t reg)
+ 	       reg == AMP_REG_IRQ1_MASK1 || reg == AMP_REG_CCM_CORE || reg == AMP_OTP_REG_OTPID ||
+ 	       (reg >= AMP_OTP_REG_MEM0 && reg < AMP_OTP_REG_MEM0 + 4u * AMP_OTP_WORDS && !(reg & 3u)) || amp_otp_reg_ok(reg) || amp_a9_read_ok(reg) ||
+ 	       amp_dsp_rd_ok(reg) ||	/* patch 0381 */
+-	       (amp_pwr_reg(reg) && reg != AMP_REG_TEST_KEY && reg != AMP_PWR_PATCH) || reg == AMP_PWR_DIGVOL || reg == AMP_PWR_GAIN;	/* patch 0384 */
++	       (amp_pwr_reg(reg) && reg != AMP_REG_TEST_KEY && reg != AMP_PWR_PATCH) || reg == AMP_PWR_DIGVOL || reg == AMP_PWR_GAIN ||	/* patch 0384 */
++	       reg == 0x10014u || reg == 0x1001Cu || (reg >= 0x10090u && reg <= 0x1009Cu && !(reg & 3u));	/* 0386: IRQ1_STATUS2/4, RAW1-4 */
+ }
+ 
+ /* byte `pos` of the 10-byte write frame of (reg, val): the address with bit 31 clear, 2 pad bytes 0, the value, all big endian */
+diff --git a/bsd/dev/sweet_amp_pwr.h b/bsd/dev/sweet_amp_pwr.h
+index 180c857..5a8cbd9 100644
+--- a/bsd/dev/sweet_amp_pwr.h
++++ b/bsd/dev/sweet_amp_pwr.h
+@@ -309,6 +309,75 @@ static void amp_pwr_line(const char *name, const struct amp_pwr_side *d)
+ 	emit("AMP", line, p);
+ }
+ 
++/* ---- patch 0386 (sweetaoc=9): the A/B diagnostic window in place of the tone window. Phase A: DAC_PCM1_SRC = DSP1TX1 (0x32, as the 0384
++ * power-up), the glue's pattern 2 (3 long beeps, 7.5 s); 2 s silence; phase B: DAC_PCM1_SRC = ASPRX1 (0x08 = CS35L41_INPUT_SRC_ASPRX1,
++ * Linux v6.18 cs35l41.h:645; the reset default, AMP cs35l41-tables.c:74), the DSP bypassed, pattern 3 (2 long beeps, 5 s); then back to 0x32.
++ * In the middle of the first beep of each phase and at the end: IRQ1_STATUS1..4 (0x10010..0x1001C) and IRQ1_RAW_STATUS1..4 (0x10090..0x1009C,
++ * v6.18 cs35l41.h:118-131), DSP MBOX_2, DAC_PCM1_SRC of both amps. Ticks each ms; no other amp access. ---- */
++static int amp_pwr_diag;
++#define AMP_DIAG_A_MS	7600u
++#define AMP_DIAG_GAP_MS	2000u
++#define AMP_DIAG_B_MS	5100u
++static void amp_pwr_diag_snap(const struct amp_snap *s, const char *tag)
++{
++	static const uint32_t regs[10] = { 0x10010u, 0x10014u, 0x10018u, 0x1001Cu, 0x10090u, 0x10094u, 0x10098u, 0x1009Cu, AMP_DSP_MBOX2, AMP_PWR_PCMSRC };
++	char line[RAMLOG_LINE_MAX];
++	unsigned p, i;
++	int cs;
++
++	for (cs = 0; cs < 2; cs++) {
++		p = put_txt(line, sizeof(line), 0, cs ? "R diag " : "L diag ");
++		p = put_txt(line, sizeof(line), p, tag);
++		p = put_txt(line, sizeof(line), p, " st1-4");
++		for (i = 0; i < 10u; i++) {
++			uint32_t v = 0;
++
++			if (i == 4u)
++				p = put_txt(line, sizeof(line), p, " raw1-4");
++			if (i == 8u)
++				p = put_txt(line, sizeof(line), p, " mbox2/pcmsrc");
++			p = put_txt(line, sizeof(line), p, " ");
++			p = amp_read(s, cs, regs[i], &v) == AMP_OK ? put_hexmin(line, sizeof(line), p, v) : put_txt(line, sizeof(line), p, "rd-err");
++		}
++		emit("AMP", line, p);
++	}
++}
++static unsigned amp_pwr_diag_wait(unsigned ms, const struct amp_snap *s, const char *tag, unsigned snap_at)
++{
++	unsigned i;
++
++	for (i = 0; i < ms; i++) {
++		if (wait_ms(1u))
++			break;
++		if (amp_a9_cb.tick)
++			amp_a9_cb.tick(amp_a9_cb.ctx);
++		if (tag && i + 1u == snap_at)
++			amp_pwr_diag_snap(s, tag);
++	}
++	return i;
++}
++static unsigned amp_pwr_diag_run(const struct amp_snap *s)
++{
++	unsigned ms = 0;
++	int cs;
++
++	say("a10 diag: ", "phase A (DSP path, PCM src 0x32): 3 long beeps 1 kHz + 500 Hz, -12 dBFS, now");
++	amp_a9_cb.tone(amp_a9_cb.ctx, 2);
++	ms += amp_pwr_diag_wait(AMP_DIAG_A_MS, s, "A", 750u);
++	amp_a9_cb.tone(amp_a9_cb.ctx, 0);
++	ms += amp_pwr_diag_wait(AMP_DIAG_GAP_MS, s, NULL, 0u);
++	for (cs = 0; cs < 2; cs++)
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_PCMSRC, 0x7Fu, 0x08u, NULL);
++	say("a10 diag: ", "phase B (DSP bypassed, PCM src 0x08 ASPRX1): 2 long beeps, now");
++	amp_a9_cb.tone(amp_a9_cb.ctx, 3);
++	ms += amp_pwr_diag_wait(AMP_DIAG_B_MS, s, "B", 750u);
++	amp_a9_cb.tone(amp_a9_cb.ctx, 0);
++	for (cs = 0; cs < 2; cs++)
++		(void)amp_pwr_rmw(s, cs, AMP_PWR_PCMSRC, 0x7Fu, AMP_PCMSRC_DSP, NULL);
++	amp_pwr_diag_snap(s, "end");
++	return ms;
++}
++
+ /* power-up both (step by step, L then R), the tone window, power-down both; the power-down runs on every path after the first step */
+ static void amp_pwr_run(const struct amp_snap *s)
+ {
+@@ -333,7 +402,9 @@ static void amp_pwr_run(const struct amp_snap *s)
+ 		p = put_txt(line, sizeof(line), p, ", powering down");
+ 	}
+ 	emit("SWEET", line, p);
+-	if (amp_pwr_res.up && amp_pwr_serve) {
++	if (amp_pwr_res.up && amp_pwr_diag && amp_a9_cb.tone) {
++		amp_pwr_res.tone_ms = amp_pwr_diag_run(s);		/* patch 0386 */
++	} else if (amp_pwr_res.up && amp_pwr_serve) {
+ 		amp_pwr_res.tone_ms = amp_pwr_serve(amp_a9_cb.ctx);	/* patch 0385 */
+ 	} else if (amp_pwr_res.up) {
+ 		if (amp_a9_cb.tone)
+diff --git a/bsd/dev/sweet_aoc.c b/bsd/dev/sweet_aoc.c
+index dd44195..1804120 100644
+--- a/bsd/dev/sweet_aoc.c
++++ b/bsd/dev/sweet_aoc.c
+@@ -127,6 +127,11 @@ sweet_aoc_init(void)
+ 	if (!PE_parse_boot_argn("sweetaoc", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (on == 9) {
++		sweet_aoc_audio_mode = 9;   /* patch 0386: as 7, with AOC read-only queries and the A/B (DSP path / DSP bypass) diagnostic tone window */
++		sweet_aoc_load_start3();
++		return;
++	}
+ 	if (on == 8) {
+ 		sweet_aoc_audio_mode = 8;   /* patch 0385: as 7, but the amps stay on and /dev/sweetaudio feeds the AOC ring until shutdown */
+ 		sweet_aoc_load_start3();
+@@ -161,7 +166,7 @@ sweet_aoc_init(void)
+ 		return;
+ 	}
+ 	if (on != 1) {
+-		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6, 7, 8), not touched\n", on);
++		printf("SWEET AOC PRE: sweetaoc=%u not known (only 1, 2, 3, 4, 5, 6, 7, 8, 9), not touched\n", on);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(swa_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+index 077fdf7..f4e0c9e 100644
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -200,6 +200,10 @@ swau_x_line(const struct swau_x *x)
+ 	printf("SWEET AUDIO: cmd id %u cntr %u len %u -> rc %d (%s) drained %u waited %u ms reply len %u type %u id %u reply %d byte8 %u aoc_err %#x\n",
+ 	    x->id, x->cntr, x->sent_len, x->rc, x->rc >= 0 && x->rc < SWAU_NSTOP ? swau_stop_name[x->rc] : "?", x->drained, x->waited_ms,
+ 	    x->reply_len, x->reply_type, x->reply_id, x->reply, x->payload0, x->aoc_err);
++	if (x->reply_len > 8u) {                /* patch 0386: the reply payload (GET queries) */
++		printf("SWEET AUDIO: cmd id %u reply bytes 8.. %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", x->id, x->pay[0], x->pay[1],
++		    x->pay[2], x->pay[3], x->pay[4], x->pay[5], x->pay[6], x->pay[7], x->pay[8], x->pay[9], x->pay[10], x->pay[11]);
++	}
+ }
+ 
+ static int
+@@ -221,6 +225,10 @@ swau_cb_open(__unused void *ctx)
+ 	printf("SWEET AUDIO: service %u hdr %#x flags %#x irq %u up off %#x size %u slots %u tx %u rx %u down off %#x size %u slots %u tx %u rx %u\n",
+ 	    swau_as->ctl_index, swau_r.s.hdr, swau_r.s.flags, swau_r.s.irq, swau_r.s.r[0].offset, swau_r.s.r[0].size, swau_r.s.r[0].slots,
+ 	    swau_r.s.r[0].tx, swau_r.s.r[0].rx, swau_r.s.r[1].offset, swau_r.s.r[1].size, swau_r.s.r[1].slots, swau_r.s.r[1].tx, swau_r.s.r[1].rx);
++	if (sweet_aoc_audio_mode == 9 && swau_open_rc == SWAU_OK) {    /* patch 0386: read-only AOC queries with the stream running */
++		b.say(b.ctx, "a10 diag: AOC queries (read only): GET_DSP_STATE, GET_SINK_PROCESSING_STATE 0, GET_SINKS_BITMAPS, GET_PARAMETER 16/0/0 (EP0 volume), 16/2/0 (ASP mode)");
++		swau_query(&b, &swau_r);
++	}
+ 	return swau_open_rc == SWAU_OK;
+ }
+ 
+@@ -276,6 +284,7 @@ swau_cb_tone(__unused void *ctx, int on)
+ extern void (*sweet_audio_stop_hook)(void);     /* sweet_restart.c (patch 0385) */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_amp_serve_arm(unsigned (*serve)(void *));     /* sweet_amp.c (patch 0385) */
++extern void sweet_amp_diag_arm(int on);        /* sweet_amp.c (patch 0386) */
+ #endif
+ static LCK_GRP_DECLARE(swau_dev_grp, "sweetaudio");
+ static LCK_MTX_DECLARE(swau_dev_mtx, &swau_dev_grp);
+@@ -576,6 +585,10 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 			swau_pb_index = i;
+ 		}
+ 	}
++	if (sweet_aoc_audio_mode == 9) {        /* patch 0386 */
++		printf("SWEET AUDIO: a10 diag: in 20 s: phase A = 3 long beeps (DSP path), 2 s gap, phase B = 2 long beeps (DSP bypassed), 1 kHz + 500 Hz, -12 dBFS\n");
++		swas_sleep_ms(NULL, 20000u);
++	}
+ 	if (sweet_aoc_audio_mode == 7) {
+ 		printf("SWEET AUDIO: a10: tone in %u s (then 3 beeps of 1 kHz, 1 s on / 1 s off, about -30 dBFS, both speakers)\n", SWAU_TONE_DELAY_S);
+ 		swas_sleep_ms(NULL, SWAU_TONE_DELAY_S * 1000u);
+@@ -589,7 +602,8 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 	if (sweet_aoc_audio_mode >= 6) {
+ 		sweet_amp_dsp_arm();
+ 	}
+-	sweet_amp_tone_arm(sweet_aoc_audio_mode == 7 ? swau_cb_tone : sweet_aoc_audio_mode == 8 ? swau_cb_notone : NULL);
++	sweet_amp_diag_arm(sweet_aoc_audio_mode == 9);   /* patch 0386 */
++	sweet_amp_tone_arm(sweet_aoc_audio_mode == 7 || sweet_aoc_audio_mode == 9 ? swau_cb_tone : sweet_aoc_audio_mode == 8 ? swau_cb_notone : NULL);
+ 	sweet_amp_serve_arm(sweet_aoc_audio_mode == 8 ? swau_cb_serve : NULL);       /* patch 0385 */
+ 	if (sweet_aoc_audio_mode == 8) {
+ 		printf("SWEET AUDIO: a11: amp run starts now (power-up, then /dev/sweetaudio + self-test 2 beeps, amps on until a software reset)\n");
+@@ -614,7 +628,7 @@ swau_run(struct swas_res *r, uint32_t image_size)
+ 		printf("SWEET AUDIO: open rc %d (%s) dsp mode %u bound %u unbound %u close rc %d; amp rc %d a9 %u opened %u cfg %u/%u pll %u/%u flags %#x\n",
+ 		    swau_open_rc, swau_open_rc >= 0 && swau_open_rc < SWAU_NSTOP ? swau_stop_name[swau_open_rc] : "not-run", swau_r.dsp_mode,
+ 		    swau_r.bound, swau_r.unbound, swau_close_rc, arc, out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+-		if (sweet_aoc_audio_mode == 7 || sweet_aoc_audio_mode == 8) {        /* patch 0384 (0385: 8) */
++		if (sweet_aoc_audio_mode >= 7) {        /* patch 0384 (0385: 8, 0386: 9) */
+ 			uint32_t f = out[7];
+ 
+ 			printf("SWEET AUDIO: tone %s %u bytes (consumed %u in the %u ms window), amp on %s, pll %s, amp off %s, errors %s%s\n",
+@@ -688,7 +702,7 @@ sweet_aoc_start_after_load(uint32_t image_size)
+ 	if (rc == SWAS_OK) {
+ 		printf("SWEET AOC: online services=%u audio_output_control=%u aoc_req released %u\n", r.services, r.ctl_index,
+ 		    r.req_released);
+-		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 8) {
++		if (sweet_aoc_audio_mode >= 4 && sweet_aoc_audio_mode <= 9) {
+ 			swau_run(&r, image_size);       /* patch 0378, step A9 (5: + stream, patch 0379) */
+ 		}
+ 		return;
+diff --git a/bsd/dev/sweet_audio.h b/bsd/dev/sweet_audio.h
+index 833d261..426346d 100644
+--- a/bsd/dev/sweet_audio.h
++++ b/bsd/dev/sweet_audio.h
+@@ -125,11 +125,12 @@ struct swau_x {
+ 	uint8_t reply_type;
+ 	uint16_t reply_id;
+ 	uint8_t payload0;               /* first payload byte of the reply (GET_DSP_STATE: mode) */
++	uint8_t pay[12];                /* patch 0386: reply bytes 8..19 (the GET queries) */
+ 	uint8_t written;                /* the message may have reached the AOC (write started) */
+ 	int rc;
+ };
+ 
+-#define SWAU_NX 6       /* 0379: GET_DSP_STATE, BIND2 1, EP_SETUP, SOURCE 1, SOURCE 0, BIND2 0 */
++#define SWAU_NX 12      /* 0379: GET_DSP_STATE, BIND2 1, EP_SETUP, SOURCE 1, SOURCE 0, BIND2 0; 0386: + 5 read-only GET queries */
+ /* patch 0379: the audio_playback0 ring (AOC_DOWN region only) */
+ struct swau_ring {
+ 	uint32_t hdr, flags, irq;
+@@ -371,6 +372,9 @@ swau_cmd(const struct swau_bus *b, struct swau_res *r, const uint8_t *m, uint32_
+ 	x->reply_id = (uint16_t)(rb[4] | rb[5] << 8);
+ 	x->reply = (int16_t)(uint16_t)(rb[6] | rb[7] << 8);
+ 	x->payload0 = rl > 8u ? rb[8] : 0u;
++	for (i = 0; i < sizeof(x->pay) && 8u + i < rl; i++) {
++		x->pay[i] = rb[8u + i];
++	}
+ 	/* patch 0380: the reply id is NOT compared. Stock aoc_audio_control (alsa:aoc_alsa_hw.c:196-311) drains, writes, then takes the next
+ 	 * message of >= 1 byte as the reply without reading its id (it copies cmd_size bytes only when the caller asks, :301-302; EP_SETUP
+ 	 * passes NULL, :1800-1801). Observed on hardware (run a9c, 2026-11-17): EP_SETUP 206 answered by a 28-byte type-0 message with id 288.
+@@ -559,6 +563,58 @@ swau_tone_word(uint32_t frame)
+ 	return (uint32_t)v | (uint32_t)v << 16;
+ }
+ 
++/* patch 0386 (sweetaoc=9): the long diagnostic patterns, louder: 1 kHz + 500 Hz (4 x sine48 each, peak 8288 = -11.9 dBFS), beeps of 1.5 s
++ * on / 1 s off; pattern 2 = 3 beeps (the DSP path), pattern 3 = 2 beeps (the DSP bypassed: DAC source ASPRX1). */
++#define SWAU_DIAG_ON    72000u
++#define SWAU_DIAG_PER   120000u
++static uint32_t
++swau_diag_word(uint32_t pat, uint32_t frame)
++{
++	uint32_t n = pat == 2u ? 3u : 2u;
++	int32_t s;
++	uint16_t v;
++
++	if (frame >= n * SWAU_DIAG_PER || frame % SWAU_DIAG_PER >= SWAU_DIAG_ON) {
++		return 0u;
++	}
++	s = 4 * ((int32_t)swau_sine48[frame % 48u] + (int32_t)swau_sine48[(frame / 2u) % 48u]);
++	v = (uint16_t)(int16_t)s;
++	return (uint32_t)v | (uint32_t)v << 16;
++}
++
++/* patch 0386: read-only AOC queries (stock getters, aoc_alsa_hw.c; ids/structs aoc-interface-gs101.h): GET_DSP_STATE 233 (:1199), GET_SINK_
++ * PROCESSING_STATE 234 sink 0 (:1215, aoc_get_sink_state :1159), GET_SINKS_BITMAPS 245 (:1605, 5 x u16), GET_PARAMETER 211 (:1007) block 16
++ * (speaker sink, AOC_AUDIO_SINK_BLOCK_ID_BASE aoc_alsa.h:95) component 0 key 0 = the EP0 volume (aoc_audio_volume_set :329-357) and component 2
++ * key 0 = "AoC Speaker Mixer ASP Mode" (aoc_alsa_ctl.c:2436, :1593-1610). Each reply is logged by the glue (pay[]). */
++#define SWAU_CMD_GET_SINK_STATE 234u
++#define SWAU_CMD_GET_BITMAPS    245u
++#define SWAU_CMD_GET_PARAM      211u
++static void
++swau_query(const struct swau_bus *b, struct swau_res *r)
++{
++	uint8_t m[18];
++	uint32_t i;
++
++	(void)swau_get_dsp_state(b, r);
++	swau_hdr(m, r->cntr++, 10u, SWAU_CMD_GET_SINK_STATE);
++	m[8] = 0u;
++	m[9] = 0u;
++	(void)swau_cmd(b, r, m, 10u);
++	swau_hdr(m, r->cntr++, 18u, SWAU_CMD_GET_BITMAPS);
++	for (i = 8; i < 18u; i++) {
++		m[i] = 0u;
++	}
++	(void)swau_cmd(b, r, m, 18u);
++	for (i = 0; i < 2u; i++) {
++		swau_hdr(m, r->cntr++, 18u, SWAU_CMD_GET_PARAM);
++		m[8] = 16u;
++		m[9] = i ? 2u : 0u;
++		swau_put32(m + 10, 0u);
++		swau_put32(m + 14, 0u);
++		(void)swau_cmd(b, r, m, 18u);
++	}
++}
++
+ /* patch 0384: the tone switch (the amp code calls it once on, once off); the rx counter at each switch for the consumed count */
+ static void
+ swau_tone(const struct swau_bus *b, struct swau_res *r, int on)
+@@ -570,7 +626,7 @@ swau_tone(const struct swau_bus *b, struct swau_res *r, int on)
+ 	}
+ 	if (on) {
+ 		p->tone_base = p->fed;
+-		p->tone = 1;
++		p->tone = (uint32_t)on;       /* patch 0386: 2 / 3 = the long diagnostic patterns */
+ 	} else {
+ 		p->tone = 0;
+ 	}
+@@ -619,7 +675,8 @@ swau_feed(const struct swau_bus *b, struct swau_res *r)
+ 		}
+ 	}
+ 	for (k = 0; k < n; k += 4u) {
+-		uint32_t w = k / 4u < got ? pcm[k / 4u] : p->tone ? swau_tone_word((p->fed + k - p->tone_base) / 4u) : 0u;
++		uint32_t w = k / 4u < got ? pcm[k / 4u] : p->tone == 1u ? swau_tone_word((p->fed + k - p->tone_base) / 4u) :
++		    p->tone ? swau_diag_word(p->tone, (p->fed + k - p->tone_base) / 4u) : 0u;
+ 
+ 		if (!b->iw32(b->ctx, g->offset + (g->wp + k) % g->size, w)) {
+ 			p->feed_err++;

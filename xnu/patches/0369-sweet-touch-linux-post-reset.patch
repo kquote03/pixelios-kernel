@@ -1,0 +1,290 @@
+From: PixeliOS <noreply@example.invalid>
+Subject: [PATCH] sweet: gs101 touch, opt-in Linux post-reset steps (sweettouchsysinfo/spi4/idwait/idretry)
+
+Oriole (runs oriole-gui3/4/5, shim oriole-touchprobe1, 2026-11-12): the controller-ready event arrives but DCHIP_ID 0x20000000 reads 00 00 00 00.
+Each step is a boot-arg, default 0 = the 0095 path unchanged, bluejay unchanged. Sources: fts_touch f87fd67 ftm5/ (header comment of sweet_touch_gs101.c).
+sweettouchsysinfo=1: readSysInfo framebuffer read (fts.c:5352). sweettouchspi4=1|2|3: hold_m3 SPI4 block (ftsFlash.c:283-344), 3 with the M3 hold.
+sweettouchidwait=MS / sweettouchidretry=N: wait and repeat the identify. Writes go to the touch IC over SPI only; no new SoC register writes.
+
+---
+diff --git a/bsd/dev/sweet_ftm5.h b/bsd/dev/sweet_ftm5.h
+index 0433ed1..b18ee28 100644
+--- a/bsd/dev/sweet_ftm5.h
++++ b/bsd/dev/sweet_ftm5.h
+@@ -24,6 +24,34 @@
+ #define FTM5_TOUCH_ID_MAX     10     /* fts.h:203 */
+ #define FTM5_SPI_DELAY_CS_US  10     /* SPI_DELAY_CS, fts_lib/ftsHardware.h:64: wait before raising CS */
+ 
++/* Patch 0369 (boot-args sweettouchspi4 / sweettouchsysinfo, sweet_touch_gs101.c). */
++#define FTM5_CMD_FB_R         0xA7   /* FTS_CMD_FRAMEBUFFER_R, fts_lib/ftsHardware.h:202 (SPI build) */
++#define FTM5_ADDR_FRAMEBUFFER 0x0000u  /* ADDR_FRAMEBUFFER, fts_lib/ftsHardware.h:239; BITS_16 address, ftsCore.c:557 */
++#define FTM5_ADDR_SYSTEM_RESET 0x20000024u /* ADDR_SYSTEM_RESET, fts_lib/ftsHardware.h:248 */
++#define FTM5_HOLD_M3          0x01   /* hold_m3 cmd[0], fts_lib/ftsFlash.c:270 */
++#define FTM5_ADDR_ICR         0x2000002Du  /* ADDR_ICR, fts_lib/ftsHardware.h:278 */
++#define FTM5_ICR_SPI4         0x02   /* SPI4_MASK, fts_lib/ftsHardware.h:287 */
++#define FTM5_ADDR_GPIO_DIR    0x20000032u  /* ADDR_GPIO_DIRECTION, fts_lib/ftsHardware.h:310 */
++#define FTM5_ADDR_GPIO_PULLUP 0x20000034u  /* ADDR_GPIO_PULLUP, fts_lib/ftsHardware.h:314 */
++#define FTM5_ADDR_GPIO_CFG0   0x2000003Du  /* ADDR_GPIO_CONFIG_REG0, fts_lib/ftsHardware.h:317 */
++#define FTM5_ADDR_GPIO_CFG2   0x2000003Fu  /* ADDR_GPIO_CONFIG_REG2, fts_lib/ftsHardware.h:320 */
++#define FTM5_ADDR_GPIO_CFG3   0x2000003Eu  /* ADDR_GPIO_CONFIG_REG3, fts_lib/ftsHardware.h:324 */
++#define FTM5_SPI4_GPIO_DIR    0x10   /* fts_lib/ftsFlash.c:288 */
++#define FTM5_SPI4_GPIO_PULLUP 0x02   /* fts_lib/ftsFlash.c:297 */
++#define FTM5_SPI4_CFG_ALIX    0x70   /* ALIX: CONFIG_REG3, fts_lib/ftsFlash.c:306-309 */
++#define FTM5_SPI4_CFG_OTHER   0x07   /* SALIXP: CONFIG_REG3, others: CONFIG_REG2, fts_lib/ftsFlash.c:310-317 */
++#define FTM5_SPI4_GPIO_CFG0   0x30   /* fts_lib/ftsFlash.c:326 */
++#define FTM5_ALIX_ID0         0x36   /* ALIX_DCHIP_ID_0, fts_lib/ftsHardware.h:28 */
++#define FTM5_ALIX_ID1         0x48   /* ALIX_DCHIP_ID_1, fts_lib/ftsHardware.h:29 */
++#define FTM5_SALIXP_ID0       0x36   /* SALIXP_DCHIP_ID_0, fts_lib/ftsHardware.h:30 */
++#define FTM5_SALIXP_ID1       0x40   /* SALIXP_DCHIP_ID_1, fts_lib/ftsHardware.h:31 */
++#define FTM5_SYSINFO_SIGN     0xA5   /* HEADER_SIGNATURE, fts_lib/ftsCompensation.h:45; data[0], ftsCore.c:568 */
++#define FTM5_SYSINFO_LOAD     0x01   /* LOAD_SYS_INFO, fts_lib/ftsSoftware.h:308; data[1], ftsCore.c:577 */
++#define FTM5_SYSINFO_CHIP0VER 8      /* index 4 + 2 + 1 + 1, fts_lib/ftsCore.c:585-590 */
++#define FTM5_SYSINFO_CHIP0ID  10     /* u16_chip0Id, little endian (u8ToU16, ftsTool.c:127-131), ftsCore.c:592 */
++#define FTM5_SYSINFO_FWVER    16     /* u16_fwVer, fts_lib/ftsCore.c:594-598 */
++#define FTM5_SYSINFO_READ     18     /* bytes read here: up to u16_fwVer (SYS_INFO_SIZE = 216, ftsCore.h:56) */
++
+ /* Event ID byte 0 (fts_lib/ftsSoftware.h:377-383). The driver dispatches on the high nibble (fts.c:4570). */
+ #define FTM5_EVT_NOEVENT          0x00
+ #define FTM5_EVT_CONTROLLER_READY 0x03
+@@ -69,6 +97,28 @@ ftm5_hwreg_read_cmd(uint8_t *cmd, uint32_t addr)
+ 	return 5;
+ }
+ 
++/* Build the one-byte write of a hardware register: fts_writeU8UX(FTS_CMD_HW_REG_W, ADDR_SIZE_HW_REG, addr, &val, 1)
++ * (fts_lib/ftsIO.c:593-602: opcode, address most significant byte first, data). Returns the length (6). */
++static inline unsigned
++ftm5_hwreg_write8_cmd(uint8_t *cmd, uint32_t addr, uint8_t val)
++{
++	(void)ftm5_hwreg_read_cmd(cmd, addr);
++	cmd[0] = FTM5_CMD_HW_REG_W;
++	cmd[5] = val;
++	return 6;
++}
++
++/* Build the framebuffer read of readSysInfo (fts_lib/ftsCore.c:557-559: FTS_CMD_FRAMEBUFFER_R, BITS_16 address,
++ * DUMMY_FRAMEBUFFER = 1 junk byte first, ftsHardware.h:214). Returns the length (3). */
++static inline unsigned
++ftm5_fb_read_cmd(uint8_t *cmd, uint16_t addr)
++{
++	cmd[0] = FTM5_CMD_FB_R;
++	cmd[1] = (uint8_t)(addr >> 8);
++	cmd[2] = (uint8_t)addr;
++	return 3;
++}
++
+ /* Compare the first two bytes of the chip-id register with the expected pair.
+  * 1 = same order as st,dchip_id (fts.h:299), 2 = swapped, 0 = no match. The byte order of the register is a
+  * GUESS (the downstream tree does not read it back), hence both orders are reported. */
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index 01cb6a0..d035d82 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -34,6 +34,22 @@
+  *                        Example: --args "sweettouchclk=3 sweettouchpoke=r:10c00000;m:1e080000=1=1;d:1000;r:1e080000;"
+  *   sweettouchvar=0|1    1: if the first identify times out, try up to 5 SPI/USI variants (A..E below) and stop at the
+  *                        first whose burst completes, then identify again (default 0: only the register dump runs)
++ *   Patch 0369, all default 0 = the path above unchanged. FTM5 = fts_touch f87fd67 ftm5/ (sweet_ftm5.h). Run in this order:
++ *   sweettouchsysinfo=1  only after the controller-ready event of sweettouchcs=1: read the System Info header from the
++ *                        framebuffer as fts_init does right after fts_system_reset (fts.c:5343-5352, readSysInfo(info, 0)
++ *                        ftsCore.c:556-598), log signature, chip0Id, fwVer. Read only; Linux never compares chip0Id with
++ *                        st,dchip_id, so it decides nothing here. deviation: 18 of the 216 bytes are read.
++ *   sweettouchspi4=1|2|3 only after the controller-ready event: the SPI4 block of hold_m3 (fts_lib/ftsFlash.c:283-344,
++ *                        "when no fw is running the chip use SPI3 by default"), each step logged, ICR (0x2000002D) read
++ *                        before and after (the read of fts.c:416-417). 1 = ICR := SPI4_MASK + 1 ms only (:335-:343);
++ *                        2 = the whole block: GPIO dir, pull-up, config 2/3, config 0, ICR, 1 ms (:288-:343);
++ *                        3 = as flash_burn: 100 ms (:1058), hold M3 (ADDR_SYSTEM_RESET := 1, :270-:275), then the block of 2.
++ *                        deviation: Linux runs the block only inside hold_m3 (flash update path, ftsFlash.c:1062), never
++ *                        at probe; 1 and 2 run it with the firmware running. 3 stops the firmware: phase 2 then repeats
++ *                        the reset pulse first, as flash_burn ends with fts_system_reset (:1151).
++ *   sweettouchidwait=MS  0..1000: sleep before the identify (and before every retry). Linux has no such wait (it does not
++ *                        read DCHIP_ID at probe): a timing test, no source.
++ *   sweettouchidretry=N  0..5: if the identify does not match, run it again up to N times, logging each result.
+  *
+  * Variants (patch 0090). Linux = master of git.kernel.org torvalds/linux.git fetched 2026-10-22 (line numbers of that copy):
+  *   A  CLK_CFG |= ENCLK (bit 8), PSR (bits 7:0) = 3: spi-s3c64xx.c S3C64XX_SPI_ENCLK_ENABLE :52, PSR_MASK :53, set in
+@@ -174,6 +190,8 @@ static struct {
+ 	char poke[POKE_MAX_LEN + 16];   /* sweettouchpoke boot-arg (empty = none) */
+ 	uint32_t last_st, last_ch;   /* STATUS / CH_CFG at the last burst timeout */
+ 	int mode, mux_force;
++	int spi4, sysinfo, idretry;   /* patch 0369 boot-args, 0 = off */
++	uint32_t idwait_ms;
+ 	uint32_t delay_s;
+ 	int sleep_chan;
+ 	bool down[FTM5_TOUCH_ID_MAX];
+@@ -1095,6 +1113,118 @@ tg_identify(void)
+ 	return match != 0;
+ }
+ 
++/* ---- patch 0369: what Linux does after the reset (header comment); every step is a boot-arg, default off ---- */
++
++/* One hardware-register byte write as fts_writeU8UX sends it: a plain write in one chip-select assertion
++ * (fts_lib/ftsIO.c:593-602, nrd = 0 in tg_xfer). Writes go to the touch IC only. */
++static bool
++tg_hwreg_write8(const char *what, uint32_t addr, uint8_t val)
++{
++	uint8_t cmd[6];
++	int err;
++
++	(void)ftm5_hwreg_write8_cmd(cmd, addr, val);
++	err = tg_xfer(cmd, sizeof(cmd), NULL, 0);
++	printf("SWEET TOUCH: spi4: %s [%#x] := %#x (%02x %02x %02x %02x %02x %02x): %s\n", what, addr, val, cmd[0], cmd[1],
++	    cmd[2], cmd[3], cmd[4], cmd[5], err ? "SPI transfer timed out" : "sent");
++	return err == 0;
++}
++
++/* The ICR read of fts.c:416-417: FTS_CMD_HW_REG_R, ADDR_SIZE_HW_REG, ADDR_ICR, 1 byte after DUMMY_HW_REG. */
++static void
++tg_icr_report(const char *when)
++{
++	uint8_t cmd[5], v = 0;
++
++	(void)ftm5_hwreg_read_cmd(cmd, FTM5_ADDR_ICR);
++	if (tg_read(cmd, sizeof(cmd), &v, 1)) {
++		printf("SWEET TOUCH: spi4: ICR [%#x] %s: SPI transfer timed out\n", FTM5_ADDR_ICR, when);
++		return;
++	}
++	printf("SWEET TOUCH: spi4: ICR [%#x] %s = %#x (SPI4_MASK %#x %s)\n", FTM5_ADDR_ICR, when, v, FTM5_ICR_SPI4,
++	    (v & FTM5_ICR_SPI4) ? "set" : "clear");
++}
++
++/* sweettouchspi4=1|2|3: the SPI4 block of hold_m3, fts_lib/ftsFlash.c:283-344; 3 adds flash_burn's wait and M3 hold. */
++static void
++tg_spi4(void)
++{
++	uint32_t cfg = FTM5_ADDR_GPIO_CFG2;
++	uint8_t cfgv = FTM5_SPI4_CFG_OTHER;
++	bool ok = true;
++
++	printf("SWEET TOUCH: spi4: sweettouchspi4=%d (1 ICR only, 2 GPIO + ICR, 3 hold M3 + GPIO + ICR)\n", tg.spi4);
++	tg_icr_report("before");
++	if (tg.spi4 >= 3) {
++		tg_sleep_ms(100);   /* ref: ftsFlash.c:1058 msleep(100) "required by HW for safe flash procedure" */
++		ok = tg_hwreg_write8("hold M3 (ADDR_SYSTEM_RESET)", FTM5_ADDR_SYSTEM_RESET, FTM5_HOLD_M3);   /* ref: ftsFlash.c:270-275 */
++		tg.reset_done = false;   /* firmware held: phase 2 pulses the reset again, as flash_burn ends (ftsFlash.c:1151) */
++	}
++	if (ok && tg.spi4 >= 2) {
++		if (tg.chip_id[0] == FTM5_ALIX_ID0 && tg.chip_id[1] == FTM5_ALIX_ID1) {   /* ref: ftsFlash.c:306-317, st,dchip_id */
++			cfg = FTM5_ADDR_GPIO_CFG3;
++			cfgv = FTM5_SPI4_CFG_ALIX;
++		} else if (tg.chip_id[0] == FTM5_SALIXP_ID0 && tg.chip_id[1] == FTM5_SALIXP_ID1) {
++			cfg = FTM5_ADDR_GPIO_CFG3;
++		}
++		ok = tg_hwreg_write8("GPIO direction", FTM5_ADDR_GPIO_DIR, FTM5_SPI4_GPIO_DIR) &&       /* ref: ftsFlash.c:288-290 */
++		    tg_hwreg_write8("GPIO pull-up", FTM5_ADDR_GPIO_PULLUP, FTM5_SPI4_GPIO_PULLUP) &&   /* ref: ftsFlash.c:297-299 */
++		    tg_hwreg_write8(cfg == FTM5_ADDR_GPIO_CFG3 ? "GPIO config 3" : "GPIO config 2", cfg, cfgv) &&   /* ref: ftsFlash.c:318-319 */
++		    tg_hwreg_write8("GPIO config 0", FTM5_ADDR_GPIO_CFG0, FTM5_SPI4_GPIO_CFG0);         /* ref: ftsFlash.c:326-328 */
++	}
++	if (ok) {
++		ok = tg_hwreg_write8("ICR", FTM5_ADDR_ICR, FTM5_ICR_SPI4);   /* ref: ftsFlash.c:335-337 */
++	}
++	if (!ok) {
++		printf("SWEET TOUCH: spi4: stopped at the failed write (hold_m3 returns there too, ftsFlash.c:276-341)\n");
++		return;
++	}
++	delay(1000);   /* ref: ftsFlash.c:343 mdelay(1) "wait for the GPIO to stabilize" */
++	tg_icr_report("after");
++}
++
++/* sweettouchsysinfo=1: readSysInfo(info, 0) as fts_init calls it right after fts_system_reset (fts.c:5343-5352).
++ * Read only; the chip0Id comparison is printed for the log, Linux itself never makes it. */
++static void
++tg_sysinfo(void)
++{
++	uint8_t cmd[3], d[FTM5_SYSINFO_READ] = { 0 }, want[2];
++	int match;
++
++	want[0] = (uint8_t)tg.chip_id[0];
++	want[1] = (uint8_t)tg.chip_id[1];
++	(void)ftm5_fb_read_cmd(cmd, FTM5_ADDR_FRAMEBUFFER);
++	if (tg_read(cmd, sizeof(cmd), d, sizeof(d))) {
++		printf("SWEET TOUCH: sysinfo: SPI transfer timed out\n");
++		return;
++	}
++	match = ftm5_chip_id_match(d + FTM5_SYSINFO_CHIP0ID, want);
++	printf("SWEET TOUCH: sysinfo raw: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++	    "%02x %02x\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14],
++	    d[15], d[16], d[17]);
++	printf("SWEET TOUCH: sysinfo: signature %02x (want %02x) type %02x (want %02x) chip0Ver %02x%02x chip0Id %02x%02x "
++	    "fwVer %02x%02x, st,dchip_id %02x %02x -> %s\n", d[0], FTM5_SYSINFO_SIGN, d[1], FTM5_SYSINFO_LOAD,
++	    d[FTM5_SYSINFO_CHIP0VER + 1], d[FTM5_SYSINFO_CHIP0VER], d[FTM5_SYSINFO_CHIP0ID + 1], d[FTM5_SYSINFO_CHIP0ID],
++	    d[FTM5_SYSINFO_FWVER + 1], d[FTM5_SYSINFO_FWVER], want[0], want[1],
++	    (d[0] != FTM5_SYSINFO_SIGN || d[1] != FTM5_SYSINFO_LOAD) ? "header wrong (readSysInfo would fail, ftsCore.c:568-583)" :
++	    match == 1 ? "chip0Id low byte = st,dchip_id[0] (GUESS: same id)" : match == 2 ? "chip0Id = st,dchip_id swapped" :
++	    "chip0Id differs from st,dchip_id");
++}
++
++/* The identify, after sweettouchidwait ms; n > 0 is a sweettouchidretry repeat. With both 0 this is tg_identify(). */
++static bool
++tg_identify_try(int n)
++{
++	if (n > 0) {
++		printf("SWEET TOUCH: idretry %d/%d\n", n, tg.idretry);
++	}
++	if (tg.idwait_ms) {
++		printf("SWEET TOUCH: idwait: %u ms before the identify\n", tg.idwait_ms);
++		tg_sleep_ms(tg.idwait_ms);
++	}
++	return tg_identify();
++}
++
+ /* ---- phase 2 ---- */
+ 
+ static void
+@@ -1279,7 +1409,21 @@ tg_run(void)
+ 		tg.reset_done = tg_reset_and_ready(&logged);
+ 		printf("SWEET TOUCH: reset before identify: %s\n", tg.reset_done ? "controller-ready event seen" : "no ready event");
+ 	}
+-	ok = tg_identify();
++	if ((tg.sysinfo || tg.spi4) && !tg.reset_done) {   /* patch 0369: both follow fts_system_reset in Linux */
++		printf("SWEET TOUCH: sweettouchsysinfo/sweettouchspi4 skipped: no controller-ready event before the identify "
++		    "(needs sweettouchcs=1)\n");
++	} else {
++		if (tg.sysinfo) {
++			tg_sysinfo();
++		}
++		if (tg.spi4) {
++			tg_spi4();
++		}
++	}
++	ok = tg_identify_try(0);
++	for (int r = 1; !ok && r <= tg.idretry; r++) {
++		ok = tg_identify_try(r);
++	}
+ 	for (unsigned n = 0; !ok && tg.var && n < 5; n++) {
+ 		if (tg_variant(n)) {
+ 			printf("SWEET TOUCH: VARIANT %c completes, identifying again\n", (char)('A' + n));
+@@ -1362,6 +1506,7 @@ sweet_touch_gs101_init(void)
+ 	char const *compat = NULL;
+ 	unsigned int csize = 0;
+ 	int mode = 2, delay_s = 45, mux = 0, clk = 0, var = 0, cs = 0;
++	int spi4 = 0, sysinfo = 0, idwait = 0, idretry = 0;
+ 	thread_t thread;
+ 
+ 	if (started) {
+@@ -1387,6 +1532,10 @@ sweet_touch_gs101_init(void)
+ 	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
+ 	(void)PE_parse_boot_argn("sweettouchvar", &var, sizeof(var));
+ 	(void)PE_parse_boot_argn("sweettouchcs", &cs, sizeof(cs));
++	(void)PE_parse_boot_argn("sweettouchspi4", &spi4, sizeof(spi4));
++	(void)PE_parse_boot_argn("sweettouchsysinfo", &sysinfo, sizeof(sysinfo));
++	(void)PE_parse_boot_argn("sweettouchidwait", &idwait, sizeof(idwait));
++	(void)PE_parse_boot_argn("sweettouchidretry", &idretry, sizeof(idretry));
+ 	{   /* patch 0355/0356: sweettouchirq 0/absent = unchanged, 2 = read-only stage 0 (0355), 1 = interrupt stage 1 (0356), other = GAP, treated as 0 */
+ 		int irq0 = 0;
+ 		bool irq0_given = PE_parse_boot_argn("sweettouchirq", &irq0, sizeof(irq0));
+@@ -1404,6 +1553,15 @@ sweet_touch_gs101_init(void)
+ 	tg_parse_cmu(node);
+ 	tg.var = var == 1;
+ 	tg.cs_abl = cs == 1;
++	if (spi4 < 0 || spi4 > 3 || sysinfo < 0 || sysinfo > 1 || idwait < 0 || idwait > 1000 || idretry < 0 || idretry > 5) {
++		printf("SWEET TOUCH: refused sweettouchspi4=%d sweettouchsysinfo=%d sweettouchidwait=%d sweettouchidretry=%d "
++		    "(ranges 0..3, 0..1, 0..1000, 0..5): all four off\n", spi4, sysinfo, idwait, idretry);
++		spi4 = sysinfo = idwait = idretry = 0;
++	}
++	tg.spi4 = spi4;
++	tg.sysinfo = sysinfo;
++	tg.idwait_ms = (uint32_t)idwait;
++	tg.idretry = idretry;
+ 	tg.clk_mode = clk < 0 ? 0 : clk > 3 ? 3 : clk;
+ 	tg.mode = mode;
+ 	tg.delay_s = (uint32_t)delay_s;

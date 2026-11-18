@@ -1,0 +1,43 @@
+SWEET USB live-log port (patch 0371): boot-arg sweetusblogport=N (1..65535) sends the UDP console log (patch 0075) to 192.168.7.1:N instead of 5140.
+Without the boot-arg nothing changes. No hardware access. Reason: the host firewall (NixOS networking.firewall) drops UDP 5140 when it is active (observed 2026-11-15 c4-batt5:
+rx counters rose, listener got 0 bytes, firewall.service active); 64738 is already in allowedUDPPorts.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c85f3a9..75668a2 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1196,6 +1196,9 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/* UDP destination port of the live log and of the panic frame: 5140, or boot-arg sweetusblogport (set once by the log thread) */
++static uint16_t ud_log_port = 5140;
++
+ /*
+  * Live console log over USB Ethernet: every 100 ms the new bytes of the
+  * console ring (bsd/dev/sweet_ufs.c) go as UDP datagrams to
+@@ -1395,7 +1398,12 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+-	to.sin_port = htons(5140);
++	uint32_t port = 5140;
++	if (!PE_parse_boot_argn("sweetusblogport", &port, sizeof(port)) || port == 0 || port > 65535) {
++		port = 5140;            /* boot-arg sweetusblogport=N (oriole usb-log-port patch): another UDP port for a host firewall that blocks 5140 */
++	}
++	ud_log_port = (uint16_t)port;   /* the panic frame below goes to the same port */
++	to.sin_port = htons((uint16_t)port);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		/* patch 0267: 2 ms while console bytes are pending (back-pressure from ud_log_drain), else 100 ms as before */
+@@ -1571,8 +1579,8 @@ sweet_usb_panic_send(const char *payload, uint32_t len)
+ 	}
+ 	sum = ~sum & 0xffff;
+ 	f[10] = (uint8_t)(sum >> 8); f[11] = (uint8_t)sum;
+-	/* UDP (RFC 768): 5140 -> 5140, checksum 0 = none (allowed over IPv4) */
+-	f[20] = 0x14; f[21] = 0x14; f[22] = 0x14; f[23] = 0x14;
++	/* UDP (RFC 768): 5140 -> the log thread's port (5140, or sweetusblogport), checksum 0 = none (allowed over IPv4) */
++	f[20] = 0x14; f[21] = 0x14; f[22] = (uint8_t)(ud_log_port >> 8); f[23] = (uint8_t)ud_log_port;
+ 	f[24] = (uint8_t)(udl >> 8); f[25] = (uint8_t)udl; f[26] = 0; f[27] = 0;
+ 	memcpy(f + 28, payload, len);
+ 	flen = ETHER_HDR_LEN + 28 + len;

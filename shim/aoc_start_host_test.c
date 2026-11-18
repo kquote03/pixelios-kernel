@@ -1,4 +1,4 @@
-/* Host test of the AOC start + service discovery (xnu patch 0165, bsd/dev/sweet_aoc_start.h, sweetaoc=3, plan step A8)
+/* Host test of the AOC start + service discovery (xnu patch 0377, bsd/dev/sweet_aoc_start.h, sweetaoc=3, plan step A8)
  * against a fake SoC (chipid, aoc_req, SSMT, AOC mailbox, SysMMU), a fake TIPC peer (the hwmgr sequence result) and a fake
  * AOC firmware that writes the control block + service table into the IPC window. Cases: good start with N services incl.
  * audio_output_control, START error code, gate (not LOADED, START never sent), undocumented state, no ready, malformed

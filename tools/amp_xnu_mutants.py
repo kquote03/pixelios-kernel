@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Mutation check for xnu patch 0158 (bsd/dev/sweet_amp.h, review 0158-amp-init-review-fable-1 F2): each mutant of the header must make
+"""Mutation check for xnu patch 0373 (bsd/dev/sweet_amp.h, review 0373-amp-init-review-fable-1 F2): each mutant of the header must make
 shim/amp_xnu_host_test.c fail. Extracts the header from the patch, applies one mutation at a time, compiles and runs the test.
 Usage (from the repo root, in the FHS env): python3 tools/amp_xnu_mutants.py      Last line: RESULT: PASS n/n mutants killed | FAIL ..."""
 import pathlib, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PATCH = ROOT / "xnu/patches/0158-sweet-amp-init.patch"
-PATCH_A9 = ROOT / "xnu/patches/0166-aoc-audio.patch"	# patch 0166 (A9b) extends sweet_amp.h: its hunk is applied on top
-PATCH_PLAY = ROOT / "xnu/patches/0167-aoc-playback.patch"	# patch 0167 (sweetaoc=5) extends sweet_amp.h and sweet_audio.h again
-PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"
-PATCH_DSP = ROOT / "xnu/patches/0169-amp-dsp-load.patch"	# patch 0169 (sweetaoc=6): sweet_amp.h hunk + the new sweet_amp_dsp.h	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
-PATCH_CHUNK = ROOT / "xnu/patches/0170-amp-dsp-chunk.patch"	# patch 0170 (A9f): sweet_amp_dsp.h bursts of <= 480 bytes + failure detail
-PATCH_MPU = ROOT / "xnu/patches/0171-amp-dsp-mpu.patch"	# patch 0171 (A9g): MPU read-back logged, relock after a failed MPU write, detail lines
-PATCH_TONE = ROOT / "xnu/patches/0172-amp-tone.patch"	# patch 0172 (A10): sweet_amp.h power words + sweet_amp_pwr.h, sweet_audio.h tone
+PATCH = ROOT / "xnu/patches/0373-sweet-amp-init.patch"
+PATCH_A9 = ROOT / "xnu/patches/0378-aoc-audio.patch"	# patch 0378 (A9b) extends sweet_amp.h: its hunk is applied on top
+PATCH_PLAY = ROOT / "xnu/patches/0379-aoc-playback.patch"	# patch 0379 (sweetaoc=5) extends sweet_amp.h and sweet_audio.h again
+PATCH_MATCH = ROOT / "xnu/patches/0380-aoc-reply-match.patch"
+PATCH_DSP = ROOT / "xnu/patches/0381-amp-dsp-load.patch"	# patch 0381 (sweetaoc=6): sweet_amp.h hunk + the new sweet_amp_dsp.h	# patch 0380: sweet_audio.h reply matching (id not compared, as stock)
+PATCH_CHUNK = ROOT / "xnu/patches/0382-amp-dsp-chunk.patch"	# patch 0382 (A9f): sweet_amp_dsp.h bursts of <= 480 bytes + failure detail
+PATCH_MPU = ROOT / "xnu/patches/0383-amp-dsp-mpu.patch"	# patch 0383 (A9g): MPU read-back logged, relock after a failed MPU write, detail lines
+PATCH_TONE = ROOT / "xnu/patches/0384-amp-tone.patch"	# patch 0384 (A10): sweet_amp.h power words + sweet_amp_pwr.h, sweet_audio.h tone
 TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
@@ -27,7 +27,7 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("no pre-write error check (F6)", "\tif (e == AMP_OK && (st0 & AMP_ERR_BITS)) {", "\tif (0) {"),
     ("R written after a failed L (F4)", "\t\tif (il == AMP_OK && AMP_ID_OK(er, r))", "\t\tif (AMP_ID_OK(er, r))"),
     ("pass line from another condition (F1)", 'con_str("SWEET", pass ? "AMP: init ok', 'con_str("SWEET", 1 ? "AMP: init ok'),
-    # review 0158 round 2 N2: the post-write check and read, each error bit, the DEVID gate
+    # review 0373 round 2 N2: the post-write check and read, each error bit, the DEVID gate
     ("post-write error check removed (n01)", "\treturn e == AMP_OK && !(st1 & AMP_ERR_BITS) && mask", "\treturn e == AMP_OK && mask"),
     ("post-write status read removed (n20)", "\tif (e == AMP_OK)\n\t\te = amp_read(s, cs, AMP_REG_IRQ1_STATUS1, &st1);\n", ""),
     ("AMP_SHORT_ERR dropped (n11)", "(0x80000000u | 0x20000u |", "(0x20000u |"),
@@ -43,7 +43,7 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("second lock word dropped", "\t\tlk = (amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_LOCK2) == AMP_OK) && lk;\n", ""),
     ("a failed lock does not fail the amp", "return e == AMP_OK && unlocked && lk && nbad == 0u", "return e == AMP_OK && unlocked && nbad == 0u"),
     ("unlock without its second word", "\t\tif (e == AMP_OK)\n\t\t\te = amp_write(s, cs, AMP_REG_TEST_KEY, AMP_OTP_KEY_UNLOCK2);\n", ""),
-    # patch 0166 A9b (new stop / restore paths)
+    # patch 0378 A9b (new stop / restore paths)
     # dropping only the by-name PWR_CTRL1 refusal is equivalent (no row names 0x2014: _Static_assert + reg == t->reg), so it is paired with the row check
     ("A9: PWR_CTRL1 allowed while armed (and row register unchecked)", "if (!amp_a9.on || amp_a9.idx >= AMP_A9_N || reg == AMP_REG_PWR_CTRL1)\n\t\treturn 0;\n\tt = &amp_a9_tab[amp_a9.idx];\n\treturn reg == t->reg && ", "if (!amp_a9.on || amp_a9.idx >= AMP_A9_N)\n\t\treturn 0;\n\tt = &amp_a9_tab[amp_a9.idx];\n\treturn "),
     ("A9: row register not checked", "\treturn reg == t->reg && (val & t->mask)", "\treturn (val & t->mask)"),
@@ -53,13 +53,13 @@ MUTANTS = [	# (label, old, new): the reviewer's five survivors (m08 m09 m10 m12 
     ("A9: PLL poll does not stop at the lock", "d->polls < AMP_A9_PLL_POLLS && !d->locked", "d->polls < AMP_A9_PLL_POLLS"),
 ]
 
-# patch 0169 A9e: the new stop / restore path of sweet_amp_dsp.h and its hook in sweet_amp.h (killed by the A9e cases of amp_xnu_host_test)
+# patch 0381 A9e: the new stop / restore path of sweet_amp_dsp.h and its hook in sweet_amp.h (killed by the A9e cases of amp_xnu_host_test)
 MUTANTS_DSP = [
     ("A9e: started core never stopped", "\tif (!d->started || d->stopped)\n\t\treturn;\n\td->stopped = 1;", "\tif (1)\n\t\treturn;\n\td->stopped = 1;"),
     ("A9e: started marked only after the CCM write", "\td->started = 1;\n\te = amp_dsp_rmw(", "\te = amp_dsp_rmw("),
     ("A9e: error bit after the start not checked", "(d->st1 & AMP_ERR_BITS) || (d->pwr1 & AMP_GLOBAL_EN))\n\t\t\td->stage = DS_ERR;", "0)\n\t\t\td->stage = DS_ERR;"),
     ("A9e: read-back not compared", "if ((!unp24 || (i & 3u)) && amp_dsp_rb[i] != d[off + i])", "if (0)"),
-    # patch 0171 A9g: the relock after a failed MPU write (new restore path); the MPU read-back stays a logged value
+    # patch 0383 A9g: the relock after a failed MPU write (new restore path); the MPU read-back stays a logged value
     ("A9g: no relock after a failed MPU write", "\telse\n\t\t(void)amp_write(s, cs, AMP_DSP_MPU_LOCK, 0u);", "\telse\n\t\t(void)0;"),
     ("A9g: MPU read-back mismatch stops again", "\t\td->mpu_rb++;\n", "\t\tif (rb != 0xFFFFFFFFu)\n\t\t\treturn AMP_ERROR;\n\t\td->mpu_rb++;\n"),
 ]
@@ -68,7 +68,7 @@ MUTANTS_HOOK = [
     ("A9e: R loaded after a failed L", "if (amp_dsp_load(s, 0, &amp_dsp_res.a[0]) == AMP_OK)\n\t\t\t(void)", "(void)amp_dsp_load(s, 0, &amp_dsp_res.a[0]);\n\t\t\t(void)"),
 ]
 
-# patch 0167: the new stop path of sweet_audio.h (SOURCE on 0 before the BIND2 undo), killed by shim/aoc_audio_host_test.c
+# patch 0379: the new stop path of sweet_audio.h (SOURCE on 0 before the BIND2 undo), killed by shim/aoc_audio_host_test.c
 MUTANTS_AUDIO = [
     ("play: SOURCE off never sent", "\tif (r->started && !r->stopped) {", "\tif (0) {"),
     ("play: started only on a good reply (no stop after a timeout / reject)", "r->started = r->x[r->nx - 1u].written;", "r->started = rc == SWAU_OK;"),
@@ -120,12 +120,12 @@ def apply(base: str, name: str, patches) -> str:
 
 
 def header_dsp() -> str:
-    """sweet_amp_dsp.h of patch 0169 with the 0170 hunk applied on top (as shim/build.sh does)."""
+    """sweet_amp_dsp.h of patch 0381 with the 0382 hunk applied on top (as shim/build.sh does)."""
     return apply(header("sweet_amp_dsp.h", PATCH_DSP), "sweet_amp_dsp.h", [PATCH_CHUNK, PATCH_MPU])
 
 
 def header_a9() -> str:
-    """The 0158 header with the sweet_amp.h hunks of patches 0166 and 0167 applied on top."""
+    """The 0373 header with the sweet_amp.h hunks of patches 0378 and 0379 applied on top."""
     return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY, PATCH_DSP, PATCH_TONE])
 
 

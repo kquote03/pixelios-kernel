@@ -33,7 +33,7 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
    and push. No reviewer agents, review rounds or review files unless the user asks.
 
 User exception (2026-11-18, oriole audio bring-up only): the pre-run review and the amp-enable precondition are lifted. Still
-required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS sample clamp, patch 0182), never touch the haptics amp.
+required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS sample clamp, patch 0394), never touch the haptics amp.
 
 ## Commands
 

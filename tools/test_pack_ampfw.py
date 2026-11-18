@@ -1,4 +1,4 @@
-"""tools/pack_ampfw.py: AMPFWV01 container of the CS35L41 DSP files (xnu patch 0169, sweetaoc=6), mkpayload / build-xnu-image.sh / xrun --ampfw.
+"""tools/pack_ampfw.py: AMPFWV01 container of the CS35L41 DSP files (xnu patch 0381, sweetaoc=6), mkpayload / build-xnu-image.sh / xrun --ampfw.
 The layout must match bsd/dev/sweet_amp_dsp.h amp_dsp_container; the pinned identity must be the kernel's."""
 import hashlib
 import os
@@ -39,7 +39,7 @@ class PackAmpfw(unittest.TestCase):
             p.parse(bytes(c), pinned=False)                      # crc
 
     def test_pinned_identity_matches_kernel(self):
-        patch = open(os.path.join(ROOT, 'xnu', 'patches', '0169-amp-dsp-load.patch')).read()
+        patch = open(os.path.join(ROOT, 'xnu', 'patches', '0381-amp-dsp-load.patch')).read()
         m = re.search(r'amp_fw_len\[AMP_FW_N\] = \{ (\d+)u, (\d+)u, (\d+)u \}', patch)
         self.assertEqual([int(x) for x in m.groups()], [p.PINNED[t][0] for t in p.TAGS])
         m = re.search(r'amp_fw_sha\[AMP_FW_N\]\[32\] = \{(.*?)\n\+\};', patch, re.S)

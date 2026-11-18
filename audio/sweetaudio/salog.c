@@ -182,7 +182,7 @@ is_tap_device(AudioObjectID id)
  *  - mix: the taps add into one accumulator (sa_mix, summing where concurrent streams overlap); the leader tap (the last one called
  *    within TAP_LEAD_MS) flushes it, so two VirtualAudio streams sum instead of interleaving in the kernel FIFO;
  *  - loudness: make-up gain SALOG_GAIN_DB (default 12 dB, 0..24) with a block peak limiter at TAP_CEIL (-1 dBFS) before S16; the kernel then
- *    applies its own gain (default -6 dB) and its -3 dBFS sample clamp (patch 0182);
+ *    applies its own gain (default -6 dB) and its -3 dBFS sample clamp (patch 0394);
  *  - drift: before each write the kernel FIFO fill (SWAU_IOC_POS) trims the resample ratio (sa_drift_adj, <= 0.3 %) towards TAP_FILL frames;
  *  - evidence: one "tap: sound" line per sound (after 1 s of silence): frames, input peak, output peak, gain, fill, drift, kernel counters.
  * The fd stays open (the kernel keeps the amps on while a writer is attached). IO thread: one os_unfair_lock, no allocation. */

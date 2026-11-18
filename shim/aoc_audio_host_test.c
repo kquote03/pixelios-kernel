@@ -1,13 +1,13 @@
-/* Host test of the AOC audio path open (xnu patch 0166, bsd/dev/sweet_audio.h, sweetaoc=4, plan step A9a) against a fake AOC queue peer in a fake
+/* Host test of the AOC audio path open (xnu patch 0378, bsd/dev/sweet_audio.h, sweetaoc=4, plan step A9a) against a fake AOC queue peer in a fake
  * IPC window, and of the CS35L41 HALO file parser (bsd/dev/sweet_cs_dsp.h, A9c parser only) on synthetic files and, when present, on the stock
  * files in $SWEET_CS35L41_FW (default ~/pixelios-artifacts/aoc/cs35l41; skipped if absent, never in git).
  * AOC cases: good open + close (exact bytes, ids 233 / 271 / 271, cntr 0..2, one doorbell per message, counters), a stale reply drained,
  * BIND2 rejected (reply != 0: stop, undo sent), a 4-byte AOC error code, a timeout (<= 500 ms), an unknown reply id, a ring service refused,
  * a full DOWN queue (nothing written), counters corrupt.
- * Patch 0167 (sweetaoc=5): the play open (audio_playback0 ring zeroed + reset, EP_SETUP 206 and SOURCE 201 bytes), zero feeds (exact amount, cap,
+ * Patch 0379 (sweetaoc=5): the play open (audio_playback0 ring zeroed + reset, EP_SETUP 206 and SOURCE 201 bytes), zero feeds (exact amount, cap,
  * wrap, push-ring doorbell), the close order (SOURCE on 0, then BIND2 0), each stop inside the play open (SOURCE rejected or unanswered: stop sent;
  * EP_SETUP or BIND2 rejected: no SOURCE, bind undone) and the refusals (queue type, size, window, counters, indexes, overlaps: no zero write).
- * Patch 0168: a reply with another id but type 0 and the sent length is accepted (stock never reads the id); EP_SETUP answered with id 288 as
+ * Patch 0380: a reply with another id but type 0 and the sent length is accepted (stock never reads the id); EP_SETUP answered with id 288 as
  * on the phone (run a9c): SOURCE on sent, then SOURCE off + BIND2 0. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +34,7 @@ static uint32_t r32(uint32_t o) { return ipc[o] | ipc[o + 1] << 8 | ipc[o + 2] <
 #define RG(d, f) (HDR + 36u + 28u * (d) + 4u * (f))      /* f: 0 offset 1 size 2 slots 3 tx 4 rx 5 wp 6 rp */
 
 static int mode;            /* peer: 0 echo reply 0, 1 reject BIND2 bind 1, 2 error code on 233, 3 silent, 4 wrong id, 5 reply len differs,
-                             * 0167: 6 silent on SOURCE on 1, 7 reject SOURCE on 1, 8 reject EP_SETUP */
+                             * 0379: 6 silent on SOURCE on 1, 7 reject SOURCE on 1, 8 reject EP_SETUP */
 static int nbell, nsync, nwrite_bad, stale;
 static uint8_t sent[8][32];
 static uint32_t sent_len[8], nsent, now;
@@ -161,7 +161,7 @@ t_refuse(void)
 	printf("ok: refusals (ring, full, corrupt, outside)\n");
 }
 
-/* ---- patch 0167 (sweetaoc=5): audio_playback0 ring + EP_SETUP + SOURCE on / off ---- */
+/* ---- patch 0379 (sweetaoc=5): audio_playback0 ring + EP_SETUP + SOURCE on / off ---- */
 #define PBI   8u                                /* audio_playback0 index in the fake table */
 #define NSVC  12u
 #define PHDR  (SO + PBI * SS)
@@ -372,7 +372,7 @@ t_parser_stock(void)
 	}
 }
 
-/* patch 0172: the tone pattern: 3 x 1 s of the 48-sample sine, 1 s apart, then silence; never above 1036 (-30 dBFS); L = R */
+/* patch 0384: the tone pattern: 3 x 1 s of the 48-sample sine, 1 s apart, then silence; never above 1036 (-30 dBFS); L = R */
 static void
 t_tone(void)
 {
@@ -409,7 +409,7 @@ main(void)
 	t_stop(1, SWAU_E_REJECTED, 1, 3u, "BIND2 rejected (reply -22): stop, undo sent");
 	t_stop(2, SWAU_E_AOCERR, 0, 1u, "4-byte AOC error on GET_DSP_STATE: stop, no BIND2");
 	t_stop(3, SWAU_E_TIMEOUT, 0, 1u, "no reply: timeout after 500 ms, no BIND2");
-	t_stop(4, SWAU_OK, 1, 3u, "reply with another id, same type + length: accepted as stock (0168), bind undone on close");
+	t_stop(4, SWAU_OK, 1, 3u, "reply with another id, same type + length: accepted as stock (0380), bind undone on close");
 	t_stop(5, SWAU_E_UNKNOWN, 0, 1u, "reply of another length: unknown, stop");
 	t_refuse();
 	t_play_good(0x10000u);

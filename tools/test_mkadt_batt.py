@@ -1,6 +1,6 @@
-"""The /sweet-batt ADT node (tools/mkadt.py) of xnu patch 0148 (bsd/dev/sweet_hsi2c_fg.h, boot-arg sweetbatt=1): every value equals soc.json
+"""The /sweet-batt ADT node (tools/mkadt.py) (written for the old oriole patch 0148, dropped in the 2026-11-18 upstream port; kept as board data): every value equals soc.json
 hsi2c / peri and board.json fg, typed here independently; the device allowlist {0x36} and the seven registers are pinned and anything else
-in board.json is refused; only boards with an fg block get the node; the property names are exactly the ones the patch header reads."""
+in board.json is refused; only boards with an fg block get the node."""
 import copy
 import os
 import re
@@ -12,7 +12,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from tools import adt, boards, mkadt  # noqa: E402
 
-PATCH = os.path.join(ROOT, "xnu", "patches", "0148-sweet-hsi2c-fg.patch")
 
 
 def node_props(board, **kw):
@@ -116,28 +115,6 @@ class SweetBattNode(unittest.TestCase):
         self.bad(lambda c: c["hsi2c"]["bits"].__setitem__("ctl_master", 32), "a bit number 32")
         self.bad(lambda c: c["hsi2c"]["bits"].pop("auto_master_run"), "a bit missing")
         self.bad(lambda c: c["peri"]["pins"].__setitem__(1, ["I2C12_SDA", "gpp25", 5, "i2c12"]), "the two pads on different banks")
-
-    def test_property_names_equal_the_patch_header(self):
-        if not os.path.exists(PATCH):
-            self.fail("xnu/patches/0148-sweet-hsi2c-fg.patch missing")
-        text = open(PATCH).read()
-        hdr = []
-        on = False
-        for line in text.splitlines():
-            if line == "+++ b/bsd/dev/sweet_hsi2c_fg.h":
-                on = True
-                continue
-            if on and line.startswith("diff --git "):
-                break
-            if on and line.startswith("+"):
-                hdr.append(line[1:])
-        hdr = re.sub(r"/\*.*?\*/", " ", "\n".join(hdr), flags=re.S)
-        u32 =set(re.findall(r'X\(\s*[\w\[\]]+\s*,\s*"([\w-]+)"\s*,\s*\w+\s*\)', hdr))
-        pa = set(re.findall(r'X\(\s*\w+\s*,\s*\w+\s*,\s*"([\w-]+)"\s*\)', hdr))
-        if not u32 or not pa:
-            self.fail("the header's SFG_CFG_U32 / SFG_CFG_PA lists not found")
-        names = {k for k, _v in mkadt.sweet_batt_props(boards.BOARDS["oriole"])} - {"compatible"}
-        self.assertEqual(u32 | pa, names)
 
 
 if __name__ == "__main__":
