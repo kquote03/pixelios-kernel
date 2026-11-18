@@ -39,6 +39,16 @@ class T(unittest.TestCase):
         self.assertEqual(open(self.o, "rb").read(8), b"bplist00")
         self.assertIn("jobs 2 -> 3", r.stdout)
 
+    def test_sweetaudio_job(self):
+        h = self.put(base())
+        r = self.run_tool("--sha256", h, "--job", "sweetaudio")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = plistlib.load(open(self.o, "rb"))
+        job = out["LaunchDaemons"].pop("/System/Library/LaunchDaemons/org.pixelios.sweetaudio.plist")
+        self.assertEqual(out, base())
+        self.assertEqual(job, {"Label": "org.pixelios.sweetaudio", "RunAtLoad": True, "ProgramArguments": ["/usr/local/bin/sweetaudio_install"]})
+        self.assertEqual(self.run_tool("--sha256", h, "--job", "nope").returncode, 2)
+
     def test_deterministic(self):
         h = self.put(base())
         self.assertEqual(self.run_tool("--sha256", h).returncode, 0)
