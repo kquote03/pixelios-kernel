@@ -9,7 +9,10 @@
  */
 #include <CoreAudio/AudioHardware.h>
 #include <AudioToolbox/AudioQueue.h>
+#include <AudioToolbox/AudioServices.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -202,6 +205,50 @@ play_aq(void)
 	return e != 0;
 }
 
+/* AVAudioSession category Playback (what media apps use; ignores the ringer switch) and active, through the ObjC runtime from C.
+ * VirtualAudio caches the default-category route (csav -> Null_Device, run a12j); a new category gets a fresh route computation. */
+extern CFStringRef AVAudioSessionCategoryPlayback;
+static int
+session_playback(void)
+{
+	id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	BOOL (*send_cat)(id, SEL, id, id *) = (BOOL (*)(id, SEL, id, id *))objc_msgSend;
+	BOOL (*send_act)(id, SEL, BOOL, id *) = (BOOL (*)(id, SEL, BOOL, id *))objc_msgSend;
+	Class c = objc_getClass("AVAudioSession");
+	id s = c ? send((id)c, sel_registerName("sharedInstance")) : NULL;
+	BOOL a = s ? send_cat(s, sel_registerName("setCategory:error:"), (id)AVAudioSessionCategoryPlayback, NULL) : NO;
+	BOOL b = s ? send_act(s, sel_registerName("setActive:error:"), YES, NULL) : NO;
+	printf("sweetaudio_play: session: class %s, category Playback %s, active %s\n", c ? "ok" : "MISSING", a ? "ok" : "FAIL", b ? "ok" : "FAIL");
+	return !(a && b);
+}
+
+/* one real system path: AudioServices system sound from a UISounds file (falls back to the id 1007 tri-tone), bounded 4 s */
+static volatile int sys_done;
+static void
+sys_cb(SystemSoundID id, void *ctx)
+{
+	(void)id; (void)ctx;
+	sys_done = 1;
+}
+
+static int
+play_sys(void)
+{
+	SystemSoundID id = 1007;
+	CFURLRef u = CFURLCreateWithFileSystemPath(NULL, CFSTR("/System/Library/Audio/UISounds/sms-received1.caf"), kCFURLPOSIXPathStyle, false);
+	OSStatus e = u ? AudioServicesCreateSystemSoundID(u, &id) : -1;
+	if (u)
+		CFRelease(u);
+	printf("sweetaudio_play: sys: create err %d id %u\n", (int)e, (unsigned)id);
+	if (e != 0)
+		id = 1007;
+	AudioServicesPlaySystemSoundWithCompletion(id, ^{ sys_cb(id, NULL); });
+	for (int i = 0; i < 40 && !sys_done; i++)
+		usleep(100000);
+	printf("sweetaudio_play: sys: played id %u, completion %s\n", (unsigned)id, sys_done ? "yes" : "no (4 s timeout)");
+	return !sys_done;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -215,6 +262,15 @@ main(int argc, char **argv)
 		sleep(1);
 	if (strcmp(m, "aq") == 0 || strcmp(m, "both") == 0)
 		rc |= play_aq();
+	if (strcmp(m, "pb") == 0 || strcmp(m, "both") == 0) {
+		sleep(1);
+		session_playback();
+		rc |= play_aq();
+	}
+	if (strcmp(m, "sys") == 0 || strcmp(m, "both") == 0) {
+		sleep(1);
+		rc |= play_sys();
+	}
 	list(1);
 	printf("sweetaudio_play: end rc %d\n", rc);
 	return rc;

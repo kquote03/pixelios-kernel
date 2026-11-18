@@ -15,6 +15,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <notify.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -171,6 +172,29 @@ kick_mediaserverd(void)
 	free(kp);
 }
 
+/* VirtualAudio (in mediaserverd, up before SpringBoard) computes its routes while the ringer switch reads "off" and culls the
+ * built-in speaker for the default category; a later ringer update does not re-route (run a12i, VirtualAudio os_log). So: wait
+ * (<= 240 s) until SpringBoard publishes the ringer state, then restart mediaserverd once so VirtualAudio starts with it. */
+static void
+ringer_kick(void)
+{
+	int tok = 0, s;
+	uint64_t st = 0;
+	if (notify_register_check("com.apple.springboard.ringerstate", &tok) != NOTIFY_STATUS_OK) {
+		printf("sweetaudio_install: FAIL ringerstate register\n");
+		return;
+	}
+	for (s = 0; s < 240; s++) {
+		if (notify_get_state(tok, &st) == NOTIFY_STATUS_OK && st != 0)
+			break;
+		sleep(1);
+	}
+	notify_cancel(tok);
+	printf("sweetaudio_install: ringer state %llu after %d s; restarting mediaserverd for VirtualAudio routing\n", (unsigned long long)st, s);
+	kick_mediaserverd();
+	sleep(8);
+}
+
 /* the kernel makes /dev/sweetaudio once the AOC + amps are up (~+120 s, patch 0173) and holds it for its 2-beep self-test: wait for an
  * open to succeed, bounded to 300 s (1 s steps) */
 static int
@@ -227,8 +251,10 @@ main(int argc, char **argv)
 		fprintf(stderr, "usage: sweetaudio_install driver|driver+va|restore|status\n");
 		return 2;
 	}
-	if (changed)
+	if (changed && strcmp(m, "driver+va") != 0)
 		kick_mediaserverd();
+	if (strcmp(m, "driver+va") == 0)
+		ringer_kick();
 	status();
 	printf("sweetaudio_install: done %s: %s, %s\n", m, changed ? "changed" : "unchanged", failed ? "FAIL" : "ok");
 	int do_tone = strcmp(extra, "tone") == 0 || strcmp(extra, "tone+play") == 0, do_play = strcmp(extra, "play") == 0 || strcmp(extra, "tone+play") == 0;

@@ -36,8 +36,9 @@ CF=(--target=arm64-apple-ios16.0 -isysroot "$SDK" -miphoneos-version-min=16.0 -O
 "$CLANG" "${CF[@]}" -bundle -fvisibility=hidden -framework CoreFoundation -o "$OUT/SweetAudio.driver/SweetAudio" "$HERE/SweetAudio.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_tone" "$HERE/sweetaudio_tone.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_install" "$HERE/sweetaudio_install.c"
-"$CLANG" "${CF[@]}" -Wno-deprecated-declarations -framework CoreFoundation -framework CoreAudio -framework AudioToolbox -o "$OUT/sweetaudio_play" "$HERE/sweetaudio_play.c"
-for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play"; do ldid -S "$f"; done
+"$CLANG" "${CF[@]}" -Wno-deprecated-declarations -framework CoreFoundation -framework CoreAudio -framework AudioToolbox -framework AVFAudio -lobjc -o "$OUT/sweetaudio_play" "$HERE/sweetaudio_play.c"
+"$CLANG" "${CF[@]}" -dynamiclib -install_name /usr/local/lib/libsalog.dylib -framework CoreFoundation -o "$OUT/libsalog.dylib" "$HERE/salog.c"
+for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/libsalog.dylib" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play"; do ldid -S "$f"; done
 python3 -I - "$OUT/SweetAudio.driver/Info.plist" <<'EOF'
 import os, plistlib, sys
 FACTORY = "7F3C2A61-5B0E-4E57-9C1D-0A5E1D6B9F42"           # ours (random); type = kAudioServerPlugInTypeUUID
@@ -47,7 +48,8 @@ pl = {"CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "SweetAudio", "CF
       "MinimumOSVersion": "16.0", "UIDeviceFamily": [1], "UIRequiredDeviceCapabilities": ["arm64"],
       "CFPlugInFactories": {FACTORY: "SweetAudio_Create"},
       "CFPlugInTypes": {"443ABAB8-E7B3-491A-B985-BEB9187030DB": [FACTORY]},
-      "SweetAudioTransportType": os.environ.get("SWEETAUDIO_TRANSPORT", "usb "), "SweetAudioName": "PixOS Speaker"}
+      "SweetAudioTransportType": os.environ.get("SWEETAUDIO_TRANSPORT", "usb "), "SweetAudioDeviceUID": os.environ.get("SWEETAUDIO_UID", "PixOSSweetAudio:0"),
+      "SweetAudioName": "PixOS Speaker"}
 open(sys.argv[1], "wb").write(plistlib.dumps(pl, fmt=plistlib.FMT_XML))
 EOF
 # symbol + link checks (gpu/ios/check-sdk-symbols.py: every undefined symbol resolves against the SDK .tbd files)
@@ -55,14 +57,27 @@ llvm-nm -gU "$OUT/SweetAudio.driver/SweetAudio" | grep -q ' T _SweetAudio_Create
 python3 -I "$REPO/gpu/ios/check-sdk-symbols.py" "$SDK" "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play" | tail -1
 
 # 3. overlay: /usr/local/{pixos,bin} + the launchd cache with the one job (paths inside the 0117 allowlist)
-OV=$A/audio/ov-sa-$MODE${TONE:+-$TONE}
+OV=$A/audio/ov-sa-$MODE${TONE:+-$TONE}${SWEETAUDIO_TAG:+-$SWEETAUDIO_TAG}
 rm -rf "$OV"
 mkdir -p "$OV/usr/local/pixos/SweetAudio.driver" "$OV/usr/local/bin" "$OV/System/Library/xpc"
 install -m 0644 "$OUT/SweetAudio.driver/Info.plist" "$OV/usr/local/pixos/SweetAudio.driver/Info.plist"
 install -m 0755 "$OUT/SweetAudio.driver/SweetAudio" "$OV/usr/local/pixos/SweetAudio.driver/SweetAudio"
 install -m 0755 "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_play" "$OV/usr/local/bin/"
+# debug visibility (doc 54 s7): only used when the boot-args inject it (sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=...)
+mkdir -p "$OV/usr/local/lib"; install -m 0755 "$OUT/libsalog.dylib" "$OV/usr/local/lib/libsalog.dylib"
 printf '%s\n' "$MODE${TONE:+ $TONE}" > "$OV/usr/local/pixos/sweetaudio.mode"; chmod 0644 "$OV/usr/local/pixos/sweetaudio.mode"
 python3 -I "$REPO/tools/mk_launchd_job.py" "$LAUNCHD_RO" "$OV/System/Library/xpc/launchd.plist" --sha256 "$LAUNCHD_SHA" --job sweetaudio
 chmod 0644 "$OV/System/Library/xpc/launchd.plist"
+# SWEETAUDIO_OSLOG=1: mediaserverd gets OS_ACTIVITY_DT_MODE=1 (os_log also to stderr; with sweetnull=mediaserverd that is the console)
+if [ "${SWEETAUDIO_OSLOG:-0}" = 1 ]; then
+  python3 -I - "$OV/System/Library/xpc/launchd.plist" <<'EOF'
+import plistlib, sys
+pl = plistlib.load(open(sys.argv[1], "rb"))
+j = pl["LaunchDaemons"]["/System/Library/LaunchDaemons/com.apple.mediaserverd.plist"]
+j.setdefault("EnvironmentVariables", {}).update({"OS_ACTIVITY_DT_MODE": "1"})
+open(sys.argv[1], "wb").write(plistlib.dumps(pl, fmt=plistlib.FMT_BINARY, sort_keys=True))
+print("launchd: mediaserverd EnvironmentVariables", j["EnvironmentVariables"])
+EOF
+fi
 python3 -I "$REPO/tools/mkdevoverlay.py" "$OV" "$OV.bin"
 sha256sum "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_play" "$OV.bin"

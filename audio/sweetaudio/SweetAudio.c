@@ -40,6 +40,7 @@ static AudioServerPlugInHostRef sa_host;
 static _Atomic uint32_t sa_refs = 1;
 static UInt32 sa_transport = kAudioDeviceTransportTypeUSB;
 static CFStringRef sa_name;
+static CFStringRef sa_uid;         /* Info.plist SweetAudioDeviceUID (VirtualAudio dispatches physical devices by UID, doc 54 s7) */
 static uint32_t sa_running;       /* StartIO count */
 static int sa_fd = -1;
 static struct sa_clock sa_clk;
@@ -72,7 +73,12 @@ static _Atomic uint32_t sa_trace_n;
 static void
 sa_trace(const char *op, AudioObjectID obj, const AudioObjectPropertyAddress *a, long rc)
 {
-	if (a == NULL || atomic_fetch_add(&sa_trace_n, 1) >= SA_TRACE_N)
+	/* every failing call is logged too (bounded): those are what VirtualAudio asks for and we lack */
+	if (a == NULL)
+		return;
+	uint32_t k = atomic_fetch_add(&sa_trace_n, 1);
+	int fail = op[0] == 'h' ? rc == 0 : rc != 0;
+	if (k >= SA_TRACE_N && (!fail || k >= 8 * SA_TRACE_N))
 		return;
 	UInt32 s = a->mSelector, c = a->mScope;
 	sa_log("%s obj %u sel '%c%c%c%c' scope '%c%c%c%c' el %u -> %ld", op, (unsigned)obj, (char)(s >> 24), (char)(s >> 16), (char)(s >> 8), (char)s,
@@ -146,7 +152,11 @@ sa_read_config(void)
 		sa_transport = ((UInt32)(uint8_t)s[0] << 24) | ((UInt32)(uint8_t)s[1] << 16) | ((UInt32)(uint8_t)s[2] << 8) | (uint8_t)s[3];
 	CFStringRef n = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("SweetAudioName")) : NULL;
 	sa_name = (n && CFGetTypeID(n) == CFStringGetTypeID()) ? CFRetain(n) : CFSTR("PixOS Speaker");
-	sa_log("initialize: transport 0x%08x, bundle %s", (unsigned)sa_transport, b ? "found" : "NOT found (defaults)");
+	CFStringRef u = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("SweetAudioDeviceUID")) : NULL;
+	sa_uid = (u && CFGetTypeID(u) == CFStringGetTypeID()) ? CFRetain(u) : CFSTR(SA_DEVICE_UID);
+	char us[64] = "?";
+	CFStringGetCString(sa_uid, us, sizeof us, kCFStringEncodingUTF8);
+	sa_log("initialize: transport 0x%08x, uid '%s', bundle %s", (unsigned)sa_transport, us, b ? "found" : "NOT found (defaults)");
 }
 
 static OSStatus
@@ -299,7 +309,7 @@ sa_get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qsize, con
 		case kAudioPlugInPropertyTranslateUIDToDevice: {
 			AudioObjectID id = kAudioObjectUnknown;
 			if (qsize == sizeof(CFStringRef) && qdata && *(const CFStringRef *)qdata &&
-			    CFStringCompare(*(const CFStringRef *)qdata, CFSTR(SA_DEVICE_UID), 0) == kCFCompareEqualTo)
+			    CFStringCompare(*(const CFStringRef *)qdata, sa_uid, 0) == kCFCompareEqualTo)
 				id = kObjDevice;
 			PUT(AudioObjectID, id);
 		}
@@ -312,7 +322,7 @@ sa_get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qsize, con
 		case kAudioObjectPropertyOwner: PUT(AudioObjectID, kObjPlugIn);
 		case kAudioObjectPropertyName: PUT(CFStringRef, (CFStringRef)CFRetain(sa_name));
 		case kAudioObjectPropertyManufacturer: PUT(CFStringRef, CFSTR("PixOS"));
-		case kAudioDevicePropertyDeviceUID: PUT(CFStringRef, CFSTR(SA_DEVICE_UID));
+		case kAudioDevicePropertyDeviceUID: PUT(CFStringRef, (CFStringRef)CFRetain(sa_uid));
 		case kAudioDevicePropertyModelUID: PUT(CFStringRef, CFSTR(SA_MODEL_UID));
 		case kAudioDevicePropertyTransportType: PUT(UInt32, sa_transport);
 		case kAudioDevicePropertyRelatedDevices: PUT_IDS(1, kObjDevice);
@@ -391,7 +401,7 @@ sa_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, c
 }
 
 static OSStatus
-sa_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs,
+sa_set(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs,
     const void *qd, UInt32 size, const void *data)
 {
 	(void)pid; (void)qs; (void)qd;
@@ -414,6 +424,15 @@ sa_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, c
 		    : kAudioDeviceUnsupportedFormatError;
 	}
 	return kAudioHardwareUnsupportedOperationError;
+}
+
+static OSStatus
+sa_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs,
+    const void *qd, UInt32 size, const void *data)
+{
+	OSStatus r = sa_set(d, obj, pid, a, qs, qd, size, data);
+	sa_trace("set", obj, a, (long)r);
+	return r;
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */
