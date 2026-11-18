@@ -48,7 +48,7 @@ pl = {"CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "SweetAudio", "CF
       "MinimumOSVersion": "16.0", "UIDeviceFamily": [1], "UIRequiredDeviceCapabilities": ["arm64"],
       "CFPlugInFactories": {FACTORY: "SweetAudio_Create"},
       "CFPlugInTypes": {"443ABAB8-E7B3-491A-B985-BEB9187030DB": [FACTORY]},
-      "SweetAudioTransportType": os.environ.get("SWEETAUDIO_TRANSPORT", "usb "), "SweetAudioDeviceUID": os.environ.get("SWEETAUDIO_UID", "PixOSSweetAudio:0"),
+      "SweetAudioTransportType": os.environ.get("SWEETAUDIO_TRANSPORT", "bltn"), "SweetAudioDeviceUID": os.environ.get("SWEETAUDIO_UID", "Speaker"),
       "SweetAudioName": "PixOS Speaker"}
 open(sys.argv[1], "wb").write(plistlib.dumps(pl, fmt=plistlib.FMT_XML))
 EOF

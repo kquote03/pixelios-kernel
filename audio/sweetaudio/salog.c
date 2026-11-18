@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * libsalog.dylib: debug-only visibility for mediaserverd (doc 54 s7). Injected with the boot-arg
- * sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib (patches 0110 + 0106), it interposes
+ * libsalog.dylib: mediaserverd helper (doc 54 s7), injected with the boot-arg
+ * sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib[,SALOG_TAP_NULL=1][,SALOG_OSLOG=1] (patches 0110 + 0106).
+ * SALOG_TAP_NULL=1: the audio path (VirtualAudio default route mix -> /dev/sweetaudio, see below). SALOG_OSLOG=1: interposes
  * _os_log_impl and os_log_type_enabled and prints every os_log message of the process (VirtualAudio, the HAL) to stderr,
- * which sweetnull=mediaserverd tees to the console. Bounded: SALOG_MAX lines, SALOG_LINE bytes each.
+ * which sweetnull=mediaserverd tees to the console (debug). Bounded: SALOG_MAX lines, SALOG_LINE bytes each.
  *
  * os_log buffer layout (libtrace, the public "os_log_fmt" encoding the compiler emits): byte 0 summary flags, byte 1 item count,
  * then per item: descriptor byte (high nibble type: 0 scalar, 1 count, 2 string, 3 pointer, 4 object; low nibble privacy flags),
@@ -126,10 +127,21 @@ render(char *out, size_t cap, const char *fmt, const uint8_t *buf, uint32_t size
 	out[o < cap ? o : cap - 1] = 0;
 }
 
+static int salog_oslog = -1;
+static int
+oslog_on(void)
+{
+	if (salog_oslog < 0) {
+		const char *e = getenv("SALOG_OSLOG");
+		salog_oslog = e && e[0] == '1';
+	}
+	return salog_oslog;
+}
+
 static void
 salog_os_log_impl(void *dso, os_log_t log, os_log_type_t type, const char *format, uint8_t *buf, uint32_t size)
 {
-	if (format && atomic_fetch_add(&salog_n, 1) < SALOG_MAX) {
+	if (format && oslog_on() && atomic_fetch_add(&salog_n, 1) < SALOG_MAX) {
 		char line[SALOG_LINE];
 		int h = snprintf(line, sizeof line, "valog[%d] t%d: ", getpid(), (int)type);
 		render(line + h, sizeof line - (size_t)h - 1, format, buf, size);
@@ -140,25 +152,7 @@ salog_os_log_impl(void *dso, os_log_t log, os_log_type_t type, const char *forma
 	_os_log_impl(dso, log, type, format, buf, size);
 }
 
-/* SALOG_HIDE_NULL=1: drop the HAL device with UID "Null_Device" from every device list read in this process ('dev#' on the system
- * object or a plug-in). VirtualAudio then has no Null port to keep its default route on, and routes to the Speaker port of
- * SweetAudio.driver (runs a12i-k: the speaker port exists but the cached route stays on Null_Device). */
-static int salog_hide = -1;
-static _Atomic uint32_t salog_hidden_n;
-
-static int
-is_null_device(AudioObjectID id)
-{
-	AudioObjectPropertyAddress u = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-	CFStringRef s = NULL;
-	UInt32 sz = sizeof s;
-	if (AudioObjectGetPropertyData(id, &u, 0, NULL, &sz, &s) != 0 || s == NULL)
-		return 0;
-	int r = CFStringCompare(s, CFSTR("Null_Device"), 0) == kCFCompareEqualTo;
-	CFRelease(s);
-	return r;
-}
-
+/* (run a12l: hiding Null_Device from 'dev#' reads had no effect; VirtualAudio gets its device list inside CoreAudio.) */
 /* the device VirtualAudio actually runs IO on: its HAL aggregate ("VAD [vdef] AggDev 1", transport grup; run a12m: no IOProc is ever
  * created on Null_Device itself, the aggregate holds it as sub-device) */
 static int
@@ -171,33 +165,6 @@ is_tap_device(AudioObjectID id)
 		return 0;
 	int r = CFStringHasPrefix(s, CFSTR("VAD [")) || CFStringCompare(s, CFSTR("Null_Device"), 0) == kCFCompareEqualTo;
 	CFRelease(s);
-	return r;
-}
-
-static OSStatus
-salog_get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qs, const void *qd, UInt32 *io, void *out)
-{
-	OSStatus r = AudioObjectGetPropertyData(obj, a, qs, qd, io, out);
-	if (salog_hide < 0) {
-		const char *e = getenv("SALOG_HIDE_NULL");
-		salog_hide = e && e[0] == '1';
-	}
-	if (r != 0 || !salog_hide || a == NULL || a->mSelector != kAudioHardwarePropertyDevices || io == NULL || out == NULL)
-		return r;
-	AudioObjectID *ids = out;
-	UInt32 n = *io / sizeof(AudioObjectID), k = 0;
-	for (UInt32 i = 0; i < n; i++) {
-		if (is_null_device(ids[i])) {
-			if (atomic_fetch_add(&salog_hidden_n, 1) < 64) {
-				char m[96];
-				int l = snprintf(m, sizeof m, "valog[%d]: hid Null_Device %u from the device list of %u\n", getpid(), (unsigned)ids[i], (unsigned)obj);
-				(void)write(2, m, (size_t)l);
-			}
-			continue;
-		}
-		ids[k++] = ids[i];
-	}
-	*io = k * sizeof(AudioObjectID);
 	return r;
 }
 
@@ -317,14 +284,12 @@ salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioD
 static bool
 salog_type_enabled(os_log_t log, os_log_type_t type)
 {
-	(void)log; (void)type;
-	return true;
+	return oslog_on() ? true : os_log_type_enabled(log, type);
 }
 
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } salog_interpose[] = {
 	{ (const void *)salog_os_log_impl, (const void *)_os_log_impl },
 	{ (const void *)salog_type_enabled, (const void *)os_log_type_enabled },
-	{ (const void *)salog_get, (const void *)AudioObjectGetPropertyData },
 	{ (const void *)salog_create_ioproc, (const void *)AudioDeviceCreateIOProcID },
 };
 
