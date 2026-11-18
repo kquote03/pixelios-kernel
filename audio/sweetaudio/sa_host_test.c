@@ -63,6 +63,55 @@ main(void)
 	CHECK(sa_frames_taken(40, 10) == 10);
 	CHECK(sa_frames_taken(400, 10) == 10);
 
+	/* tap limiter: make-up 4x, ceiling 0.89, release 1.06 per block */
+	{
+		struct sa_lim l;
+		sa_lim_init(&l, 4.0f, 0.89f, 1.06f);
+		CHECK(sa_lim_block(&l, 0.1f) == 4.0f);                 /* quiet: full make-up */
+		float g = sa_lim_block(&l, 0.708f);                      /* loud: attack in the same block */
+		CHECK(g * 0.708f <= 0.8901f && g * 0.708f >= 0.889f);
+		float g2 = sa_lim_block(&l, 0.0f);                       /* silence: slow release */
+		CHECK(g2 > g && g2 < g * 1.07f);
+		for (int i = 0; i < 100; i++)
+			g2 = sa_lim_block(&l, 0.01f);
+		CHECK(g2 == 4.0f);
+		CHECK(sa_lim_block(&l, 5.0f) * 5.0f <= 0.8901f);       /* > full scale input */
+	}
+	/* mix: two writers sum where they overlap, take moves offsets back */
+	{
+		static struct sa_mix m;
+		uint32_t a = 0, b = 0, *offs[2] = { &a, &b };
+		float x[8] = { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f }, y[4] = { 0.5f, -0.5f, 0.5f, -0.5f };
+		CHECK(sa_mix_add(&m, &a, x, 4) == 4 && m.len == 4 && a == 4);
+		CHECK(sa_mix_add(&m, &b, y, 2) == 2 && m.len == 4 && b == 2);
+		CHECK(m.acc[0] == 0.75f && m.acc[1] == -0.25f && m.acc[4] == 0.25f);
+		sa_mix_take(&m, 4, offs, 2);
+		CHECK(m.len == 0 && a == 0 && b == 0);
+		CHECK(sa_mix_add(&m, &b, y, 2) == 2 && sa_mix_add(&m, &a, x, 4) == 4 && m.len == 4 && m.acc[2] == 0.75f && m.acc[4] == 0.25f);
+		sa_mix_take(&m, 3, offs, 2);
+		CHECK(m.len == 1 && a == 1 && b == 0 && m.acc[0] == 0.25f);
+		b = 9;                                                    /* an offset past the end is pulled back */
+		CHECK(sa_mix_add(&m, &b, y, 2) == 2 && b == 3 && m.len == 3);
+		uint32_t big = SA_MIXN - 1, c = big;
+		m.len = big;
+		CHECK(sa_mix_add(&m, &c, x, 4) == 1 && m.len == SA_MIXN);  /* bounded at SA_MIXN */
+	}
+	/* drift trim */
+	{
+		double avg = 0;
+		CHECK(sa_drift_adj(&avg, 0, 1200, 2e-6, 0.003) == 0.0 && avg == 1200);
+		double a = 0;
+		for (int i = 0; i < 500; i++)
+			a = sa_drift_adj(&avg, 2200, 1200, 2e-6, 0.003);
+		CHECK(a > 0.0019 && a <= 0.002);
+		for (int i = 0; i < 500; i++)
+			a = sa_drift_adj(&avg, 8000, 1200, 2e-6, 0.003);
+		CHECK(a == 0.003);
+		for (int i = 0; i < 2000; i++)
+			a = sa_drift_adj(&avg, 100, 1200, 2e-6, 0.003);
+		CHECK(a < -0.0021 && a >= -0.003);
+	}
+
 	printf("sa_host_test: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
 	return fails != 0;
 }

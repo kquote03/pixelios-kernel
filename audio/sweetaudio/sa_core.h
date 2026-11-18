@@ -74,4 +74,80 @@ sa_frames_taken(long rc, uint32_t frames)
 	return f > frames ? frames : (uint32_t)f;
 }
 
+/* ---- libsalog tap (salog.c, doc 55): make-up gain + block peak limiter, mixing of concurrent taps, drift trim ---- */
+
+/* Block limiter: gain g starts at the make-up gain gmax; a block whose peak * g would exceed ceil gets g = ceil / peak at once (attack in
+ * the same block, so the output never exceeds ceil); otherwise g recovers by the factor rel per block, up to gmax. Returns the gain. */
+struct sa_lim { float g, gmax, ceil, rel; };
+
+static inline void
+sa_lim_init(struct sa_lim *l, float gmax, float ceil, float rel)
+{
+	l->g = l->gmax = gmax;
+	l->ceil = ceil;
+	l->rel = rel;
+}
+
+static inline float
+sa_lim_block(struct sa_lim *l, float peak)
+{
+	float g = l->g * l->rel;
+	if (g > l->gmax)
+		g = l->gmax;
+	if (peak * g > l->ceil)
+		g = l->ceil / peak;
+	l->g = g;
+	return g;
+}
+
+/* Mix accumulator for several writers (VirtualAudio IOProcs of different aggregates in one process): writer w adds its frames at its own
+ * offset *off (frames ahead of the accumulator start), summing over frames other writers already put there; sa_mix_take removes the first
+ * n frames (flushed to the kernel) and moves every writer offset back by n (a writer that fell behind restarts at 0). */
+#define SA_MIXN 8192u
+struct sa_mix { float acc[SA_MIXN * 2]; uint32_t len; };
+
+static inline uint32_t
+sa_mix_add(struct sa_mix *m, uint32_t *off, const float *x, uint32_t k)
+{
+	if (*off > m->len)
+		*off = m->len;
+	if (k > SA_MIXN - *off)
+		k = SA_MIXN - *off;
+	for (uint32_t i = 0; i < k; i++) {
+		uint32_t f = *off + i;
+		for (uint32_t c = 0; c < 2; c++)
+			m->acc[2 * f + c] = (f < m->len ? m->acc[2 * f + c] : 0.0f) + x[2 * i + c];
+	}
+	*off += k;
+	if (*off > m->len)
+		m->len = *off;
+	return k;
+}
+
+static inline void
+sa_mix_take(struct sa_mix *m, uint32_t n, uint32_t *const *offs, uint32_t noffs)
+{
+	if (n > m->len)
+		n = m->len;
+	for (uint32_t i = 0; i < 2 * (m->len - n); i++)
+		m->acc[i] = m->acc[i + 2 * n];
+	m->len -= n;
+	for (uint32_t w = 0; w < noffs; w++)
+		*offs[w] = *offs[w] > n ? *offs[w] - n : 0;
+}
+
+/* Drift trim from the kernel FIFO fill (SWAU_IOC_POS before each write): a slow average of the fill vs a target gives a resample ratio
+ * correction (+ = take more input per output frame), bounded to +-lim; an empty FIFO (start, underrun) resets the average. */
+static inline double
+sa_drift_adj(double *avg, uint32_t fill, double target, double k, double lim)
+{
+	if (fill == 0) {
+		*avg = target;
+		return 0.0;
+	}
+	*avg += 0.02 * ((double)fill - *avg);
+	double a = (*avg - target) * k;
+	return a > lim ? lim : a < -lim ? -lim : a;
+}
+
 #endif

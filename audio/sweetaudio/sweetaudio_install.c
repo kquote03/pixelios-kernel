@@ -202,9 +202,10 @@ wait_dev(void)
 {
 	for (int s = 0; s < 300; s++) {
 		int fd = open("/dev/sweetaudio", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
-		if (fd >= 0) {
-			close(fd);
-			printf("sweetaudio_install: /dev/sweetaudio ready after %d s\n", s);
+		if (fd >= 0 || errno == EBUSY) {        /* a12p: EBUSY = mediaserverd's tap already holds it (path up) */
+			if (fd >= 0)
+				close(fd);
+			printf("sweetaudio_install: /dev/sweetaudio ready after %d s%s\n", s, fd >= 0 ? "" : " (held by the tap)");
 			return 1;
 		}
 		if (s % 30 == 0)
@@ -230,10 +231,11 @@ main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	char mbuf[32] = "", extra[32] = "";
+	int delay = 0;          /* a12p: third word of the mode file = seconds to wait before tone/play (the amp idle power-down is 30 s) */
 	const char *m = argc == 2 ? argv[1] : mbuf;
 	if (argc == 1) {
 		FILE *f = fopen("/usr/local/pixos/sweetaudio.mode", "r");
-		if (f == NULL || fscanf(f, "%31s %31s", mbuf, extra) < 1)
+		if (f == NULL || fscanf(f, "%31s %31s %d", mbuf, extra, &delay) < 1)
 			printf("sweetaudio_install: FAIL no mode (argument or /usr/local/pixos/sweetaudio.mode)\n");
 		if (f)
 			fclose(f);
@@ -258,6 +260,10 @@ main(int argc, char **argv)
 	status();
 	printf("sweetaudio_install: done %s: %s, %s\n", m, changed ? "changed" : "unchanged", failed ? "FAIL" : "ok");
 	int do_tone = strcmp(extra, "tone") == 0 || strcmp(extra, "tone+play") == 0, do_play = strcmp(extra, "play") == 0 || strcmp(extra, "tone+play") == 0;
+	if ((do_tone || do_play) && delay > 0 && delay <= 600) {
+		printf("sweetaudio_install: waiting %d s before %s\n", delay, extra);
+		sleep((unsigned)delay);
+	}
 	if ((do_tone || do_play) && wait_dev()) {
 		extern char **environ;
 		char *tone_argv[] = { "/usr/local/bin/sweetaudio_tone", "3", "880", "3", NULL };

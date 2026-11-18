@@ -1,6 +1,6 @@
 /* Host test of the /dev/sweetaudio FIFO (xnu patch 0173, bsd/dev/sweet_audio_fifo.h, sweetaoc=8): push bound + overrun count, the 960-frame
- * start threshold, underrun = silence + restart threshold, close play-out below the threshold, wrap, flush, gain clamp (<= -10 dB, default
- * -20 dB, -96 dB = mute) and the per-channel scale. */
+ * start threshold, underrun = silence + restart threshold, close play-out below the threshold, wrap, flush, gain clamp (0182: <= 0 dB, default
+ * -6 dB, -96 dB = mute), the -3 dBFS sample clamp and the per-channel scale. */
 #include <stdio.h>
 #include <stdint.h>
 #include "sweet_audio_fifo.h"
@@ -19,14 +19,14 @@ main(void)
 	for (i = 0; i < SWAU_FIFO_FRAMES + 100; i++)
 		in[i] = (uint32_t)(uint16_t)(int16_t)(i & 0x3FFF) | (uint32_t)(uint16_t)(int16_t)-(int32_t)(i & 0x3FFF) << 16;
 	swau_fifo_reset(&f);
-	CHECK(f.gain_mdb == -20000 && f.gain_q16 == 6553u, "default gain %d q %u", f.gain_mdb, f.gain_q16);
+	CHECK(f.gain_mdb == -6000 && f.gain_q16 == 32846u, "default gain %d q %u", f.gain_mdb, f.gain_q16);
 	/* below the start threshold nothing leaves */
 	CHECK(swau_fifo_push(&f, in, 959) == 959, "push 959");
 	CHECK(swau_fifo_pull(&f, out, 192) == 0, "no drain below 960");
 	CHECK(swau_fifo_push(&f, in + 959, 1) == 1, "push 1");
 	n = swau_fifo_pull(&f, out, 192);
 	CHECK(n == 192 && f.draining, "drain from 960: %u", n);
-	CHECK(out[1] == swau_scale_word(in[1], 6553u), "scaled");
+	CHECK(out[1] == swau_scale_word(in[1], 32846u), "scaled");
 	/* drain to empty: underrun counted once, then the threshold again */
 	for (i = 0; i < 4; i++)
 		(void)swau_fifo_pull(&f, out, 192);
@@ -40,8 +40,14 @@ main(void)
 	CHECK(f.played == 960 + 500, "played %llu", (unsigned long long)f.played);
 	/* full FIFO: push bounded, overruns counted, wrap keeps order */
 	swau_fifo_reset(&f);
-	swau_fifo_set_gain(&f, 0);
-	CHECK(f.gain_mdb == -10000 && f.gain_q16 == 20724u, "clamp to -10 dB: %d %u", f.gain_mdb, f.gain_q16);
+	swau_fifo_set_gain(&f, -10000);
+	CHECK(f.gain_mdb == -10000 && f.gain_q16 == 20724u, "-10 dB: %d %u", f.gain_mdb, f.gain_q16);
+	swau_fifo_set_gain(&f, 3000);
+	CHECK(f.gain_mdb == 0 && f.gain_q16 == 65536u, "clamp to 0 dB: %d %u", f.gain_mdb, f.gain_q16);
+	CHECK(swau_scale_word(0x7FFF8000u, 65536u) == ((uint32_t)(uint16_t)(int16_t)SWAU_LIMIT << 16 | (uint16_t)(int16_t)-SWAU_LIMIT), "-3 dBFS clamp %#x",
+	    swau_scale_word(0x7FFF8000u, 65536u));
+	CHECK(swau_scale_word(0x10000100u, 65536u) == 0x10000100u, "below the clamp unchanged");
+	swau_fifo_set_gain(&f, -10000);
 	CHECK(swau_fifo_push(&f, in, SWAU_FIFO_FRAMES + 100) == SWAU_FIFO_FRAMES && f.overruns == 100, "bound %u", f.overruns);
 	CHECK(swau_fifo_push(&f, in, 4) == 0, "full: 0");
 	CHECK(swau_fifo_pull(&f, out, 1000) == 1000, "pull 1000");
@@ -55,7 +61,7 @@ main(void)
 	/* gain table */
 	CHECK(swau_gain_q16(-96000) == 0u && swau_gain_q16(-200000) == 0u, "mute");
 	CHECK(swau_gain_q16(-40000) == 655u && swau_gain_q16(-26000) == 3284u, "-40 %u -26 %u", swau_gain_q16(-40000), swau_gain_q16(-26000));
-	CHECK(swau_gain_q16(5000) == 20724u, "positive clamps");
+	CHECK(swau_gain_q16(5000) == 65536u && swau_gain_q16(0) == 65536u, "positive clamps to 0 dB");
 	/* scale: full-scale negative at -10 dB stays in range, channels independent */
 	CHECK(swau_scale_word(0x7FFF8000u, 20724u) == ((uint32_t)(uint16_t)(int16_t)10361 << 16 | (uint16_t)(int16_t)-10362), "scale %#x",
 	    swau_scale_word(0x7FFF8000u, 20724u));

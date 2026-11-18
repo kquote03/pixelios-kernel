@@ -642,6 +642,11 @@ else
 	done
 	# /dev/sweetaudio FIFO of xnu patch 0173 (new-file hunk of bsd/dev/sweet_audio_fifo.h): threshold, underrun, play-out, wrap, gain clamp
 	awk '$0=="+++ b/bsd/dev/sweet_audio_fifo.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0173-aoc-sweetaudio-dev.patch > $O/sweet_audio_fifo.h
+	for px in 0181-sweetaudio-ep1 0182-sweetaudio-polish; do      # later gain changes (0181: -15/-6 dB; 0182: -6/0 dB + -3 dBFS clamp)
+		rm -rf $O/hpx && mkdir -p $O/hpx/bsd/dev && cp $O/sweet_audio_fifo.h $O/hpx/bsd/dev/sweet_audio_fifo.h
+		awk -v f="diff --git a/bsd/dev/sweet_audio_fifo.h b/bsd/dev/sweet_audio_fifo.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/$px.patch > $O/hpx/p.diff
+		chk "audio_fifo_host_test: $px applied" sh -c "cd $O/hpx && patch -s -p1 --no-backup-if-mismatch < p.diff && cp bsd/dev/sweet_audio_fifo.h ../sweet_audio_fifo.h"
+	done
 	chk "audio_fifo_host_test (compile)" gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -Werror -I$O -o $O/audio_fifo_host_test audio_fifo_host_test.c
 	chk "audio_fifo_host_test" $O/audio_fifo_host_test
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)

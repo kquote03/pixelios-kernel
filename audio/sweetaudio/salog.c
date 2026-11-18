@@ -12,6 +12,10 @@
  */
 #include <CoreAudio/AudioHardware.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach_time.h>
+#include <math.h>
+#include <os/lock.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <os/log.h>
@@ -21,6 +25,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "sa_core.h"
+#include "sweetaudio_dev.h"
 
 #define SALOG_MAX  30000u
 #define SALOG_LINE 480
@@ -168,21 +175,43 @@ is_tap_device(AudioObjectID id)
 	return r;
 }
 
-/* SALOG_TAP_NULL=1 (doc 54 s7, the fallback of the brief): VirtualAudio keeps its default route on Null_Device (runs a12i-l), and
- * drives that device through the public AudioDeviceCreateIOProcID/AudioDeviceStart. Wrap every IOProc created on Null_Device: run
- * VirtualAudio's proc, then take the final mixed output buffer, resample it linearly from the device's nominal rate to 48 kHz,
- * convert to S16LE stereo and write() it non-blocking to /dev/sweetaudio (kernel FIFO; it drops what does not fit and plays silence
- * when empty; gain and mute stay in the kernel). IO thread: no locks, no logging except a bounded stats line. */
+/* SALOG_TAP_NULL=1 (doc 54 s7, doc 55): VirtualAudio keeps its default route on Null_Device (runs a12i-l) and drives it through a HAL
+ * aggregate ('VAD [vdef] AggDev 1') with the public AudioDeviceCreateIOProcID/AudioDeviceStart. Every IOProc created on such a device is
+ * wrapped: VirtualAudio's proc runs, then its final mix (Float32, after VirtualAudio's volume) is resampled linearly from the device's
+ * nominal rate to 48 kHz into a per-tap buffer. Polish pass (a12p):
+ *  - mix: the taps add into one accumulator (sa_mix, summing where concurrent streams overlap); the leader tap (the last one called
+ *    within TAP_LEAD_MS) flushes it, so two VirtualAudio streams sum instead of interleaving in the kernel FIFO;
+ *  - loudness: make-up gain SALOG_GAIN_DB (default 12 dB, 0..24) with a block peak limiter at TAP_CEIL (-1 dBFS) before S16; the kernel then
+ *    applies its own gain (default -6 dB) and its -3 dBFS sample clamp (patch 0182);
+ *  - drift: before each write the kernel FIFO fill (SWAU_IOC_POS) trims the resample ratio (sa_drift_adj, <= 0.3 %) towards TAP_FILL frames;
+ *  - evidence: one "tap: sound" line per sound (after 1 s of silence): frames, input peak, output peak, gain, fill, drift, kernel counters.
+ * The fd stays open (the kernel keeps the amps on while a writer is attached). IO thread: one os_unfair_lock, no allocation. */
+#define TAP_MAX      8u
+#define TAP_LEAD_MS  50u
+#define TAP_CEIL     0.891f          /* -1 dBFS */
+#define TAP_REL      1.03f           /* limiter release per IO block (~0.26 dB) */
+#define TAP_FILL     1200.0          /* frames queued in the kernel FIFO before a write (25 ms) */
 struct tap {
 	AudioDeviceIOProc proc;
 	void *ctx;
-	double step;          /* input frames per output frame */
+	double step;          /* input frames per output frame (nominal) */
 	double pos;           /* fractional read position into [last, buf...] */
 	float last[2];
-	uint64_t in_frames, out_frames, dropped, calls;
+	uint32_t off;         /* this tap's position in the mix accumulator */
+	uint64_t in_frames, calls;
+	float buf[8192 * 2];
 };
 static int salog_tap = -1, tap_fd = -1;
-static int16_t tap_out[8192 * 2];
+static os_unfair_lock tap_lk = OS_UNFAIR_LOCK_INIT;
+static struct tap *taps[TAP_MAX];
+static uint32_t *tap_offs[TAP_MAX], ntaps;
+static struct sa_mix tap_mix;
+static struct sa_lim tap_lim;
+static struct tap *tap_leader;
+static uint64_t tap_leader_t, tap_lead_ticks, tap_out_frames, tap_dropped, tap_flushes;
+static double tap_drift, tap_drift_avg;
+static int16_t tap_out[SA_MIXN * 2];
+static struct { uint64_t frames, silent; float pk_in, gmin; int32_t pk_out; uint32_t fill; int on; } snd;
 
 static int
 tap_enabled(void)
@@ -194,11 +223,52 @@ tap_enabled(void)
 	return salog_tap;
 }
 
-static inline int16_t
-s16(float v)
+/* the leader's flush: n frames of the accumulator -> limiter -> S16 -> /dev/sweetaudio (non-blocking; what does not fit is dropped) */
+static void
+tap_flush(uint32_t n)
 {
-	v *= 32767.0f;
-	return (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+	float pk = 0;
+	for (uint32_t i = 0; i < 2 * n; i++) {
+		float a = fabsf(tap_mix.acc[i]);
+		pk = a > pk ? a : pk;
+	}
+	float g = sa_lim_block(&tap_lim, pk);
+	int32_t pko = 0;
+	for (uint32_t i = 0; i < 2 * n; i++) {
+		tap_out[i] = sa_f2s16(tap_mix.acc[i] * g);
+		int32_t a = tap_out[i] < 0 ? -tap_out[i] : tap_out[i];
+		pko = a > pko ? a : pko;
+	}
+	if (tap_fd < 0)
+		tap_fd = open("/dev/sweetaudio", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	struct swau_pos ps = { 0 };
+	if (tap_fd >= 0 && ioctl(tap_fd, SWAU_IOC_POS, &ps) == 0)
+		tap_drift = sa_drift_adj(&tap_drift_avg, ps.fifo_fill, TAP_FILL, 2e-6, 0.003);
+	if (tap_fd >= 0 && n > 0) {
+		uint32_t took = sa_frames_taken(write(tap_fd, tap_out, (size_t)n * 4), n);
+		tap_out_frames += took;
+		tap_dropped += n - took;
+	}
+	tap_flushes++;
+	if (pk > 1e-4f) {                 /* a sound: count it */
+		if (!snd.on)
+			snd.gmin = g;
+		snd.on = 1;
+		snd.frames += n;
+		snd.silent = 0;
+		snd.pk_in = pk > snd.pk_in ? pk : snd.pk_in;
+		snd.pk_out = pko > snd.pk_out ? pko : snd.pk_out;
+		snd.gmin = g < snd.gmin ? g : snd.gmin;
+		snd.fill = ps.fifo_fill;
+	} else if (snd.on && (snd.silent += n) >= 48000) {
+		char m[300];
+		int l = snprintf(m, sizeof m, "valog[%d]: tap: sound: %llu frames, peak in %d out %d (s16, kernel gain follows), gain min %.1f dB, fill %u, "
+		    "drift %d ppm, kernel underruns %u overruns %u, taps %u, written %llu dropped %llu\n", getpid(), (unsigned long long)snd.frames,
+		    (int)(snd.pk_in * 32767.0f), (int)snd.pk_out, 20.0 * log10((double)snd.gmin), snd.fill, (int)(tap_drift * 1e6), ps.underruns,
+		    ps.overruns, ntaps, (unsigned long long)tap_out_frames, (unsigned long long)tap_dropped);
+		(void)write(2, m, (size_t)l);
+		memset(&snd, 0, sizeof snd);
+	}
 }
 
 static OSStatus
@@ -209,27 +279,26 @@ tap_proc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in
 	OSStatus r = t->proc(dev, now, in, it, out, ot, t->ctx);
 	if (out == NULL || out->mNumberBuffers == 0 || out->mBuffers[0].mData == NULL)
 		return r;
-	if (tap_fd < 0)
-		tap_fd = open("/dev/sweetaudio", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	const AudioBuffer *b0 = &out->mBuffers[0], *b1 = out->mNumberBuffers > 1 ? &out->mBuffers[1] : NULL;
 	UInt32 ch = b0->mNumberChannels ? b0->mNumberChannels : 1;
 	UInt32 n = b0->mDataByteSize / (4u * ch);
 	const float *p0 = b0->mData, *p1 = (b1 && b1->mData) ? b1->mData : NULL;
 	/* frame i, channel c (interleaved in buffer 0, or planar over buffers 0/1) */
 #define SMP(i, c) (ch >= 2 ? p0[(size_t)(i) * ch + (c)] : ((c) && p1) ? p1[(i)] : p0[(size_t)(i) * ch])
+	double step = t->step * (1.0 + tap_drift);
 	UInt32 k = 0;
 	while (k < 8192) {
 		double x = t->pos;            /* position in input frames, -1 .. n-1 (-1 = t->last) */
 		long i0 = (long)(x < 0 ? -1 : (long)x);
 		if (i0 + 1 >= (long)n)
 			break;
-		double f = x - (double)i0;
+		float f = (float)(x - (double)i0);
 		for (int c = 0; c < 2; c++) {
 			float a = i0 < 0 ? t->last[c] : SMP(i0, c), b = SMP(i0 + 1, c);
-			tap_out[2 * k + c] = s16(a + (float)f * (b - a));
+			t->buf[2 * k + c] = a + f * (b - a);
 		}
 		k++;
-		t->pos += t->step;
+		t->pos += step;
 	}
 	if (n > 0) {
 		t->last[0] = SMP(n - 1, 0);
@@ -239,17 +308,26 @@ tap_proc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in
 	t->pos -= (double)n;      /* next buffer: index -1 is this buffer's last frame */
 	t->in_frames += n;
 	t->calls++;
-	if (tap_fd >= 0 && k > 0) {
-		ssize_t w = write(tap_fd, tap_out, (size_t)k * 4);
-		UInt32 took = w > 0 ? (UInt32)(w / 4) : 0;
-		t->out_frames += took;
-		t->dropped += k - took;
+	os_unfair_lock_lock(&tap_lk);
+	uint64_t tn = mach_absolute_time();
+	if (tap_leader == NULL || tap_leader == t || tn - tap_leader_t > tap_lead_ticks) {
+		tap_leader = t;
+		tap_leader_t = tn;
 	}
-	if (t->calls == 1 || t->calls % 2000 == 0) {
-		char m[200];
-		int l = snprintf(m, sizeof m, "valog[%d]: tap: call %llu, in %llu frames (%u ch, %u bufs), out %llu, dropped %llu, fd %d\n", getpid(),
-		    (unsigned long long)t->calls, (unsigned long long)t->in_frames, (unsigned)ch, (unsigned)out->mNumberBuffers,
-		    (unsigned long long)t->out_frames, (unsigned long long)t->dropped, tap_fd);
+	tap_dropped += k - sa_mix_add(&tap_mix, &t->off, t->buf, k);
+	if (tap_leader == t) {
+		uint32_t fl = t->off;
+		tap_flush(fl);
+		sa_mix_take(&tap_mix, fl, tap_offs, ntaps);
+	}
+	uint64_t calls = t->calls, outf = tap_out_frames, drop = tap_dropped;
+	int fd = tap_fd, ppm = (int)(tap_drift * 1e6);
+	os_unfair_lock_unlock(&tap_lk);
+	if (calls == 1 || calls % 2000 == 0) {
+		char m[220];
+		int l = snprintf(m, sizeof m, "valog[%d]: tap: call %llu, in %llu frames (%u ch, %u bufs), out %llu, dropped %llu, drift %d ppm, fd %d\n",
+		    getpid(), (unsigned long long)calls, (unsigned long long)t->in_frames, (unsigned)ch, (unsigned)out->mNumberBuffers,
+		    (unsigned long long)outf, (unsigned long long)drop, ppm, fd);
 		(void)write(2, m, (size_t)l);
 	}
 	return r;
@@ -258,7 +336,7 @@ tap_proc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in
 static OSStatus
 salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioDeviceIOProcID *out)
 {
-	if (!tap_enabled() || proc == NULL || !is_tap_device(dev))
+	if (!tap_enabled() || proc == NULL || ntaps >= TAP_MAX || !is_tap_device(dev))
 		return AudioDeviceCreateIOProcID(dev, proc, ctx, out);
 	struct tap *t = calloc(1, sizeof *t);
 	if (t == NULL)
@@ -272,9 +350,29 @@ salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioD
 	t->ctx = ctx;
 	t->step = rate / 48000.0;
 	t->pos = 0;
+	float gdb = 12.0f;
+	const char *e = getenv("SALOG_GAIN_DB");
+	if (e != NULL)
+		gdb = (float)atof(e);
+	gdb = gdb < 0.0f ? 0.0f : gdb > 24.0f ? 24.0f : gdb;
 	OSStatus r = AudioDeviceCreateIOProcID(dev, tap_proc, t, out);
-	char m[160];
-	int l = snprintf(m, sizeof m, "valog[%d]: tap: wrapped IOProc on device %u (rate %.0f -> 48000), status %d\n", getpid(), (unsigned)dev, rate, (int)r);
+	os_unfair_lock_lock(&tap_lk);
+	if (r == 0) {
+		if (ntaps == 0) {
+			mach_timebase_info_data_t tb;
+			mach_timebase_info(&tb);
+			tap_lead_ticks = (uint64_t)TAP_LEAD_MS * 1000000u * tb.denom / tb.numer;
+			sa_lim_init(&tap_lim, powf(10.0f, gdb / 20.0f), TAP_CEIL, TAP_REL);
+		}
+		taps[ntaps] = t;
+		tap_offs[ntaps] = &t->off;
+		ntaps++;
+	}
+	unsigned nt = ntaps;
+	os_unfair_lock_unlock(&tap_lk);
+	char m[200];
+	int l = snprintf(m, sizeof m, "valog[%d]: tap: wrapped IOProc on device %u (rate %.0f -> 48000), status %d, taps %u, make-up %.1f dB, limit -1 dBFS\n",
+	    getpid(), (unsigned)dev, rate, (int)r, nt, gdb);
 	(void)write(2, m, (size_t)l);
 	if (r != 0)
 		free(t);

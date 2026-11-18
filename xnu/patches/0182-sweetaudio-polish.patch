@@ -1,0 +1,96 @@
+SWEET AUDIO POLISH (patch 0182, plan A12 polish), on top of 0181. User decision 2026-11-18 (speed first, loudness first):
+- /dev/sweetaudio gain: default -6 dB (was -15), max 0 dB (was -6); every sample is clamped at -3 dBFS (23197) after the gain, so no gain
+  setting drives the amps (DSP bypassed) above -3 dBFS. The level make-up for quiet iOS mixes is done in userland (libsalog tap limiter).
+- The sweetaoc=15 boot self-test (2 beeps) is opt-in: boot-arg sweetaudiotest=1; without it /dev/sweetaudio opens right away, silent boot.
+- sweetaoc=15 implies sweetamp=1 (the amp windows / identify run) when sweetamp is not given.
+
+diff --git a/bsd/dev/sweet_amp.c b/bsd/dev/sweet_amp.c
+--- a/bsd/dev/sweet_amp.c
++++ b/bsd/dev/sweet_amp.c
+@@ -126,7 +126,12 @@
+ 		return;
+ 	}
+ 	started = 1;
+-	if (!PE_parse_boot_argn("sweetamp", &on, sizeof(on)) || on == 0) {
++	if (!PE_parse_boot_argn("sweetamp", &on, sizeof(on))) {
++		uint32_t aoc = 0;       /* patch 0182: sweetaoc=15 (/dev/sweetaudio) implies sweetamp=1 */
++
++		on = PE_parse_boot_argn("sweetaoc", &aoc, sizeof(aoc)) && aoc == 15u ? 1u : 0u;
++	}
++	if (on == 0) {
+ 		return;         /* default: no map, no read */
+ 	}
+ 	if (on != 1) {
+diff --git a/bsd/dev/sweet_aoc_start.c b/bsd/dev/sweet_aoc_start.c
+--- a/bsd/dev/sweet_aoc_start.c
++++ b/bsd/dev/sweet_aoc_start.c
+@@ -21,6 +21,7 @@
+ #include <mach/vm_param.h>
+ #include <vm/memory_types.h>
+ #include <arm/memory_types.h>            /* VM_WIMG_WCOMB */
++#include <pexpert/pexpert.h>             /* patch 0182: PE_parse_boot_argn (sweetaudiotest) */
+ #include <stdint.h>
+ 
+ #include "sweet_aoc_start.h"
+@@ -807,12 +808,19 @@
+ 	static const struct swau_bus ab = { swas_ir32, swas_iw32, swas_isync, swau_doorbell, swas_sleep_ms, NULL, NULL };
+ 	uint64_t t0 = mach_absolute_time(), ns, now, up_at, ms_per = 0;
+ 	uint32_t st = 0, errs0 = swau_r.pb.feed_err, bad = 0, st_done = 0, st_det = 0, rx0, idle = 0, k, ups = 0, downs = 0, t[2] = { 0, 0 }, seen = 0;
+-	uint32_t w[256];
++	uint32_t w[256], test = 0;
+ 
++	/* patch 0182: the 2-beep boot self-test is opt-in (boot-arg sweetaudiotest=1); daily boots stay silent */
++	if (!PE_parse_boot_argn("sweetaudiotest", &test, sizeof(test))) {
++		test = 0;
++	}
++	if (!test) {
++		st = SWAU_ST15_FRAMES;
++	}
+ 	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ms_per);
+ 	lck_mtx_lock(&swau_dev_mtx);
+ 	swau_fifo_reset(&swau_ff);
+-	swau_dev_writer = 2;                    /* the self-test owns the FIFO first */
++	swau_dev_writer = test ? 2 : 0;         /* the self-test owns the FIFO first */
+ 	lck_mtx_unlock(&swau_dev_mtx);
+ 	swau_r.pb.pull = swau_dev_pull;
+ 	swau_r.pb.pull_ctx = NULL;
+@@ -834,9 +842,9 @@
+ 	swau_dev_up = 1;
+ 	sweet_audio_stop_hook = swau_stop_hook;
+ 	printf("SWEET AUDIO: a12: /dev/sweetaudio up on EP1 (major %d, 0666, 48 kHz 2 ch S16LE, fifo %u, start %u, ring target %u B, gain %d mdB, "
+-	    "max %d mdB, idle power-down %u s); detector S L %#x R %#x; kernel self-test now: 2 beeps 1 kHz 0.5 s on / 0.5 s off, -16 dBFS\n",
+-	    swau_dev_major, SWAU_FIFO_FRAMES, SWAU_START_FRAMES, swau_r.pb.target, SWAU_DEF_GAIN_MDB, SWAU_MAX_GAIN_MDB, SWAU_IDLE_MS / 1000u,
+-	    swau_det_s[0], swau_det_s[1]);
++	    "max %d mdB, limit %d, idle power-down %u s); detector S L %#x R %#x; kernel self-test %s\n",
++	    swau_dev_major, SWAU_FIFO_FRAMES, SWAU_START_FRAMES, swau_r.pb.target, SWAU_DEF_GAIN_MDB, SWAU_MAX_GAIN_MDB, SWAU_LIMIT, SWAU_IDLE_MS / 1000u,
++	    swau_det_s[0], swau_det_s[1], test ? "now: 2 beeps 1 kHz 0.5 s on / 0.5 s off, -7 dBFS" : "off (sweetaudiotest=1 enables it)");
+ 	while (!swau_stop_req) {
+ 		uint32_t fill;
+ 		int want;
+diff --git a/bsd/dev/sweet_audio_fifo.h b/bsd/dev/sweet_audio_fifo.h
+--- a/bsd/dev/sweet_audio_fifo.h
++++ b/bsd/dev/sweet_audio_fifo.h
+@@ -15,9 +15,12 @@
+ #define SWAU_FIFO_FRAMES        8192u
+ #define SWAU_START_FRAMES       960u
+ #endif
+-#define SWAU_MAX_GAIN_MDB       (-6000)         /* patch 0181: user decision 2026-11-18, max -6 dB, default -15 dB */
++/* patch 0182 (user decision 2026-11-18, polish pass: loudness first): max 0 dB, default -6 dB, and a hard clamp of every sample after the
++ * gain at SWAU_LIMIT = 23197 = 32767 * 10^(-3/20) (-3 dBFS), so no gain setting can drive the amps (DSP bypassed) above -3 dBFS */
++#define SWAU_MAX_GAIN_MDB       0
+ #define SWAU_MIN_GAIN_MDB       (-96000)
+-#define SWAU_DEF_GAIN_MDB       (-15000)
++#define SWAU_DEF_GAIN_MDB       (-6000)
++#define SWAU_LIMIT              23197
+ 
+ struct swau_fifo {
+ 	uint32_t buf[SWAU_FIFO_FRAMES];
+@@ -104,6 +107,8 @@
+ 
+ 	l = (int32_t)(((int64_t)l * (int64_t)q) >> 16);
+ 	r = (int32_t)(((int64_t)r * (int64_t)q) >> 16);
++	l = l > SWAU_LIMIT ? SWAU_LIMIT : l < -SWAU_LIMIT ? -SWAU_LIMIT : l;     /* patch 0182: -3 dBFS clamp */
++	r = r > SWAU_LIMIT ? SWAU_LIMIT : r < -SWAU_LIMIT ? -SWAU_LIMIT : r;
+ 	return ((uint32_t)l & 0xFFFFu) | ((uint32_t)r & 0xFFFFu) << 16;
+ }
+ 
