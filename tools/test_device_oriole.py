@@ -36,6 +36,23 @@ class Oriole(unittest.TestCase):
         base, size = boards.BOARDS["oriole"]["xnu_ram"]
         self.assertTrue(any(b <= base and base + size <= b + s for b, s in boards.BOARDS["oriole"]["dram_banks"]))
 
+    def test_batt_gauge_publish_reads_only(self):
+        """Patch 0395 (battery publish on upstream's charger engine): fuel-gauge reads only, the allowlisted registers, plausibility bounds, never 0 % before a sample."""
+        import glob
+        import re
+        p = glob.glob(os.path.join(ROOT, "xnu", "patches", "0395-*.patch"))
+        self.assertEqual(len(p), 1)
+        with open(p[0]) as f:
+            added = "\n".join(l[1:] for l in f.read().splitlines() if l.startswith("+") and not l.startswith("+++"))
+        self.assertEqual(sorted(re.findall(r"chg_i2c_read\((0x[0-9a-f]+), (0x[0-9a-f]+)", added)), [("0x36", "0x06"), ("0x36", "0x09")])
+        self.assertEqual(re.findall(r"i2c_wr\(([^)]*)\)", added), ["I_INTEN, 0", "I_INTEN, 0"])  # the per-transfer interrupt-enable clear of sweet_chg_fg_sample, nothing else
+        for bad in ("i2c_cnfg09_write", "i2c_hw_wr32", "ml_io_map", "PE_parse_boot_arg"):
+            self.assertNotIn(bad, added)
+        self.assertIn("mv < 2800u || mv > 4600u || soc > 10200u", added)
+        self.assertIn("publish(100, 4200, 0, true, true, false, true, false, false);", added)  # static fallback before the first set
+        self.assertIn("* 78125u) / 1000000u", added)   # VCell 78.125 uV/LSB, as mon_row
+        self.assertIn("* 100u) / 256u", added)         # RepSOC 1/256 %, in centi-%
+
     def test_is_a_phone_target(self):
         self.assertEqual(boards.target_board({"BOARD": "oriole"}), "oriole")
 

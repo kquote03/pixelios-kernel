@@ -1,0 +1,249 @@
+SWEET BATTERY GAUGE PUBLISH (patch 0395, oriole upstream port Step 2; the old oriole 0153 re-seated on upstream's sweet_chg_i2c / sweet_thermal, old 0148 reader dropped): SweetBattery (patch 0061, the iOS IOPMPowerSource) publishes the MAX77759 fuel gauge's real state of charge on gs101 instead of the static 100 % fallback. The thermal thread (patch 0336, every boot, sweetthermal=0 turns it off) adds, at most every 30 s and only after a good temperature sample, one read set through the new sweet_chg_fg_batt() (bsd/dev/sweet_chg_i2c.c): FG 0x36 reg 0x06 RepSOC (1/256 %) and reg 0x09 VCell (78.125 uV/LSB), the same registers and conversions mon_row (0298/0307) and i2c_g_fg (0284) already read, both on the i2c_rd_slave_ok allowlist, same guards and TH_RD_* codes as sweet_chg_fg_sample (a failed read stops the bus, as for every read since 0284). A set with VCell outside 2800..4600 mV or RepSOC > 102 % is not published (GAP once). sweet_batt_get() hands SweetBattery the last set (RepSOC, VCell, the sample's FG Current in mA, age). SweetBattery's existing 10 s fallback timer publishes it: percent = RepSOC rounded, External/Charging = Current > +50 mA (old 0153 rule), SweetBatteryFuelGauge = true, SweetBatterySOCEstimated = false; before the first set the static fallback stays (100 %, never 0 %); after a set older than 120 s the last values stay with SweetBatteryStale = true. Log: `SWEET BATTERY: MAX77759 fuel gauge RepSOC (patch 0395), N% ...` once on the mode change. READS ONLY: no new chip or controller register, no write. No new boot-arg. Applies after 0394.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+index 95eddfc..5a0f51e 100644
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -1486,6 +1486,42 @@ sweet_chg_fg_sample(int32_t *deci_c, int32_t *cur_uA)
+ 	return rc;
+ }
+ 
++/*
++ * Patch 0395 (oriole battery publish, the old oriole 0153 re-seated): one state-of-charge read set for SweetBattery, called by the thermal thread every 30 s after a good
++ * sweet_chg_fg_sample(). FG 0x36 reg 0x06 RepSOC (LSB 1/256 %) and reg 0x09 VCell (LSB 78.125 uV): the registers and conversions mon_row (patch 0298/0307) and i2c_g_fg
++ * (patch 0284) already read, both on the i2c_rd_slave_ok allowlist. Reads only; same guards and return codes as sweet_chg_fg_sample (a failed read stops the bus).
++ */
++int
++sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv)
++{
++	uint8_t sc[2], vc[2];
++	int rc = 0;
++
++	if (!sweet_chg_enter()) {
++		return 2;
++	}
++	if (i2c_group < 9) {
++		rc = 1;
++	} else if (!i2c_loaded || !sweet_chg_gate_established()) {
++		rc = -3;
++	} else if (i2c_dead) {
++		rc = -2;
++	} else if (!i2c_gate(!i2c_xfer_seen)) {
++		rc = -1;
++	} else if (chg_i2c_read(0x36, 0x06, 2, sc) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0) {
++		(void)i2c_wr(I_INTEN, 0);
++		i2c_log("SWEET CHG GAP: BATT fuel-gauge read failed: bus stopped, no more battery samples this boot\n");
++		rc = -1;
++	} else {
++		(void)i2c_wr(I_INTEN, 0);
++		i2c_xfer_seen = 1;
++		*soc_centi = ((uint32_t)(sc[0] | ((uint32_t)sc[1] << 8)) * 100u) / 256u;
++		*mv = (uint32_t)(((uint64_t)(vc[0] | ((uint32_t)vc[1] << 8)) * 78125u) / 1000000u);
++	}
++	sweet_chg_leave();
++	return rc;
++}
++
+ /*
+  * The charge lever of the thermal backstop. hold=1: put CNFG_09 back to its original value (the restore 0287 performs when the link is lost: same register, same value);
+  * hold=0: write the 875 mA value again. Returns 0 = done and read back, 1 = nothing to do (the 0287 raise is not in place: sweetchgicl=900 not given, refused, or already
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 843e5f2..c5806ef 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -27,6 +27,7 @@ extern void thread_deallocate(thread_t);
+ extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);   /* osfmk/kern/sched_prim.c; the call of patch 0270 */
+ extern unsigned int ml_get_cpu_count(void);                                          /* patch 0270 */
+ extern int sweet_chg_fg_sample(int32_t *deci_c, int32_t *cur_uA);                    /* bsd/dev/sweet_chg_i2c.c (patch 0336) */
++extern int sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv);                     /* bsd/dev/sweet_chg_i2c.c (patch 0395) */
+ extern int sweet_chg_icl_thermal(int hold);                                          /* bsd/dev/sweet_chg_i2c.c (patch 0336) */
+ extern void sweet_chg_tick(int log_pending);                                         /* bsd/dev/sweet_chg.c */
+ extern int sweet_thermal_reboot_bootloader(void);                                    /* bsd/dev/sweet_restart.c (patch 0336) */
+@@ -39,6 +40,12 @@ static uint32_t th_boot_mask;
+ static volatile int32_t th_g_cc;        /* latest good value, centi-C (published before th_g_ms with a release store; read after an acquire load of th_g_ms: review 0336 F8) */
+ static volatile uint32_t th_g_state;
+ static volatile uint64_t th_g_ms;       /* when th_g_cc was read; 0 = never */
++/* patch 0395: the latest fuel-gauge state of charge for SweetBattery (same release/acquire order as th_g_*; th_b_ms 0 = never) */
++static volatile uint32_t th_b_soc;      /* centi-% */
++static volatile uint32_t th_b_mv;
++static volatile int32_t th_b_ma;        /* positive = charging */
++static volatile uint64_t th_b_ms;
++#define TH_BATT_MS 30000u       /* one RepSOC/VCell read set every 30 s (the old 0153 cadence), after a good temperature sample */
+ 
+ static uint64_t
+ th_now_ms(void)
+@@ -87,6 +94,52 @@ sweet_thermal_get(int32_t *centi_c, uint32_t *state, uint32_t *age_ms)
+ 	return 1;
+ }
+ 
++/* Patch 0395: 1 = a plausible fuel-gauge read set exists (age in ms; the caller decides what is stale), 0 = none yet or the thread is off. */
++int
++sweet_batt_get(uint32_t *soc_centi, uint32_t *mv, int32_t *ma, uint32_t *age_ms)
++{
++	uint64_t t = __atomic_load_n(&th_b_ms, __ATOMIC_ACQUIRE);
++
++	if (t == 0) {
++		return 0;
++	}
++	*soc_centi = th_b_soc;
++	*mv = th_b_mv;
++	*ma = th_b_ma;
++	*age_ms = (uint32_t)(th_now_ms() - t);
++	return 1;
++}
++
++/* Patch 0395: after a good temperature sample, at most every TH_BATT_MS; an implausible set (VCell outside 2800..4600 mV, RepSOC above 102 %) is not published (GAP once). */
++static void
++th_batt_sample(uint64_t now, int32_t cur_uA)
++{
++	static uint64_t last_try;
++	static int said;
++	uint32_t soc = 0, mv = 0;
++	int rd;
++
++	if (last_try != 0 && now - last_try < TH_BATT_MS) {
++		return;
++	}
++	last_try = now;
++	rd = sweet_chg_fg_batt(&soc, &mv);
++	if (rd != TH_RD_OK) {
++		return;
++	}
++	if (mv < 2800u || mv > 4600u || soc > 10200u) {
++		if (!said) {
++			said = 1;
++			printf("SWEET BATTERY GAP: implausible fuel-gauge set (soc %u.%02u %% vcell %u mV): not published\n", soc / 100u, soc % 100u, mv);
++		}
++		return;
++	}
++	th_b_soc = soc > 10000u ? 10000u : soc;
++	th_b_mv = mv;
++	th_b_ma = cur_uA / 1000;
++	__atomic_store_n(&th_b_ms, now ? now : 1, __ATOMIC_RELEASE);
++}
++
+ static void
+ th_op_x1(int drop, int32_t dC)
+ {
+@@ -141,6 +194,7 @@ sweet_thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ 			th_g_cc = th_c.last_real_dC * 10;
+ 			th_g_state = (uint32_t)th_state(&th_c);
+ 			__atomic_store_n(&th_g_ms, now ? now : 1, __ATOMIC_RELEASE);     /* last: a reader that sees this time sees the value stored before it (review 0336 F8) */
++			th_batt_sample(now, cur);       /* patch 0395 */
+ 		}
+ 		for (i = 0; i < TH_PERIOD_MS / 1000u; i++) {
+ 			delay_for_interval(1000, 1000 * 1000);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 0819448..950ee4b 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -19,6 +19,9 @@ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_thermal_enabled(void);
+ extern "C" int sweet_thermal_get(int32_t *centi_c, uint32_t *state, uint32_t *age_ms);
+ #define SWEET_TEMP_STALE_MS 60000u      /* = TH_STALE_MS of bsd/dev/sweet_thermal.h */
++/* bsd/dev/sweet_thermal.c (patch 0395): the MAX77759 fuel-gauge RepSOC / VCell / Current the thermal thread reads every 30 s */
++extern "C" int sweet_batt_get(uint32_t *soc_centi, uint32_t *mv, int32_t *ma, uint32_t *age_ms);
++#define SWEET_BATT_STALE_MS 120000u    /* four missed 30 s read sets */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -33,11 +36,16 @@ private:
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
+ 	int fTempGapSaid;       /* patch 0336 */
++	bool fGauge;           /* patch 0395: the values being published come from the fuel gauge */
++	bool fGaugeSeen;       /* patch 0395: a gauge set was published once (then a stale gauge keeps the last set, never the 100 % fallback) */
++	unsigned fGaugePct, fGaugeMv;
++	int fGaugeMa;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void pollGauge(void);  /* patch 0395 */
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -57,6 +65,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	fGauge = fGaugeSeen = false;
++	fGaugePct = fGaugeMv = 0;
++	fGaugeMa = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -155,8 +166,9 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	}
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
++	putBool("SweetBatterySOCEstimated", measured && !fGauge);
+ 	putBool("SweetBatteryFallback", !measured);
++	putBool("SweetBatteryFuelGauge", fGauge);      /* patch 0395 */
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+ 	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
+@@ -179,10 +191,10 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+-	int mode = measured ? 1 : 0;
++	int mode = fGauge ? 2 : measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    fGauge ? "MAX77759 fuel gauge RepSOC (patch 0395)" : measured ? "PM6150 / estimated SOC" : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -249,7 +261,7 @@ SweetBattery::poll(void)
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		pollGauge();
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
+@@ -274,6 +286,39 @@ SweetBattery::poll(void)
+ 	    charging, full, true, currentValid);
+ }
+ 
++/*
++ * Patch 0395 (oriole battery publish): no PM6150 (gs101): publish the MAX77759 fuel-gauge set of the thermal thread (sweet_batt_get, every 30 s). Before the first set the
++ * static fallback (100 %, never 0 %) stays; once a set was published, a stale gauge keeps the last values (SweetBatteryStale) instead of jumping back to 100 %.
++ * External power / charging = FG Current > +50 mA (the old 0153 rule: the charger state bytes are not read here).
++ */
++void
++SweetBattery::pollGauge(void)
++{
++	uint32_t soc = 0, mv = 0, age = 0;
++	int32_t ma = 0;
++	bool have = sweet_batt_get(&soc, &mv, &ma, &age) != 0;
++
++	if (have && age <= SWEET_BATT_STALE_MS) {
++		fGaugePct = (soc + 50u) / 100u;
++		fGaugeMv = mv;
++		fGaugeMa = ma;
++		fGaugeSeen = true;
++		fGauge = true;
++		bool in = ma > 50;
++		putBool("SweetBatteryStale", false);
++		publish(fGaugePct, fGaugeMv, fGaugeMa, in, in, in, false, true, true);
++		return;
++	}
++	if (fGaugeSeen) {
++		fGauge = true;
++		putBool("SweetBatteryStale", true);
++		publish(fGaugePct, fGaugeMv, fGaugeMa, false, false, false, false, true, false);
++		return;
++	}
++	fGauge = false;
++	publish(100, 4200, 0, true, true, false, true, false, false);
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {

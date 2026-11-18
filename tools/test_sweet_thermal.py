@@ -66,6 +66,16 @@ class T(unittest.TestCase):
             if not os.path.isfile(src):
                 raise AssertionError("no patched XNU tree: %s is missing (set CHG_STACK_TREE to the tree of the build that has 0336; never skipped)" % src)
             shutil.copy(src, d)
+        # oriole fork (doc 56): patches after upstream's last (0368) that touch these files (e.g. 0395 battery publish) sit on top of 0336 in the build tree:
+        # peel them off, newest first, so every case below still tests 0336/0339 exactly as upstream pinned them. A patch that does not reverse cleanly fails here.
+        pdir = os.path.join(ROOT, "xnu", "patches")
+        mine = ["bsd/dev/" + f for f in ("sweet_thermal.h", "sweet_thermal.c", "sweet_chg_i2c.c", "sweet_restart.c")]
+        for n in sorted(os.listdir(pdir), reverse=True):
+            m = re.match(r"(\d{4})-.*\.patch$", n)
+            if m and int(m.group(1)) > 368 and set(re.findall(r"^\+\+\+ b/(\S+)$", rd(os.path.join(pdir, n)), re.M)) & set(mine):
+                r = run("git", "apply", "-R", *["--include=" + f for f in mine], os.path.join(pdir, n), cwd=os.path.join(cls.tmp, "tree"))
+                if r.returncode != 0:
+                    raise AssertionError("peel %s failed: %s" % (n, r.stderr[-600:]))
         cls.d = d
 
     @classmethod
