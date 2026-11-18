@@ -796,6 +796,12 @@ else
 	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
 	chk "wlan_wr_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_wr_host_test wlan_wr_host_test.c
 	chk "wlan_wr_host_test" $O/wlan_wr_host_test
+	# patch 0396 (oriole firmware identity): its sweet_wlan_wr.h hunk on top of the text after 0174, in a separate dir (the tests above keep bluejay's pinned header)
+	rm -rf $O/wrp396; mkdir -p $O/wrp396/bsd/dev; cp $O/sweet_wlan_wr.h $O/sweet_wlan_chip.h $O/wrp396/bsd/dev/
+	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0396-sweet-wlan-fw-ident-oriole.patch > $O/sweet_wlan_wr.0396.diff
+	patch -s -p1 -d $O/wrp396 < $O/sweet_wlan_wr.0396.diff || { echo "FAIL patch 0396 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
+	chk "wlan_fwid_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O/wrp396/bsd/dev -o $O/wlan_fwid_host_test wlan_fwid_host_test.c
+	chk "wlan_fwid_host_test" $O/wlan_fwid_host_test
 	# the pure NVRAM part of the same header (process_nvram_vars port): known answers, no bus
 	chk "wlan_nv_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_nv_host_test wlan_nv_host_test.c
 	chk "wlan_nv_host_test" $O/wlan_nv_host_test
