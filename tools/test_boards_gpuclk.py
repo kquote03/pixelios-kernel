@@ -72,6 +72,25 @@ class GpuPairs(unittest.TestCase):
         # T-50eb review F1: the observed fvmap uV of the ceiling pair, aligned with the pairs, 0 = not observed
         self.assertIn("#define GPU_CLK_UVS { 775000, 756250 }, { 775000, 718750 }, { 775000, 700000 }, { 731250, 662500 }", h)
 
+    def test_uv_is_per_chip(self):
+        # fvmap voltages are per chip: another board never inherits the bluejay unit's rows (0 = not observed -> shim GAP, no compare)
+        self.assertEqual(boards.gpu_dvfs_uv("bluejay"), boards._GPU_DVFS_UV)
+        self.assertIn("#define GPU_CLK_UVS { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }", boards.c_header("oriole"))
+        self.assertIn("#define GPU_CLK_PAIRS { 996000, 848000 }, { 996000, 762000 }, { 885000, 701000 }, { 750000, 572000 }", boards.c_header("oriole"))
+        saved = boards.BOARDS["oriole"].get("gpu_dvfs_uv")
+        try:
+            boards.BOARDS["oriole"]["gpu_dvfs_uv"] = ((996000, 762000, 768750, 700000),)
+            self.assertIn("#define GPU_CLK_UVS { 0, 0 }, { 768750, 700000 }, { 0, 0 }, { 0, 0 }", boards.c_header("oriole"))
+            for bad in (((996000, 760000, 768750, 700000),), ((996000, 762000, 768750, 2000000),), ((996000, 762000, 768750),)):
+                boards.BOARDS["oriole"]["gpu_dvfs_uv"] = bad
+                with self.assertRaises(ValueError):
+                    boards.c_header("oriole")
+        finally:
+            if saved is None:
+                boards.BOARDS["oriole"].pop("gpu_dvfs_uv", None)
+            else:
+                boards.BOARDS["oriole"]["gpu_dvfs_uv"] = saved
+
     def test_uv_pin_is_required_for_the_ceiling_pair(self):
         saved = dict(boards._GPU_DVFS_UV)
         try:

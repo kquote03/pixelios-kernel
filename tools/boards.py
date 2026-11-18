@@ -236,6 +236,30 @@ _GPU_DVFS_CEIL = {"G3D": 762000, "G3DL2": 996000}   # = DT v2 row 1 (996000 / 76
 # Rows 0..2 (sprint-gpu 2026-11-08): OBSERVED `SWEET FVMAP: dom 5 lv 0 rate=848000 volt=756250`, `lv 1 rate=762000 volt=718750`, `lv 2 rate=701000 volt=700000`,
 # `dom 6 lv 0 rate=996000 volt=775000`, `lv 1 rate=885000 volt=775000` (run 20261108T151209Z-gputest-nav20).
 _GPU_DVFS_UV = {(996000, 848000): (775000, 756250), (996000, 762000): (775000, 718750), (885000, 701000): (775000, 700000), (750000, 572000): (731250, 662500)}
+# The fvmap voltages are the APM's per-chip values (the rates are the SoC's table; the voltages are the chip's), so the table above
+# holds only for the unit it was read on. Any other board gets its own OBSERVED rows from board.json `gpu_dvfs_uv`
+# ([[G3DL2 kHz, G3D kHz, G3DL2 uV, G3D uV], ...], from the `SWEET FVMAP: dom 5/6 lv N rate= volt=` lines of a sweetfvmap boot of THAT phone)
+# or 0 = not observed (the shim then logs "fvmap voltage of the asked rate not pinned: undervolt not checked" instead of comparing
+# its rails with another chip's voltages). oriole 2026-11-18: G3D/G3DL2 rows not printed yet (PORT.md P0.1), so no key.
+_GPU_DVFS_UV_BOARD = "bluejay"
+_GPU_UV_RANGE = (450000, 1300000)   # S2MPG11 BUCK2S DT range 450-1300 mV (gs101-pmic.dtsi:766-768, as gpurailon.c)
+
+
+def gpu_dvfs_uv(board):
+    """{(G3DL2 kHz, G3D kHz): (G3DL2 uV, G3D uV)} observed on this board's chip (see _GPU_DVFS_UV_BOARD); {} = none observed."""
+    if board == _GPU_DVFS_UV_BOARD:
+        return dict(_GPU_DVFS_UV)
+    out = {}
+    for row in BOARDS[board].get("gpu_dvfs_uv", ()):
+        if len(row) != 4:
+            raise ValueError(f"{board} board.json gpu_dvfs_uv row {row!r}: want [G3DL2 kHz, G3D kHz, G3DL2 uV, G3D uV]")
+        l2, g3d, ul2, ug3d = row
+        if (l2, g3d) not in _GPU_DVFS_V2:
+            raise ValueError(f"{board} board.json gpu_dvfs_uv pair {l2}/{g3d}: not a DT v2 pair (_GPU_DVFS_V2)")
+        if not all(_GPU_UV_RANGE[0] <= u <= _GPU_UV_RANGE[1] for u in (ul2, ug3d)):
+            raise ValueError(f"{board} board.json gpu_dvfs_uv {row!r}: voltage outside {_GPU_UV_RANGE} uV")
+        out[(l2, g3d)] = (ul2, ug3d)
+    return out
 
 
 def _gpu_clk_pairs_check(dv):
@@ -388,8 +412,10 @@ def dvfs_requests(board, csv):
     return vals
 
 
-def _acpm_macros(v):
-    """ACPM_* macros for shim/acpm.c (soc.json "acpm", docs/research/23). null vsel_min/vsel_max = unknown (VSEL_KNOWN 0)."""
+def _acpm_macros(v, uv=None):
+    """ACPM_* macros for shim/acpm.c (soc.json "acpm", docs/research/23). null vsel_min/vsel_max = unknown (VSEL_KNOWN 0).
+    uv = the board's observed GPU fvmap voltages (gpu_dvfs_uv); None = _GPU_DVFS_UV (the bluejay unit)."""
+    uv = _GPU_DVFS_UV if uv is None else uv
     a = v["acpm"]
     _acpm_check(a)
     out = []
@@ -476,7 +502,7 @@ def _acpm_macros(v):
         out.append("#define ACPM_DVFS_ROWS " + ", ".join("{ " + ", ".join(str(x) for x in d["rates_khz"]) + " }" for d in doms))
         out.append(f"#define GPU_CLK_NLEVELS {_GPU_CLK_LEVELS}")
         out.append("#define GPU_CLK_PAIRS " + ", ".join(f"{{ {l2}, {g3d} }}" for l2, g3d in _GPU_DVFS_V2[:_GPU_CLK_LEVELS]))	# { G3DL2, G3D } kHz, gpuclk.c indexes it by GPU_CLK_LEVEL
-        out.append("#define GPU_CLK_UVS " + ", ".join("{ %d, %d }" % _GPU_DVFS_UV.get(pr, (0, 0)) for pr in _GPU_DVFS_V2[:_GPU_CLK_LEVELS]))	# { G3DL2, G3D } uV aligned with GPU_CLK_PAIRS, 0 = not observed
+        out.append("#define GPU_CLK_UVS " + ", ".join("{ %d, %d }" % uv.get(pr, (0, 0)) for pr in _GPU_DVFS_V2[:_GPU_CLK_LEVELS]))	# { G3DL2, G3D } uV aligned with GPU_CLK_PAIRS, 0 = not observed
     return out
 
 
@@ -602,7 +628,7 @@ def c_header(board: str) -> str:
     if "touch_chip_id" in values:
         lines += _touch_macros(values)
     if "acpm" in values:
-        lines += _acpm_macros(values)
+        lines += _acpm_macros(values, gpu_dvfs_uv(board))
     lines += _el2_macros(values)
     lines.append(f"#define BOARD_BLUEJAY {1 if this_soc == 'GS101' else 0}")
     lines.append(f"#define BOOT_HEADER_VERSION {values['boot_header_version']}")
