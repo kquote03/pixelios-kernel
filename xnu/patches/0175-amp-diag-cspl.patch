@@ -1,0 +1,72 @@
+SWEET AMP DIAG CSPL (patch 0175), on top of 0174 (sweetaoc=9). The diagnostic snapshot lines were longer than RAMLOG_LINE_MAX (96) and lost the
+raw / mailbox / DAC source words (run a10b): now one line per group ("L|R st1-4 <tag>", "raw1-4/mbox2/pcmsrc <tag>"), plus the CSPL firmware
+controls read from XM at the algorithm bases the 0169 load found (cd_xm / fw_xm): CSPL_ENABLE 0, CSPL_STATE 2, CSPL_ERRORNO 3, CSPL_TEMPERATURE 4,
+CAL_R 6, CAL_STATUS 8, CAL_R_SELECTED 10, CAL_SET_STATUS 11, BDLOG_ABNORMAL_MUTE 70 (alg 0xcd) and HALO_STATE 0, FIRMWARE_STATE 9 (alg 0x400a4):
+word offsets of the stock cs35l41-dsp1-spk-prot.wmfw coefficient list, read on the host with the Linux v6.18 cs_dsp.c:1125-1310 layout. Reads only.
+
+diff --git a/bsd/dev/sweet_amp_pwr.h b/bsd/dev/sweet_amp_pwr.h
+--- a/bsd/dev/sweet_amp_pwr.h
++++ b/bsd/dev/sweet_amp_pwr.h
+@@ -318,28 +318,47 @@
+ #define AMP_DIAG_A_MS	7600u
+ #define AMP_DIAG_GAP_MS	2000u
+ #define AMP_DIAG_B_MS	5100u
+-static void amp_pwr_diag_snap(const struct amp_snap *s, const char *tag)
++/* one log line (<= RAMLOG_LINE_MAX 96): "<side> <what> <tag> v v ..." of n words; w[] = register (xm = 0) or XM word index (xm = 1) */
++static void amp_pwr_diag_line(const struct amp_snap *s, int cs, const char *what, const char *tag, const uint32_t *w, unsigned n, int xm)
+ {
+-	static const uint32_t regs[10] = { 0x10010u, 0x10014u, 0x10018u, 0x1001Cu, 0x10090u, 0x10094u, 0x10098u, 0x1009Cu, AMP_DSP_MBOX2, AMP_PWR_PCMSRC };
+ 	char line[RAMLOG_LINE_MAX];
+ 	unsigned p, i;
++
++	p = put_txt(line, sizeof(line), 0, cs ? "R " : "L ");
++	p = put_txt(line, sizeof(line), p, what);
++	p = put_txt(line, sizeof(line), p, tag);
++	for (i = 0; i < n; i++) {
++		uint32_t v = 0, reg = xm ? AMP_DSP_XM_UNP + 4u * w[i] : w[i];
++
++		p = put_txt(line, sizeof(line), p, " ");
++		p = (!xm || (w[i] && w[i] < AMP_DSP_XM_WORDS)) && amp_read(s, cs, reg, &v) == AMP_OK ? put_hexmin(line, sizeof(line), p, v) :
++		    put_txt(line, sizeof(line), p, "-");
++	}
++	emit("AMP", line, p);
++}
++/* patch 0174 + 0175: IRQ1_STATUS1..4, RAW1..4, MBOX_2, DAC_PCM1_SRC; 0175: the CSPL firmware controls (XM word offsets of the stock wmfw
++ * coefficient list, read on the host: alg 0xcd CSPL: CSPL_ENABLE 0, CSPL_STATE 2, CSPL_ERRORNO 3, CSPL_TEMPERATURE 4, CAL_R 6, CAL_STATUS 8,
++ * CAL_R_SELECTED 10, CAL_SET_STATUS 11, BDLOG_ABNORMAL_MUTE 70; alg 0x400a4: HALO_STATE 0, FIRMWARE_STATE 9) */
++static void amp_pwr_diag_snap(const struct amp_snap *s, const char *tag)
++{
++	static const uint32_t st[4] = { 0x10010u, 0x10014u, 0x10018u, 0x1001Cu }, raw[6] = { 0x10090u, 0x10094u, 0x10098u, 0x1009Cu, AMP_DSP_MBOX2,
++	    AMP_PWR_PCMSRC };
++	static const uint8_t co[9] = { 0, 2, 3, 4, 6, 8, 10, 11, 70 };
++	uint32_t x[11];
++	unsigned i;
+ 	int cs;
+ 
+ 	for (cs = 0; cs < 2; cs++) {
+-		p = put_txt(line, sizeof(line), 0, cs ? "R diag " : "L diag ");
+-		p = put_txt(line, sizeof(line), p, tag);
+-		p = put_txt(line, sizeof(line), p, " st1-4");
+-		for (i = 0; i < 10u; i++) {
+-			uint32_t v = 0;
++		const struct amp_dsp_side *ds = &amp_dsp_res.a[cs];
+ 
+-			if (i == 4u)
+-				p = put_txt(line, sizeof(line), p, " raw1-4");
+-			if (i == 8u)
+-				p = put_txt(line, sizeof(line), p, " mbox2/pcmsrc");
+-			p = put_txt(line, sizeof(line), p, " ");
+-			p = amp_read(s, cs, regs[i], &v) == AMP_OK ? put_hexmin(line, sizeof(line), p, v) : put_txt(line, sizeof(line), p, "rd-err");
+-		}
+-		emit("AMP", line, p);
++		amp_pwr_diag_line(s, cs, "st1-4 ", tag, st, 4u, 0);
++		amp_pwr_diag_line(s, cs, "raw1-4/mbox2/pcmsrc ", tag, raw, 6u, 0);
++		for (i = 0; i < 9u; i++)
++			x[i] = ds->cd_xm ? ds->cd_xm + co[i] : 0u;
++		x[9] = ds->fw_xm ? ds->fw_xm : 0u;
++		x[10] = ds->fw_xm ? ds->fw_xm + 9u : 0u;
++		amp_pwr_diag_line(s, cs, "cspl en/st/err/temp/calr ", tag, x, 5u, 1);
++		amp_pwr_diag_line(s, cs, "cspl calst/rsel/set/mute halo/fw ", tag, x + 5, 6u, 1);
+ 	}
+ }
+ static unsigned amp_pwr_diag_wait(unsigned ms, const struct amp_snap *s, const char *tag, unsigned snap_at)

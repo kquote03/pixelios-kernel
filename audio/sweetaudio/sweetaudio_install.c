@@ -8,8 +8,8 @@
  *   restore    remove SweetAudio.driver; move VirtualAudio.plugin back to HAL.disabled (the root-tweak state)
  *   status     change nothing, print the state
  * Without MODE the first word of /usr/local/pixos/sweetaudio.mode is used (so one launchd job serves every mode and the
- * overlay picks the mode by that file). A second word "tone" in that file then runs /usr/local/bin/sweetaudio_tone 2 440
- * (kernel path test without CoreAudio; it bounds itself to 4 s) after the mode step.
+ * overlay picks the mode by that file). A second word "tone" in that file then waits (<= 300 s) for /dev/sweetaudio and runs /usr/local/bin/sweetaudio_tone 3 880 3
+ * (3 beeps, kernel path without CoreAudio; bounded to 5 s); "play" runs /usr/local/bin/sweetaudio_play both (HAL + AudioQueue).
  * When something changed, mediaserverd is killed once so launchd restarts it and the HAL rescans (KeepAlive job).
  * Every step prints one "sweetaudio_install: ..." line. Exit 0 ok, 1 a step failed, 2 usage. Bounded: fixed file list.
  */
@@ -171,6 +171,26 @@ kick_mediaserverd(void)
 	free(kp);
 }
 
+/* the kernel makes /dev/sweetaudio once the AOC + amps are up (~+120 s, patch 0173) and holds it for its 2-beep self-test: wait for an
+ * open to succeed, bounded to 300 s (1 s steps) */
+static int
+wait_dev(void)
+{
+	for (int s = 0; s < 300; s++) {
+		int fd = open("/dev/sweetaudio", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+		if (fd >= 0) {
+			close(fd);
+			printf("sweetaudio_install: /dev/sweetaudio ready after %d s\n", s);
+			return 1;
+		}
+		if (s % 30 == 0)
+			printf("sweetaudio_install: waiting for /dev/sweetaudio (errno %d)\n", errno);
+		sleep(1);
+	}
+	printf("sweetaudio_install: FAIL /dev/sweetaudio not ready after 300 s\n");
+	return 0;
+}
+
 static void
 status(void)
 {
@@ -211,15 +231,17 @@ main(int argc, char **argv)
 		kick_mediaserverd();
 	status();
 	printf("sweetaudio_install: done %s: %s, %s\n", m, changed ? "changed" : "unchanged", failed ? "FAIL" : "ok");
-	if (strcmp(extra, "tone") == 0) {
+	if ((strcmp(extra, "tone") == 0 || strcmp(extra, "play") == 0) && wait_dev()) {
 		extern char **environ;
-		char *targv[] = { "/usr/local/bin/sweetaudio_tone", "2", "440", NULL };
+		char *tone_argv[] = { "/usr/local/bin/sweetaudio_tone", "3", "880", "3", NULL };
+		char *play_argv[] = { "/usr/local/bin/sweetaudio_play", "both", NULL };
+		char **targv = strcmp(extra, "tone") == 0 ? tone_argv : play_argv;
 		pid_t pid;
 		int st = 0, r = posix_spawn(&pid, targv[0], NULL, NULL, targv, environ);
 		if (r == 0 && waitpid(pid, &st, 0) == pid)
-			printf("sweetaudio_install: tone exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+			printf("sweetaudio_install: %s exit %d\n", extra, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
 		else
-			printf("sweetaudio_install: FAIL tone spawn %d\n", r);
+			printf("sweetaudio_install: FAIL %s spawn %d\n", extra, r);
 	}
 	return failed ? 1 : 0;
 }

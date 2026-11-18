@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * sweetaudio_tone [SECONDS] [HZ]: writes a quiet sine (-30 dBFS, both channels) to /dev/sweetaudio, paced by the kernel FIFO.
- * Tests the kernel path without CoreAudio. Bounded: at most 10 s of audio, at most SECONDS + 2 s wall time, 1 ms sleeps.
+ * sweetaudio_tone [SECONDS] [HZ] [BEEPS]: writes a sine (-10 dBFS PCM; the kernel gain, default -20 dB, makes it -30 dBFS), both channels, to /dev/sweetaudio, paced by the kernel FIFO.
+ * BEEPS > 0: BEEPS x (0.5 s on, 0.5 s off) instead of a steady tone (SECONDS = BEEPS). Tests the kernel path without CoreAudio. Bounded: at most 10 s of audio, at most SECONDS + 2 s wall time, 1 ms sleeps.
  * Prints one result line: "sweetaudio_tone: done: N frames written, U underruns, O overruns" or "sweetaudio_tone: FAIL ...".
  */
 #include <errno.h>
@@ -20,6 +20,9 @@ int
 main(int argc, char **argv)
 {
 	double secs = argc > 1 ? atof(argv[1]) : 2.0, hz = argc > 2 ? atof(argv[2]) : 440.0;
+	int beeps = argc > 3 ? atoi(argv[3]) : 0;
+	if (beeps > 0 && beeps <= 10)
+		secs = beeps;
 	if (!(secs > 0.0) || secs > 10.0 || !(hz >= 20.0) || hz > 20000.0) {
 		fprintf(stderr, "usage: sweetaudio_tone [SECONDS 0-10] [HZ 20-20000]\n");
 		return 2;
@@ -37,10 +40,10 @@ main(int argc, char **argv)
 		close(fd);
 		return 1;
 	}
-	printf("sweetaudio_tone: info fifo %u start %u flags 0x%x max_gain %d mdB; %.2f s of %.0f Hz at -30 dBFS\n", in.fifo_frames,
-	    in.start_frames, in.flags, in.max_gain_mdb, secs, hz);
+	printf("sweetaudio_tone: info fifo %u start %u flags 0x%x max_gain %d mdB; %.2f s of %.0f Hz (%d beeps), -10 dBFS PCM\n", in.fifo_frames,
+	    in.start_frames, in.flags, in.max_gain_mdb, secs, hz, beeps);
 	const uint64_t total = (uint64_t)(secs * SWAU_RATE);
-	const double amp = 32768.0 * 0.0316;   /* -30 dBFS */
+	const double amp = 32768.0 * 0.316;    /* -10 dBFS PCM (kernel gain -20 dB by default) */
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	const uint64_t deadline = mach_absolute_time() + (uint64_t)((secs + 2.0) * 1e9 * tb.denom / tb.numer);
@@ -56,7 +59,9 @@ main(int argc, char **argv)
 		}
 		uint32_t n = total - done > 256 ? 256 : (uint32_t)(total - done);
 		for (uint32_t i = 0; i < n; i++) {
-			int16_t v = (int16_t)lrint(amp * sin(2.0 * M_PI * hz * (double)(done + i) / SWAU_RATE));
+			uint64_t fr = done + i;
+			int on = beeps <= 0 || (fr / (SWAU_RATE / 2)) % 2 == 0;
+			int16_t v = on ? (int16_t)lrint(amp * sin(2.0 * M_PI * hz * (double)fr / SWAU_RATE)) : 0;
 			buf[2 * i] = buf[2 * i + 1] = v;
 		}
 		ssize_t w = write(fd, buf, n * SWAU_BYTES_PER_FRAME);

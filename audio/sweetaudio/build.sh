@@ -12,7 +12,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 MODE=${1:-driver}
 TONE=${2:-}
 case $MODE in driver|driver+va|restore|status) ;; *) echo "usage: $0 [driver|driver+va|restore|status [tone]]" >&2; exit 2;; esac
-case $TONE in ''|tone) ;; *) echo "usage: $0 [driver|driver+va|restore|status [tone]]" >&2; exit 2;; esac
+case $TONE in ''|tone|play) ;; *) echo "usage: $0 [driver|driver+va|restore|status [tone|play]]" >&2; exit 2;; esac
 SDK=$A/localbuild/theos/sdks/iPhoneOS16.5.sdk
 MACSDK=$A/localbuild/sdk/MacOSX14.0.sdk
 CLANG=${CLANG:-/nix/store/jskv39ga5njhv0hwv5yxjq56dmc5jjm8-clang-21.1.8/bin/clang}
@@ -30,11 +30,14 @@ cc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -
 mkdir -p "$OUT/inc/CoreAudio" "$OUT/SweetAudio.driver"
 ln -sf "$MACSDK/System/Library/Frameworks/CoreAudio.framework/Headers/AudioServerPlugIn.h" "$OUT/inc/CoreAudio/AudioServerPlugIn.h"
 ln -sf "$MACSDK/System/Library/Frameworks/CoreAudio.framework/Headers/AudioHardwareBase.h" "$OUT/inc/CoreAudio/AudioHardwareBase.h"
+ln -sf "$MACSDK/System/Library/Frameworks/CoreAudio.framework/Headers/AudioHardware.h" "$OUT/inc/CoreAudio/AudioHardware.h"
+ln -sf "$MACSDK/System/Library/Frameworks/CoreAudio.framework/Headers/AudioHardwareDeprecated.h" "$OUT/inc/CoreAudio/AudioHardwareDeprecated.h"
 CF=(--target=arm64-apple-ios16.0 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -I"$OUT/inc" -I"$HERE")
 "$CLANG" "${CF[@]}" -bundle -fvisibility=hidden -framework CoreFoundation -o "$OUT/SweetAudio.driver/SweetAudio" "$HERE/SweetAudio.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_tone" "$HERE/sweetaudio_tone.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_install" "$HERE/sweetaudio_install.c"
-for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install"; do ldid -S "$f"; done
+"$CLANG" "${CF[@]}" -Wno-deprecated-declarations -framework CoreFoundation -framework CoreAudio -framework AudioToolbox -o "$OUT/sweetaudio_play" "$HERE/sweetaudio_play.c"
+for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play"; do ldid -S "$f"; done
 python3 -I - "$OUT/SweetAudio.driver/Info.plist" <<'EOF'
 import plistlib, sys
 FACTORY = "7F3C2A61-5B0E-4E57-9C1D-0A5E1D6B9F42"           # ours (random); type = kAudioServerPlugInTypeUUID
@@ -49,7 +52,7 @@ open(sys.argv[1], "wb").write(plistlib.dumps(pl, fmt=plistlib.FMT_XML))
 EOF
 # symbol + link checks (gpu/ios/check-sdk-symbols.py: every undefined symbol resolves against the SDK .tbd files)
 llvm-nm -gU "$OUT/SweetAudio.driver/SweetAudio" | grep -q ' T _SweetAudio_Create$'
-python3 -I "$REPO/gpu/ios/check-sdk-symbols.py" "$SDK" "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" | tail -1
+python3 -I "$REPO/gpu/ios/check-sdk-symbols.py" "$SDK" "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play" | tail -1
 
 # 3. overlay: /usr/local/{pixos,bin} + the launchd cache with the one job (paths inside the 0117 allowlist)
 OV=$A/audio/ov-sa-$MODE${TONE:+-$TONE}
@@ -57,9 +60,9 @@ rm -rf "$OV"
 mkdir -p "$OV/usr/local/pixos/SweetAudio.driver" "$OV/usr/local/bin" "$OV/System/Library/xpc"
 install -m 0644 "$OUT/SweetAudio.driver/Info.plist" "$OV/usr/local/pixos/SweetAudio.driver/Info.plist"
 install -m 0755 "$OUT/SweetAudio.driver/SweetAudio" "$OV/usr/local/pixos/SweetAudio.driver/SweetAudio"
-install -m 0755 "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OV/usr/local/bin/"
+install -m 0755 "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_play" "$OV/usr/local/bin/"
 printf '%s\n' "$MODE${TONE:+ $TONE}" > "$OV/usr/local/pixos/sweetaudio.mode"; chmod 0644 "$OV/usr/local/pixos/sweetaudio.mode"
 python3 -I "$REPO/tools/mk_launchd_job.py" "$LAUNCHD_RO" "$OV/System/Library/xpc/launchd.plist" --sha256 "$LAUNCHD_SHA" --job sweetaudio
 chmod 0644 "$OV/System/Library/xpc/launchd.plist"
 python3 -I "$REPO/tools/mkdevoverlay.py" "$OV" "$OV.bin"
-sha256sum "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OV.bin"
+sha256sum "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_play" "$OV.bin"
