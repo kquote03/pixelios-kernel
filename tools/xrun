@@ -204,6 +204,9 @@ if [ "$nochg" = 0 ] && [ "$intent" != el2 ] && [[ " $args " != *" sweetchgi2c="*
 # sweetepoch=<unix seconds> when the line is built (kernels without 0345 ignore it); --no-epoch or an own sweetepoch= opts out. The token is always 22 characters (10 digits until 2286),
 # so the boot-line length checks (build-xnu-image.sh, resident_core.line_limit) count it like any other token; a changing value never differs between two jobs' --args (it is not in them).
 if [ "$noepoch" = 0 ] && [ "$intent" != el2 ] && [[ " $args " != *" sweetepoch="* ]]; then ep=$(date -u +%s); args="${args:+$args }sweetepoch=$ep"; implicit="${implicit:+$implicit }sweetepoch=$ep"; fi
+# SWEET_USBLOG_PORT=N (oriole patch 0371): the phone sends the UDP log to N and the listener below uses N (a host firewall may block 5140). Lost in the upstream merge
+# (observed up-reg1 2026-11-18: listener on 64738, phone on 5140, 0 bytes, S6 stop); an explicit sweetusblogport= in --args wins.
+if [ -n "${SWEET_USBLOG_PORT:-}" ] && [[ " $args " != *" sweetusblogport="* ]]; then args="${args:+$args }sweetusblogport=$SWEET_USBLOG_PORT"; implicit="${implicit:+$implicit }sweetusblogport=$SWEET_USBLOG_PORT"; fi
 # review autorecover-0278 F1: the watchdog must outlast a stall panic plus its on-screen hold, or it cuts the hold short (reset into recovery mid-hold).
 # Refuse a period <= sweetstall (20) + 2 + sweetpanichold (20) + 10 before any build or phone step.
 bav() { local v; v=$(grep -o -E "(^| )$1=[0-9]+" <<< " $args" | tail -n 1 | grep -o -E '[0-9]+$'); echo "${v:-$2}"; }
