@@ -8,7 +8,7 @@
  *   restore    remove SweetAudio.driver; move VirtualAudio.plugin back to HAL.disabled (the root-tweak state)
  *   status     change nothing, print the state
  * Without MODE the first word of /usr/local/pixos/sweetaudio.mode is used (so one launchd job serves every mode and the
- * overlay picks the mode by that file). A second word "tone" in that file then waits (<= 300 s) for /dev/sweetaudio and runs /usr/local/bin/sweetaudio_tone 3 880 3
+ * overlay picks the mode by that file). A second word "tone" ("play", "tone+play": both in that order) in that file then waits (<= 300 s) for /dev/sweetaudio and runs /usr/local/bin/sweetaudio_tone 3 880 3
  * (3 beeps, kernel path without CoreAudio; bounded to 5 s); "play" runs /usr/local/bin/sweetaudio_play both (HAL + AudioQueue).
  * When something changed, mediaserverd is killed once so launchd restarts it and the HAL rescans (KeepAlive job).
  * Every step prints one "sweetaudio_install: ..." line. Exit 0 ok, 1 a step failed, 2 usage. Bounded: fixed file list.
@@ -231,17 +231,24 @@ main(int argc, char **argv)
 		kick_mediaserverd();
 	status();
 	printf("sweetaudio_install: done %s: %s, %s\n", m, changed ? "changed" : "unchanged", failed ? "FAIL" : "ok");
-	if ((strcmp(extra, "tone") == 0 || strcmp(extra, "play") == 0) && wait_dev()) {
+	int do_tone = strcmp(extra, "tone") == 0 || strcmp(extra, "tone+play") == 0, do_play = strcmp(extra, "play") == 0 || strcmp(extra, "tone+play") == 0;
+	if ((do_tone || do_play) && wait_dev()) {
 		extern char **environ;
 		char *tone_argv[] = { "/usr/local/bin/sweetaudio_tone", "3", "880", "3", NULL };
 		char *play_argv[] = { "/usr/local/bin/sweetaudio_play", "both", NULL };
-		char **targv = strcmp(extra, "tone") == 0 ? tone_argv : play_argv;
-		pid_t pid;
-		int st = 0, r = posix_spawn(&pid, targv[0], NULL, NULL, targv, environ);
-		if (r == 0 && waitpid(pid, &st, 0) == pid)
-			printf("sweetaudio_install: %s exit %d\n", extra, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-		else
-			printf("sweetaudio_install: FAIL %s spawn %d\n", extra, r);
+		for (int step = 0; step < 2; step++) {
+			if (!(step == 0 ? do_tone : do_play))
+				continue;
+			char **targv = step == 0 ? tone_argv : play_argv;
+			pid_t pid;
+			int st = 0, r = posix_spawn(&pid, targv[0], NULL, NULL, targv, environ);
+			if (r == 0 && waitpid(pid, &st, 0) == pid)
+				printf("sweetaudio_install: %s exit %d\n", step == 0 ? "tone" : "play", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+			else
+				printf("sweetaudio_install: FAIL %s spawn %d\n", step == 0 ? "tone" : "play", r);
+			if (step == 0 && do_play)
+				sleep(2);
+		}
 	}
 	return failed ? 1 : 0;
 }

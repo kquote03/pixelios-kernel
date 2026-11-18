@@ -12,7 +12,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 MODE=${1:-driver}
 TONE=${2:-}
 case $MODE in driver|driver+va|restore|status) ;; *) echo "usage: $0 [driver|driver+va|restore|status [tone]]" >&2; exit 2;; esac
-case $TONE in ''|tone|play) ;; *) echo "usage: $0 [driver|driver+va|restore|status [tone|play]]" >&2; exit 2;; esac
+case $TONE in ''|tone|play|tone+play) ;; *) echo "usage: $0 [driver|driver+va|restore|status [tone|play|tone+play]]" >&2; exit 2;; esac
 SDK=$A/localbuild/theos/sdks/iPhoneOS16.5.sdk
 MACSDK=$A/localbuild/sdk/MacOSX14.0.sdk
 CLANG=${CLANG:-/nix/store/jskv39ga5njhv0hwv5yxjq56dmc5jjm8-clang-21.1.8/bin/clang}

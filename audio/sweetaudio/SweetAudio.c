@@ -51,13 +51,32 @@ sa_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void
 sa_log(const char *fmt, ...)
 {
-	/* stderr of mediaserverd: launchd points it at /dev/null; boot-arg sweetnull=...,mediaserverd tees it to the console (0048) */
+	/* stderr of mediaserverd: launchd points it at /dev/null; boot-arg sweetnull=...,mediaserverd tees it to the console (0048);
+	 * one write per line (unbuffered stderr wrote one byte per call: one console line per character) */
+	char line[512];
 	va_list ap;
 	va_start(ap, fmt);
-	fputs("sweetaudio: ", stderr);
-	vfprintf(stderr, fmt, ap);
-	fputc('\n', stderr);
+	int n = snprintf(line, sizeof line, "sweetaudio[%d]: ", getpid());
+	if (n > 0 && n < (int)sizeof line)
+		n += vsnprintf(line + n, sizeof line - (size_t)n, fmt, ap);
 	va_end(ap);
+	if (n > (int)sizeof line - 2)
+		n = (int)sizeof line - 2;
+	line[n++] = '\n';
+	(void)write(2, line, (size_t)n);
+}
+
+/* the first SA_TRACE_N property calls of the HAL (which object / selector it asks for and what we answered) */
+#define SA_TRACE_N 240u
+static _Atomic uint32_t sa_trace_n;
+static void
+sa_trace(const char *op, AudioObjectID obj, const AudioObjectPropertyAddress *a, long rc)
+{
+	if (a == NULL || atomic_fetch_add(&sa_trace_n, 1) >= SA_TRACE_N)
+		return;
+	UInt32 s = a->mSelector, c = a->mScope;
+	sa_log("%s obj %u sel '%c%c%c%c' scope '%c%c%c%c' el %u -> %ld", op, (unsigned)obj, (char)(s >> 24), (char)(s >> 16), (char)(s >> 8), (char)s,
+	    (char)(c >> 24), (char)(c >> 16), (char)(c >> 8), (char)c, (unsigned)a->mElement, rc);
 }
 
 static AudioStreamBasicDescription
@@ -215,7 +234,7 @@ sa_has(AudioObjectID obj, const AudioObjectPropertyAddress *a)
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice: case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
 		case kAudioDevicePropertyLatency: case kAudioDevicePropertyStreams: case kAudioDevicePropertySafetyOffset:
 		case kAudioDevicePropertyPreferredChannelsForStereo:
-			return a->mScope == kAudioObjectPropertyScopeGlobal || a->mScope == kAudioObjectPropertyScopeOutput;
+			return true;   /* every scope: run a12c: the HAL asks stm# in scope inpt and dropped the device on "who?"; input answers 0 / none */
 		}
 		return false;
 	case kObjStream:
@@ -237,7 +256,9 @@ static Boolean
 sa_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *a)
 {
 	(void)pid;
-	return d == sa_ref && a != NULL && sa_has(obj, a);
+	Boolean r = d == sa_ref && a != NULL && sa_has(obj, a);
+	sa_trace("has", obj, a, r);
+	return r;
 }
 
 static OSStatus
@@ -352,7 +373,9 @@ sa_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pi
 	(void)pid;
 	if (d != sa_ref || a == NULL || outSize == NULL)
 		return kAudioHardwareIllegalOperationError;
-	return sa_get(obj, a, qs, qd, 0, outSize, NULL);
+	OSStatus r = sa_get(obj, a, qs, qd, 0, outSize, NULL);
+	sa_trace("size", obj, a, (long)r);
+	return r;
 }
 
 static OSStatus
@@ -362,7 +385,9 @@ sa_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, c
 	(void)pid;
 	if (d != sa_ref || a == NULL || outSize == NULL || out == NULL)
 		return kAudioHardwareIllegalOperationError;
-	return sa_get(obj, a, qs, qd, cap, outSize, out);
+	OSStatus r = sa_get(obj, a, qs, qd, cap, outSize, out);
+	sa_trace("get", obj, a, (long)r);
+	return r;
 }
 
 static OSStatus

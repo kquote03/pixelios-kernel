@@ -2,7 +2,7 @@
 /*
  * sweetaudio_play [hal|aq|both]: the CoreAudio side of doc 54 (run after the kernel /dev/sweetaudio is up).
  *   1. lists the HAL devices mediaserverd publishes (id, name, UID, transport, output streams) and the default output device;
- *   2. hal: waits (<= 30 s) for SweetAudio.driver's device "PixOSSweetAudio:0", then plays 4 beeps (660 Hz, 0.3 s on / 0.3 s off, -10 dBFS
+ *   2. hal: waits (<= 30 s) for SweetAudio.driver's device "PixOSSweetAudio:0", then plays 4 beeps (660 Hz, 0.3 s on / 0.3 s off, -3 dBFS
  *      float) through an IOProc on it (HAL client API: mediaserverd -> plug-in -> /dev/sweetaudio);
  *   3. aq: plays 5 beeps (1320 Hz) through an AudioQueue on the default output (the app-level path: needs VirtualAudio's routing).
  * Every step prints one "sweetaudio_play: ..." line with the OSStatus. Bounded: every wait has a limit, at most ~12 s in all.
@@ -90,7 +90,7 @@ beep_sample(struct beeper *b, uint64_t f)
 	const uint64_t on = (uint64_t)(0.3 * RATE), per = 2 * on;
 	if (f >= b->total || f % per >= on)
 		return 0.0f;
-	return (float)(0.316 * sin(2.0 * M_PI * b->hz * (double)f / RATE));
+	return (float)(0.708 * sin(2.0 * M_PI * b->hz * (double)f / RATE));
 }
 
 static OSStatus
@@ -118,10 +118,33 @@ static int
 play_hal(void)
 {
 	AudioObjectID dev = 0;
-	for (int i = 0; i < 30 && (dev = list(0)) == 0; i++)
+	for (int i = 0; i < 10 && (dev = list(0)) == 0; i++)
 		sleep(1);
+	if (dev == 0) {     /* run a12b: the device list read empty; ask by UID, then look at the default output device */
+		CFStringRef uid = CFSTR(UID_WANT);
+		AudioObjectID t = 0, def = 0;
+		UInt32 sz = sizeof t;
+		AudioValueTranslation vt = { &uid, sizeof uid, &t, sizeof t };
+		UInt32 vsz = sizeof vt;
+		OSStatus e1 = get(kAudioObjectSystemObject, kAudioHardwarePropertyDeviceForUID, kAudioObjectPropertyScopeGlobal, &vsz, &vt);
+		OSStatus e2 = get(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, &sz, &def);
+		CFStringRef dn = NULL, du = NULL;
+		UInt32 tr = 0, s2 = sizeof dn;
+		char nb[128], ub[128];
+		OSStatus e3 = get(def, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, &s2, &dn);
+		s2 = sizeof du;
+		OSStatus e4 = get(def, kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, &s2, &du);
+		s2 = sizeof tr;
+		get(def, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, &s2, &tr);
+		cfstr(dn, nb, sizeof nb);
+		cfstr(du, ub, sizeof ub);
+		printf("sweetaudio_play: hal: list empty; DeviceForUID err %d -> %u; default output %u (err %d) name '%s' (err %d) uid '%s' (err %d) "
+		    "transport '%c%c%c%c'\n", (int)e1, (unsigned)t, (unsigned)def, (int)e2, nb, (int)e3, ub, (int)e4, (char)(tr >> 24), (char)(tr >> 16),
+		    (char)(tr >> 8), (char)tr);
+		dev = e1 == 0 && t ? t : def;
+	}
 	if (dev == 0) {
-		printf("sweetaudio_play: hal: FAIL no device %s after 30 s\n", UID_WANT);
+		printf("sweetaudio_play: hal: FAIL no device %s after 10 s\n", UID_WANT);
 		return 1;
 	}
 	struct beeper b = { 660.0, 4, 0, (uint64_t)(4 * 0.6 * RATE), 0 };

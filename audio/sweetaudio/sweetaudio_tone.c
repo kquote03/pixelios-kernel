@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * sweetaudio_tone [SECONDS] [HZ] [BEEPS]: writes a sine (-10 dBFS PCM; the kernel gain, default -20 dB, makes it -30 dBFS), both channels, to /dev/sweetaudio, paced by the kernel FIFO.
+ * sweetaudio_tone [SECONDS] [HZ] [BEEPS]: writes a sine (-3 dBFS PCM; the kernel gain, default -15 dB since xnu patch 0181, makes it -18 dBFS), both channels, to /dev/sweetaudio, paced by the kernel FIFO.
  * BEEPS > 0: BEEPS x (0.5 s on, 0.5 s off) instead of a steady tone (SECONDS = BEEPS). Tests the kernel path without CoreAudio. Bounded: at most 10 s of audio, at most SECONDS + 2 s wall time, 1 ms sleeps.
  * Prints one result line: "sweetaudio_tone: done: N frames written, U underruns, O overruns" or "sweetaudio_tone: FAIL ...".
  */
@@ -40,10 +40,10 @@ main(int argc, char **argv)
 		close(fd);
 		return 1;
 	}
-	printf("sweetaudio_tone: info fifo %u start %u flags 0x%x max_gain %d mdB; %.2f s of %.0f Hz (%d beeps), -10 dBFS PCM\n", in.fifo_frames,
+	printf("sweetaudio_tone: info fifo %u start %u flags 0x%x max_gain %d mdB; %.2f s of %.0f Hz (%d beeps), -3 dBFS PCM\n", in.fifo_frames,
 	    in.start_frames, in.flags, in.max_gain_mdb, secs, hz, beeps);
 	const uint64_t total = (uint64_t)(secs * SWAU_RATE);
-	const double amp = 32768.0 * 0.316;    /* -10 dBFS PCM (kernel gain -20 dB by default) */
+	const double amp = 32768.0 * 0.708;    /* -3 dBFS PCM (kernel gain -15 dB by default, xnu patch 0181) */
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	const uint64_t deadline = mach_absolute_time() + (uint64_t)((secs + 2.0) * 1e9 * tb.denom / tb.numer);
