@@ -180,3 +180,18 @@ oriole shim build. 56dce35: those tests include a header copy with the bluejay r
 
 **Cooling:** after each Wi-Fi boot the fastboot storage temperature read 44-46 C and cooled slowly in fastboot (36-41 C after 20-30 min);
 xrun's S2 gate (< 38 C) held every boot. One pre-boot read of 45 C (wlan-up1b) was followed by 31-32 C reads seconds later.
+
+**Results (observed, kernel 820ba87b; rows wlan-up1c..up6-all, bt-up1):**
+- Wi-Fi: fw `RTE (PCIE-MSGBUF) 20.101.90 ... BCM4389 r3`, WLC_GET_VERSION + cap (up1c, sweetwlan=20). sweetwlan=23 stops at the escan
+  with BCME -26 (no CLM/country before L22c; up2). sweetwlan=24: CLM 12/12 chunks, country XZ, `scan done bss 17 channels 5`, join link
+  up (up3). sweetwlan=26 + sweetwlankeep=1 (DHCP credentials): station MAC tail ..:a5:b1, keys installed, en0 hand-over, `A80211 kept link
+  announced on en0`, iOS DHCP lease on en0 (pixping `iface en0 ready addr=192.168.2.x`), gateway ping 10/10 twice, wifid devices=1 (up4).
+- BT: patchram build 203 / hci_rev 0x20cb verified, VSC adapter on, LE scan 385 advertising reports in 20 s (rf witness), inquiry 3
+  results, stock bluetoothd alive with controller traffic (bt-up1). BT is on by default (0295); every boot of this kernel ran patchram.
+- Combined (audio blobs + wlanfw + compressed pixping overlay): payload 22.85 MB (sum of parts), boot line 689 B; both attempts (up5, up6)
+  stopped by the kept S1 battery-temperature check (46.1 / 46.8 C) after the Wi-Fi join, so audio + BT were not re-confirmed in that boot.
+- **Daily args** (on top of the audio daily args and xrun defaults): `sweetwlan=26 sweetwlankeep=1` + image flags `--wlan-hold --wlanfw
+  wlanfw-oriole.bin` + the WLANCRED blob (DHCP: network 2 keys, no IP/GW); BT needs no arg (0295 defaults: sweetbt, sweetbtkeepbaud,
+  sweetbtpatchram, sweetbtlefeat) but the kernel must carry the BCM.hcd stack. pixping/sweetnull are test-only.
+- Safety: `SAFETY_NO_COOLDOWN=<reason>` (3119ec2, user 2026-11-18) overrides S2 only. Back-to-back boots heated the phone: storage
+  44 -> 54 -> 57 C before boots, battery 46+ C at the start of the last two (S1 stop). Remaining: one combined boot with the battery < 45 C.
