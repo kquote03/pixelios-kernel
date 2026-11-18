@@ -94,3 +94,26 @@ Archives (deterministic): `ov-sa-driver.bin` sha256 `e84ca5a2...`, 6 files, 1000
    `sweetaudio:` lines followed by HAL errors in the tee.
 4. Clock drift / FIFO sizing (audible glitches only, not silence); v2 uses `SWAU_IOC_POS`.
 5. Kernel side: the device, the FIFO feed into `audio_playback0`, and the A-2/A-3 gain policy are not written yet (kernel lane).
+
+## 7. VirtualAudio routing (runs a12h-a12o, 2026-11-18)
+
+- *read from the binary* (VirtualAudio.plugin of the flashed root; strings + a disassembly annotated on the host, nothing copied
+  here): DeviceManager hands each HAL device to a factory keyed by the device UID string (`Codec`, `Baseband Voice`,
+  `USB Audio Output`, `USB IDAM`, `Voice`, `Reference`, `Speaker`, `AppleSongbirdDSP`, `Puffin*`, `Actuator`, `AOP Audio-1`,
+  `Digital Mic`, `Hawking`, `Halogen`, ..., `Squid Audio`); any other UID gets no VirtualAudio device (A12a-g: `PixOSSweetAudio:0`).
+- *observed* (a12i, VirtualAudio's own os_log via libsalog): with UID `Speaker` (transport `bltn`) VirtualAudio builds
+  `Device_Speaker` on SweetAudio.driver (hog mode, a tap input stream of its own, ports `pspk`, `pspr`, `pstp`), but the
+  default route (category csav, RoutingSettings_N71) stays on its `Null_Device`: computed while the ringer state reads off
+  (`Culling route connection because ringer switch is off`) or before the Speaker device exists, and kept afterwards
+  (`Redundant concrete route(s)`; port updates only look for a replacement when the current route is invalid). A restart of
+  mediaserverd after SpringBoard published the ringer state (a12j), an AVAudioSession Playback category from a command-line
+  client (a12k, still csav) and hiding Null_Device from 'dev#' reads (a12l, VirtualAudio never reads 'dev#' itself) did not
+  change it.
+- *observed* (a12n): VirtualAudio drives that route through a HAL aggregate (`VAD [vdef] AggDev 1`, 44.1 kHz, Null_Device as
+  sub-device) created with the public AudioDeviceCreateIOProcID. libsalog (`SALOG_TAP_NULL=1`) wraps that IOProc and writes the
+  final mix (after VirtualAudio's volume) to /dev/sweetaudio: AudioQueue, an AudioServices system sound and a boot-time system
+  sound reach the kernel (detector MOVED). This is the working path; it needs
+  `sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib,SALOG_TAP_NULL=1` (patches 0110 + 0106).
+- Limits [GUESS]: only `VAD [` aggregates are tapped (alternate VADs created later are tapped too, but two playing at once
+  would interleave in the FIFO); host clock vs AOC clock drift ends as rare FIFO drops; SweetAudio.driver's own device stays idle.
+- Debug: `SALOG_OSLOG=1` prints every os_log message of mediaserverd to stderr (`sweetnull=mediaserverd` tees it).
