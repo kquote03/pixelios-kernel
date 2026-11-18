@@ -82,11 +82,21 @@ def s4_state(st, now):
     return True, have + " (floors soc %.1f %%, vcell %d mV)" % (L.SOC_FLOOR, L.VCELL_MIN), False
 
 
+def no_cooldown():
+    """SAFETY_NO_COOLDOWN=<reason, >= 10 chars> (user 2026-11-18, oriole: boots back to back): S2 (the between-boot cool-down: storage
+    temperature / park state before a boot) passes with the reason printed. Only S2; the in-boot S1 battery-temperature stop and every other
+    item are unchanged. Unset (the default) = unchanged behaviour. Returns the reason or None."""
+    r = (os.environ.get("SAFETY_NO_COOLDOWN") or "").strip()
+    return r if len(r) >= 10 else None
+
+
 # ---- pre -------------------------------------------------------------------------------------------------------
 def pre_items(a, now):
     """[(id, ok, text)] of every pre item; plus the defer flags for the monitor."""
     items, st = [], L.load_state(a.state)
     ok2, t2, d2 = s2_state(st, now)
+    if not ok2 and no_cooldown():
+        ok2, t2 = True, "OVERRIDDEN by SAFETY_NO_COOLDOWN (%s): %s" % (no_cooldown(), t2)
     items.append(("S2", ok2, t2))
     try:
         kb = L.kernel_bytes(a.kernel)
@@ -263,7 +273,9 @@ def cmd_fastboot(a):
     except ValueError:   # lint-silent: expected a non-numeric value = unreadable, printed as the GAP of the S2 line below
         sc = None
     ok2, t2, _ = s2_state(st, now)
-    if sc is not None and sc >= L.COOL_C:
+    if sc is not None and sc >= L.COOL_C and no_cooldown():
+        res.append(("S2", True, "OVERRIDDEN by SAFETY_NO_COOLDOWN (%s): fastboot storage-temperature %.0f C >= %.1f C" % (no_cooldown(), sc, L.COOL_C)))
+    elif sc is not None and sc >= L.COOL_C:
         res.append(("S2", False, "fastboot storage-temperature %.0f C >= %.1f C (still cooling in fastboot)" % (sc, L.COOL_C)))
     elif sc is not None:
         res.append(("S2", True, "fastboot storage-temperature %.0f C < %.1f C (the newest reading; state: %s)" % (sc, L.COOL_C, t2)))
