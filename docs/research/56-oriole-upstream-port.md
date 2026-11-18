@@ -127,3 +127,29 @@ above apply unless Step 2 decides otherwise.)
 - Merge regression fixed: xrun again adds `sweetusblogport=$SWEET_USBLOG_PORT` (a66b72a).
 - Passing kernel `$A/kernels/kernel-up-7089e31f.sweet` (run up-reg3). One unexplained stop in up-reg2 (log ends ~+155 s,
   phone off USB 19 min, back in fastboot at 45 C storage temperature); not reproduced.
+
+## Step 5 GPU prep (2026-11-18, host only; nothing ran on the phone)
+
+- **libsweetgl.dylib** = upstream `tools/ci/mesa-panfrost-ios.yml.draft` stages 1, 2, 5 (3/4 are link tests, covered by stage 5's
+  checks): Mesa 26.2.5 tarball (sha256 794b3d17…, = the pin) + userland 13a4025 `mesa-patches` 0001-0008, `sweetgl-eagl`, `sweetgl-mali`.
+  Output `$A/gpu/up/out/libsweetgl.dylib`, 22567408 B, sha256 `8efaad3e3572c02c6ccecc5a1c0511d58bcbc9db2bd4314a1d8cada7bb85fe4e`; every
+  stage-5 check passes (platform iOS minos 16.0, arm64, system deps only, install name /usr/lib, 282 undefined all `(from …)`, the 13 symbols,
+  one export `_sweetgl_state`, constructor, ad-hoc signature). Host-setup deviations only (scripts `$A/gpu/up/scripts/`): NixOS + nix
+  llvm/clang 21.1.8 instead of macos-14/Xcode; an `llvm-config` wrapper reports a joined llvm+clang libdir (no Mesa patch); theos
+  iPhoneOS16.5.sdk + theos ld64 instead of xcrun's SDK; IOKit headers from that SDK (no MacOSX SDK); llvm-ar; ninja -j3; `ldid -S`
+  for `codesign -f -s -`; `otool -l` for `vtool`.
+- **Standard extra**: `$A/std-extras/manifest.tsv` + `usr/lib/libsweetgl.dylib` (intent gpu). `overlay_std.py prepare --intent gpu`
+  gives 2 files (the dylib + the standard launchd.plist), compressed archive 5460352 B. Payload = kernel 16929248 + 5460352 = 22.4 MB,
+  inside the 24.3 MB oriole has booted (PORT G5 ramp8); +aocf/ampfw would be 25.7 MB (unproven). After the first applied gpu boot the
+  ledger records the extra and later gpu runs do not carry it.
+- **Audio vs the std overlay**: the sweetaudio launchd job was only in overlay-written launchd.plists; ALWAYS_RESET has restored the
+  root's plist since up-reg1 (up-reg2: `skipped launchd.plist (identical)`). The installed HAL driver, VirtualAudio move, libsalog and
+  /usr/local/pixos are not ledger paths and are never touched. Old GPU files (/usr/local/lib/libsweetgl.dylib, gli-slots.txt,
+  sweetgl_once/selftest, /private/var/dev/ramp-*) are unused residue: no whiteout needed; optional 0280 cleanup overlay
+  `$A/gpu/up/ov-old-gpu-clean` (9 whiteout markers, audio paths excluded).
+- **Board deltas** (read from source + oriole PORT rows): sweetgpu 0x1C500000, GPU_ID/shader_present (observed oriole 2026-11-14),
+  sweetfvmap 0x206A000 (P0.1 oriole), recores 0x1e / cpus=5 / cpu order (gs101 DT), --dvfs maxima (oriole CPU fvmap rows equal),
+  G3D/G3DL2 DVFS pair rates (gs101 table), fb 1080x2400 stride 4320 (oriole board.json, equal), dot pitch 458 (an iPhone-class value,
+  not a panel measurement), nav-bench 1080x2400 coordinates: all SoC/iOS-generic. Per chip: the fvmap VOLTAGES of the clock-level
+  undervolt check -> board data `gpu_dvfs_uv` (commit 6f2b599; oriole unset until a gpu boot prints `SWEET FVMAP: dom 5|6 lv`).
+  Not checked on oriole: MIF fvmap rows (xrun `--mif-clk` top row 3172000), nav taps on this root's home-screen layout.
