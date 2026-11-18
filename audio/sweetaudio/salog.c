@@ -11,6 +11,7 @@
  */
 #include <CoreAudio/AudioHardware.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <os/log.h>
 #include <stdarg.h>
@@ -185,6 +186,119 @@ salog_get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qs, con
 	return r;
 }
 
+/* SALOG_TAP_NULL=1 (doc 54 s7, the fallback of the brief): VirtualAudio keeps its default route on Null_Device (runs a12i-l), and
+ * drives that device through the public AudioDeviceCreateIOProcID/AudioDeviceStart. Wrap every IOProc created on Null_Device: run
+ * VirtualAudio's proc, then take the final mixed output buffer, resample it linearly from the device's nominal rate to 48 kHz,
+ * convert to S16LE stereo and write() it non-blocking to /dev/sweetaudio (kernel FIFO; it drops what does not fit and plays silence
+ * when empty; gain and mute stay in the kernel). IO thread: no locks, no logging except a bounded stats line. */
+struct tap {
+	AudioDeviceIOProc proc;
+	void *ctx;
+	double step;          /* input frames per output frame */
+	double pos;           /* fractional read position into [last, buf...] */
+	float last[2];
+	uint64_t in_frames, out_frames, dropped, calls;
+};
+static int salog_tap = -1, tap_fd = -1;
+static int16_t tap_out[8192 * 2];
+
+static int
+tap_enabled(void)
+{
+	if (salog_tap < 0) {
+		const char *e = getenv("SALOG_TAP_NULL");
+		salog_tap = e && e[0] == '1';
+	}
+	return salog_tap;
+}
+
+static inline int16_t
+s16(float v)
+{
+	v *= 32767.0f;
+	return (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+}
+
+static OSStatus
+tap_proc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *it, AudioBufferList *out,
+    const AudioTimeStamp *ot, void *ctx)
+{
+	struct tap *t = ctx;
+	OSStatus r = t->proc(dev, now, in, it, out, ot, t->ctx);
+	if (out == NULL || out->mNumberBuffers == 0 || out->mBuffers[0].mData == NULL)
+		return r;
+	if (tap_fd < 0)
+		tap_fd = open("/dev/sweetaudio", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	const AudioBuffer *b0 = &out->mBuffers[0], *b1 = out->mNumberBuffers > 1 ? &out->mBuffers[1] : NULL;
+	UInt32 ch = b0->mNumberChannels ? b0->mNumberChannels : 1;
+	UInt32 n = b0->mDataByteSize / (4u * ch);
+	const float *p0 = b0->mData, *p1 = (b1 && b1->mData) ? b1->mData : NULL;
+	/* frame i, channel c (interleaved in buffer 0, or planar over buffers 0/1) */
+#define SMP(i, c) (ch >= 2 ? p0[(size_t)(i) * ch + (c)] : ((c) && p1) ? p1[(i)] : p0[(size_t)(i) * ch])
+	UInt32 k = 0;
+	while (k < 8192) {
+		double x = t->pos;            /* position in input frames, -1 .. n-1 (-1 = t->last) */
+		long i0 = (long)(x < 0 ? -1 : (long)x);
+		if (i0 + 1 >= (long)n)
+			break;
+		double f = x - (double)i0;
+		for (int c = 0; c < 2; c++) {
+			float a = i0 < 0 ? t->last[c] : SMP(i0, c), b = SMP(i0 + 1, c);
+			tap_out[2 * k + c] = s16(a + (float)f * (b - a));
+		}
+		k++;
+		t->pos += t->step;
+	}
+	if (n > 0) {
+		t->last[0] = SMP(n - 1, 0);
+		t->last[1] = SMP(n - 1, 1);
+	}
+#undef SMP
+	t->pos -= (double)n;      /* next buffer: index -1 is this buffer's last frame */
+	t->in_frames += n;
+	t->calls++;
+	if (tap_fd >= 0 && k > 0) {
+		ssize_t w = write(tap_fd, tap_out, (size_t)k * 4);
+		UInt32 took = w > 0 ? (UInt32)(w / 4) : 0;
+		t->out_frames += took;
+		t->dropped += k - took;
+	}
+	if (t->calls == 1 || t->calls % 2000 == 0) {
+		char m[200];
+		int l = snprintf(m, sizeof m, "valog[%d]: tap: call %llu, in %llu frames (%u ch, %u bufs), out %llu, dropped %llu, fd %d\n", getpid(),
+		    (unsigned long long)t->calls, (unsigned long long)t->in_frames, (unsigned)ch, (unsigned)out->mNumberBuffers,
+		    (unsigned long long)t->out_frames, (unsigned long long)t->dropped, tap_fd);
+		(void)write(2, m, (size_t)l);
+	}
+	return r;
+}
+
+static OSStatus
+salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioDeviceIOProcID *out)
+{
+	if (!tap_enabled() || proc == NULL || !is_null_device(dev))
+		return AudioDeviceCreateIOProcID(dev, proc, ctx, out);
+	struct tap *t = calloc(1, sizeof *t);
+	if (t == NULL)
+		return AudioDeviceCreateIOProcID(dev, proc, ctx, out);
+	Float64 rate = 0;
+	UInt32 sz = sizeof rate;
+	AudioObjectPropertyAddress a = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &rate) != 0 || rate < 8000 || rate > 192000)
+		rate = 48000;
+	t->proc = proc;
+	t->ctx = ctx;
+	t->step = rate / 48000.0;
+	t->pos = 0;
+	OSStatus r = AudioDeviceCreateIOProcID(dev, tap_proc, t, out);
+	char m[160];
+	int l = snprintf(m, sizeof m, "valog[%d]: tap: wrapped IOProc on Null_Device %u (rate %.0f -> 48000), status %d\n", getpid(), (unsigned)dev, rate, (int)r);
+	(void)write(2, m, (size_t)l);
+	if (r != 0)
+		free(t);
+	return r;
+}
+
 static bool
 salog_type_enabled(os_log_t log, os_log_type_t type)
 {
@@ -196,6 +310,7 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct { const
 	{ (const void *)salog_os_log_impl, (const void *)_os_log_impl },
 	{ (const void *)salog_type_enabled, (const void *)os_log_type_enabled },
 	{ (const void *)salog_get, (const void *)AudioObjectGetPropertyData },
+	{ (const void *)salog_create_ioproc, (const void *)AudioDeviceCreateIOProcID },
 };
 
 __attribute__((constructor)) static void
