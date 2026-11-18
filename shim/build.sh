@@ -641,11 +641,14 @@ else
 	sed 's/^#define ACPM_LAYOUT_VERIFIED 1$/#define ACPM_LAYOUT_VERIFIED 0/' $O/board_config.h > $O/board_config_l0.h
 	sed 's/^#define ACPM_ELEM_UNIT_VERIFIED 1$/#define ACPM_ELEM_UNIT_VERIFIED 0/' $O/board_config.h > $O/board_config_u0.h
 	GCLK="gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DGPU_CLK -I."
-	chk "gpuclk_host_test (compile)" $GCLK -I$O -include $O/board_config.h -o $O/gpuclk_host_test gpuclk_host_test.c
+	# the three gpuclk tests below cite bluejay's observed fvmap voltages (runs nav20, g0b; tools/boards.py _GPU_DVFS_UV): their copy of the board header carries
+	# those rows, so the undervolt logic is still tested on a board without observed rows of its own (oriole: no gpu_dvfs_uv yet, GPU_CLK_UVS all 0)
+	sed 's/^#define GPU_CLK_UVS .*$/#define GPU_CLK_UVS { 775000, 756250 }, { 775000, 718750 }, { 775000, 700000 }, { 731250, 662500 }/' $O/board_config.h > $O/board_config_uv.h
+	chk "gpuclk_host_test (compile)" $GCLK -I$O -include $O/board_config_uv.h -o $O/gpuclk_host_test gpuclk_host_test.c
 	chk "gpuclk_host_test" $O/gpuclk_host_test
-	chk "gpuclk_level_host_test (compile)" $GCLK -DGPU_CLK_LEVEL=3 -I$O -include $O/board_config.h -o $O/gpuclk_level_host_test gpuclk_host_test.c
+	chk "gpuclk_level_host_test (compile)" $GCLK -DGPU_CLK_LEVEL=3 -I$O -include $O/board_config_uv.h -o $O/gpuclk_level_host_test gpuclk_host_test.c
 	chk "gpuclk_level_host_test" $O/gpuclk_level_host_test
-	chk "gpuclk_level1_host_test (compile)" $GCLK -DGPU_CLK_LEVEL=1 -I$O -include $O/board_config.h -o $O/gpuclk_level1_host_test gpuclk_host_test.c	# sprint-gpu: the booted level 1 (stock max)
+	chk "gpuclk_level1_host_test (compile)" $GCLK -DGPU_CLK_LEVEL=1 -I$O -include $O/board_config_uv.h -o $O/gpuclk_level1_host_test gpuclk_host_test.c	# sprint-gpu: the booted level 1 (stock max)
 	chk "gpuclk_level1_host_test" $O/gpuclk_level1_host_test
 	chk "gpuclk_gate_l_host_test (compile)" $GCLK -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpuclk_gate_l_host_test gpuclk_host_test.c
 	chk "gpuclk_gate_l_host_test" $O/gpuclk_gate_l_host_test
