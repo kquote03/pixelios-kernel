@@ -153,3 +153,30 @@ above apply unless Step 2 decides otherwise.)
   not a panel measurement), nav-bench 1080x2400 coordinates: all SoC/iOS-generic. Per chip: the fvmap VOLTAGES of the clock-level
   undervolt check -> board data `gpu_dvfs_uv` (commit 6f2b599; oriole unset until a gpu boot prints `SWEET FVMAP: dom 5|6 lv`).
   Not checked on oriole: MIF fvmap rows (xrun `--mif-clk` top row 3172000), nav taps on this root's home-screen layout.
+
+## Step 3 Wi-Fi / Step 4 Bluetooth (2026-11-18; rows in device/google/oriole/docs/PORT.md)
+
+**Board deltas: none.** Read from oriole's live DT (`$A/ref/oriole/20261114T072643Z/dt`): PCIe1 reg blocks (DBI 0x14800000, ELBI
+0x14520000, PMA 0x14550000, PCS 0x14540000, cfg 0x60FFE000), PERST gph2-0, WLAN_EN gpp14-2 and their pinctrl (perst func 1 drv 3;
+clkreq gph2-1 func 2 pud 3 drv 3; cfg_wlanen func 1) equal `soc.json` wlan and the pinned `wlan_seq.json` rows; the shim wlan files are
+unchanged from wip/oriole-next (which reached fw ready on oriole). BT: shutdown gpp16-2, device-wakeup gpp14-3, host-wakeup gpa6-6,
+serial@175B0000 uart16-bus gpa3-0..3 func 2 = the SBU_* constants of upstream 0189. Nothing moved to board.json. *observed (DT capture)*
+
+**Firmware identity (patch 0396, `sweet-wlan-fw-ident-oriole`).** `swl_fwids[]` {model, len, crc}: bluejay 1764018 / 0x1153ccff (row 0,
+also any other/missing model), oriole 1764091 / 0x92567396, chosen by the ADT root `model-number`; `swl_wx.pin_len/pin_crc` feed the
+W14 checks (0 = stop). `SWW_RAM_MIN` 1791226 -> 1791299 (+73 B): `SWW_IMG_MAX` 1764091, 441023 words, `SWW_IMG_END` 0x3AEAFC. NVRAM
+(oriole bcmdhd.cal 24552 B, varsize 21388) and CLM (15976 B = 12 chunks <= 12 x 1400) needed no change. Tests: upstream's
+`wlan_wr_host_test` / `test_wlan_wr_mutants.py` stay on the header through 0174 (bluejay pins unchanged); new
+`shim/wlan_fwid_host_test.c` (header + the 0396 hunk) covers oriole (row choice, bounds, swl_fw_pin both ways, no bus access).
+Container `$A/wlan-fw/wlanfw-oriole.bin` (pack_wlanfw: FW 1764091 crc 0x92567396, NVRM 24552 crc 0x35ffab80, CLM 15976 crc 0x1205970c;
+1804688 B, identical to the old pack). BT: oriole's vendor `BCM.hcd` sha256 = 450f8c66… = upstream's pinned stock hash, so
+`tools/bcm-hcd-stack --hcd $A/bt-fw/BCM.hcd --out $A/scratch/hcd-stack-up` works unchanged (no second hash needed).
+
+**Kernel** `$A/kernels/kernel-up-820ba87b.sweet` (0001-0396 + local `9000-sweet-bt-hcd-image.patch`), sha256
+820ba87b9246d5081a89ca0f9a2dfe175f7c5c00c38410305baf608139a13e90, 17404424 B.
+
+**Host fix on the way:** 6f2b599 (GPU prep) made `GPU_CLK_UVS` per board; oriole has none, so `gpuclk_host_test` level 1/3 failed in every
+oriole shim build. 56dce35: those tests include a header copy with the bluejay rows they cite.
+
+**Cooling:** after each Wi-Fi boot the fastboot storage temperature read 44-46 C and cooled slowly in fastboot (36-41 C after 20-30 min);
+xrun's S2 gate (< 38 C) held every boot. One pre-boot read of 45 C (wlan-up1b) was followed by 31-32 C reads seconds later.
