@@ -195,3 +195,44 @@ xrun's S2 gate (< 38 C) held every boot. One pre-boot read of 45 C (wlan-up1b) w
   sweetbtpatchram, sweetbtlefeat) but the kernel must carry the BCM.hcd stack. pixping/sweetnull are test-only.
 - Safety: `SAFETY_NO_COOLDOWN=<reason>` (3119ec2, user 2026-11-18) overrides S2 only. Back-to-back boots heated the phone: storage
   44 -> 54 -> 57 C before boots, battery 46+ C at the start of the last two (S1 stop). Remaining: one combined boot with the battery < 45 C.
+
+## Step 5 GPU (2026-11-18; rows gpu-o-up1, gpu-o-up2 in device/google/oriole/docs/PORT.md)
+
+**Result: upstream's GPU stack draws oriole's UI with no oriole-specific code change** (*observed*, kernel `$A/kernels/kernel-up-820ba87b.sweet`,
+sha256 820ba87b9246d5081a89ca0f9a2dfe175f7c5c00c38410305baf608139a13e90; libsweetgl.dylib 8efaad3e via the std extra, first applied in gpu-o-up1).
+The old oriole failure (black framebuffer, refused `b3a8` IOSurface formats) did not occur: format-0 surfaces are accepted
+(`sweetgl: ABGR8 ... swizzle wzyx`); framebuffer geometry from board.json was right as is.
+
+- **gpu-o-up1** (pair 3 = G3D 572 / G3DL2 750 MHz, no MIF request, CPU dvfs read only): `sweetgl: SweetMali user client open` +41.7 s,
+  `EAGLContext swizzles installed` +41.8 s, `SWEET FB: display on` +47.6 s, first `SWEET FB: hash changed` +47.8 s, **GPU-drawn lock screen
+  (SBCoverSheet) at +54 s** after `fastboot boot`, `SWEET FPS: swaps 36 distinct 36`, touch scanning +81 s. Nav bench ran (`SWEET NAV: done`
+  +307 s): gpu-fps-bench v2.1 `fps_min=25.6 (app-launch) fps_pooled=43.6 low1_min=7.5`; fps-wholerun pooled 15.4 (includes idle spans).
+  `general-open` / `about-open` never animated (0/3): the fixed Settings > General tap does not match this root's Settings list, so
+  gpu-nav-score FAILs on coverage; every other action animated 3/3 (the home-screen taps do match).
+- **gpu-o-up2** (upstream defaults: pair 1 = 762 / 996 MHz, MIF 3172000, CPU maxima, cpus 5): GPU path identical (`display on` +44.7 s,
+  lock screen +48 s, `SWEET FPS: swaps 61 distinct 61`), then **stopped by S1 at the 55 C ceiling** (55.3 C, ~+220 s) before the nav bench
+  finished. The boot started hot (first kernel thermal sample 54.0 C, X1-DROP) because it followed up1 with no cool-down.
+- **Oriole fvmap voltages** (sweetfvmap boot, gpu-o-up1): G3D 848000/737500, 762000/700000, 701000/681250, 572000/650000; G3DL2 996000/750000,
+  885000/750000, 750000/712500 (uV) = 12.5-37.5 mV below the bluejay unit. Now board data `gpu_dvfs_uv` (05c1b11).
+- **Safety**: S1 override `SAFETY_BATT_TEMP_MAX` (7c7f61c, oriole only, (45, 55] C, logged by the monitor; also fixes the
+  `fb_storage_ok` mutant needle that 3119ec2 broke). The kernel's own backstop (patch 0336) already parks at 55 C on two samples; X1 drop at 48 C.
+  Temperatures: fastboot storage 50-63 C between boots; battery 47.5 -> 49.4 C (up1), 54.0 -> 55.3 C (up2).
+- Camera: none on this host, runs use `--no-camera` (no screen frames; the fb hash is the picture witness; picture correctness = the user's look).
+- Known upstream defects (components/gpu.md): search magnifier glyph and a dark band in Spotlight; 60 fps not reached on every step
+  (slowest 51.6 at boost on bluejay); no Metal; no idle GPU power-down.
+
+**Combined run (GPU + audio + Wi-Fi + BT): NOT RUN** (ladder stopped at the 55 C ceiling, as instructed). Prepared command (the daily
+configuration; WLANCRED from a 0600 temp env under `$A/scratch` with `PIXOS_ENV_FILE=<it> PIXOS_WIFI_NET=2`, wifi.env `SSID`/`PSK` mapped to
+`PIXOS_WIFI2_SSID`/`_PSK`, `PIXOS_WIFI2_SECURITY=wpa2-psk`, deleted afterwards). A wlan-intent run, because xrun builds the WLANCRED blob only
+for `--intent wlan`; the GPU flags are given explicitly and the dylib (already on userdata, ledger extra) is not re-sent:
+
+    SWEET_USBLOG_PORT=64738 SAFETY_NO_COOLDOWN=... SAFETY_BATT_TEMP_MAX=55 XRUN_NO_RUNPLAN=... tools/xrun --board oriole \
+      --kernel $A/kernels/kernel-up-820ba87b.sweet --cpus 8 --intent wlan --gpu-handover --gpu-clk-level 1 --mif-clk --gui --no-camera \
+      --aocfw $A/aoc/aocf.bin --ampfw $A/amp/ampfw.bin --wlan-hold --wlanfw $A/wlan-fw/wlanfw-oriole.bin \
+      --overlay $A/scratch/pixping-ov/tree --compress --restart 640,bootloader --lock-wait 600 --label wlan-gpu-o-all1 \
+      --args 'sweetaoc=15 sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib,SALOG_TAP_NULL=1;backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/libsweetgl.dylib,SWEETGL_BOCUT=1,SWEETGL_BOPOOL=1,SWEETGL_FLUSHT=1,SWEETGL_SPLITHEAP=1,SWEETGL_OVERLAP=1 sweetmali=1 sweetmaliirq=1 sweetmaliovl=1 sweetmalipend=3 sweetmalicache=2 sweetmalipoll=20 sweetfps=2 sweetfbhash=1 sweetwlan=26 sweetwlankeep=1 sweetnull=devd,backboardd,SpringBoard,pixping,pixopen,pixnet'
+
+Boot line 978 B (`--print-bootargs`, limit 2048). Payload (sum of parts, as wlan-up5-all): kernel 17404424 + aocf 3296808 + ampfw 41768 +
+wlanfw 1804688 + pixping overlay ~280192 (compressed) + ADT 22252 + WLANCRED 128 = ~22.85 MB (no GPU dylib). cpus 8 without the gpu
+X1-first cpu order / sweetrecores (gpu intent only) is untested with the GPU. For the daily image drop the test-only parts (pixping overlay,
+pixping/pixopen/pixnet in sweetnull, sweetfps, sweetfbhash). Run it with the battery well below 55 C, or the S1 ceiling stops it again.
