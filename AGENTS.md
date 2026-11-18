@@ -35,6 +35,9 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
 User exception (2026-11-18, oriole audio bring-up only): the pre-run review and the amp-enable precondition are lifted. Still
 required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS sample clamp, patch 0394), never touch the haptics amp.
 
+User instructions (2026-11-18, oriole runs): no cool-down waits between boots (`SAFETY_NO_COOLDOWN=<reason>` overrides the S2 storage
+gate only); the in-boot battery ceiling may be raised with `SAFETY_BATT_TEMP_MAX` to at most 55 C (never higher).
+
 ## Commands
 
 | Task | Command |
@@ -46,6 +49,10 @@ required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS
 | Kernel CI (macOS runner, ~8 min) | `gh workflow run xnu.yml` then `gh run download <id> -n xnu-kernel` |
 | Device helper | `tools/pix devices|info|check|build|new-device` |
 | Oriole speaker audio (build, run, how it works) | `audio/sweetaudio/build.sh driver+va`, then `tools/xrun ... --args 'sweetaoc=15 sweetenv=...'`: see `docs/research/55-oriole-audio-howto.md` |
+| Oriole Wi-Fi join (upstream stack) | `tools/xrun --board oriole --intent wlan --wlan-hold --wlanfw $A/wlan-fw/wlanfw-oriole.bin --args 'sweetwlan=26 sweetwlankeep=1'` + WLANCRED env: see `docs/research/56-oriole-upstream-port.md` (Step 3) |
+| Oriole Bluetooth | on by default in a kernel with the BCM.hcd stack (`tools/bcm-hcd-stack`): see doc 56 (Step 4) |
+| Oriole GPU UI | `tools/xrun --board oriole --intent gpu --gpu-clk-level 3 ...` (libsweetgl std extra): see doc 56 (Step 5) |
+| Oriole combined run / daily image (audio + Wi-Fi + BT + GPU) | see doc 56 (Step 7: command, daily boot-args, image build and flash) |
 | Reverse-engineering container | `tools/rea/rea.sh` (offline) / `tools/rea/rea-phone.sh` (phone access) |
 
 `tools/check-all.sh` rebuilds default images and overwrites `shim/out/*.img`: rebuild with the flags you need right

@@ -1,9 +1,9 @@
-# 56: oriole on the upstream release 2026-11-15 (Step 1: merge, host only)
+# 56: oriole on the upstream release 2026-11-15 (Steps 1-7: merge, Wi-Fi, BT, GPU, daily image 5)
 
 Branch `wip/oriole-upstream` (kernel) = `wip/oriole-next` (33af822, audio daily image 4) + `origin/main` f084ce5
 ("PixOS release 2026-11-15", bluejay Wi-Fi/BT/GPU, patches up to 0368). Userland: `pixelios-userland`
 `wip/oriole-upstream` = `wip/catalog-contiguous` (836bdc6) + `origin/main` d5b2079. Plan: `~/.claude/plans/bubbly-pondering-rabbit.md`.
-All claims below are *read from source* / host results unless marked otherwise; nothing here ran on the phone.
+Step 1 sections are *read from source* / host results; the Step 2-7 sections are marked observed per run.
 
 ## Patch renumber map (old -> new)
 
@@ -236,3 +236,61 @@ Boot line 978 B (`--print-bootargs`, limit 2048). Payload (sum of parts, as wlan
 wlanfw 1804688 + pixping overlay ~280192 (compressed) + ADT 22252 + WLANCRED 128 = ~22.85 MB (no GPU dylib). cpus 8 without the gpu
 X1-first cpu order / sweetrecores (gpu intent only) is untested with the GPU. For the daily image drop the test-only parts (pixping overlay,
 pixping/pixopen/pixnet in sweetnull, sweetfps, sweetfbhash). Run it with the battery well below 55 C, or the S1 ceiling stops it again.
+
+## Step 7: combined run, daily image 5 (2026-11-19; rows in device/google/oriole/docs/PORT.md)
+
+**Cool-down first** (user 2026-11-18, one time): the phone came out of gpu-o-up2 at 65 C storage / 56.4 C battery. In recovery (battery sysfs
+readable, backlight set to 0 in RAM) it reached 39.7 C after ~40 min (23:29 -> 00:08 +04); no further cool-down waits after that.
+
+**Results (observed, kernel 820ba87b, git d044311):**
+- **wlan-gpu-o-all1** (the prepared command with `--gpu-clk-level 3`, no `--mif-clk`, `--restart 480,bootloader`): GPU UI (sweetgl open +77 s,
+  fb hash changing, lock screen +91 s), touch +98 s, `/dev/sweetaudio up` +84 s, Wi-Fi join +71 s + DHCP +86 s + gateway ping 10/10 twice,
+  BT patchram build 203 + bluetoothd, battery published (RepSOC 84 %), no panic, battery 39.5 -> 41.3 C. No sound reached /dev/sweetaudio.
+- **daily-verify5-full / daily-verify6-full** (tethered boots of the daily candidates): same pass list; verify6 = the flashed image.
+- **wlan-gpu-o-all2** (audio proof, test overlay running `sweetaudio_play both` every 90 s): AudioQueue beeps -> restarted mediaserverd
+  (libsalog tap) -> `dev open pid 280` -> amps on, detector MOVED; AudioServices sound completes. Battery 46.2 -> 49.9 C.
+- **Nothing had to be dropped**: GPU, audio, Wi-Fi and BT coexist in one boot (shared `sweetenv` holds both injections, `;`-separated;
+  cpus 8; payload below the limit).
+
+**Integration findings:**
+- *Boot chime*: the up-reg2/3 "chime" was the iOS charge sound, triggered because SweetBattery still showed the static `external=1` when
+  SpringBoard started; with Wi-Fi/BT/GPU SpringBoard starts later (+91 s) than the RepSOC publish (+82 s, `external=0`), so no sound plays
+  at boot. Not an audio fault (all2), but `external=0` while on USB is a battery-publish gap (open item).
+- *Std overlay vs the audio boot job*: upstream's overlay_std puts the root's own launchd.plist back on every boot (ALWAYS_RESET), which
+  removed doc 55's `org.pixelios.sweetaudio` job (ringer kick). The daily image now carries its own overlay: root launchd.plist (sha
+  7aab4ecb) + that one job (`tools/mk_launchd_job.py --job sweetaudio`), plus the std whiteouts of the pix* test tools (from all1's overlay).
+- *Thermal backstop with cpus=8*: patch 0336's X1 drop (>= 48 C) applies mask 0x18 = logical cpus 3,4; with the default /cpus order that
+  is one A55 + one A76, so the drop leaves 2 cores (GAP lines say so). It throttles harder than intended but works (all2 at 48-49.9 C).
+- *Secrets*: tools/xrun's cred_clean removes `shim/out/shim-boot-avb.img` but not the build intermediates `shim-boot-lz4-avb.img`,
+  `shim-boot-lz4.img`, `shim-boot.img`, `ramdisk.bin`, which hold the payload with the WLANCRED blob after a credential build; deleted by
+  hand after these runs (upstream gap, not fixed here).
+
+**Daily configuration (daily image 5)** = audio daily args + Wi-Fi/BT/GPU, xrun defaults, no test-only parts (no nav bench, no pixping
+overlay, no sweetrestart, no sweetnull, no sweetfps/sweetfbhash):
+
+    image flags: --board oriole --cpus 8 --rw --rails --gui --usbnet --gpu-handover --gpu-clk-level 3 --wlan-hold
+                 --wlanfw wlanfw-oriole.bin --aocfw aocf.bin --ampfw ampfw.bin --wlancred <blob, net 2 DHCP>
+                 --overlay <root launchd.plist + org.pixelios.sweetaudio, 5 pix* whiteouts>
+    args: sweetaoc=15 sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib,SALOG_TAP_NULL=1;backboardd:
+          DYLD_INSERT_LIBRARIES=/usr/lib/libsweetgl.dylib,SWEETGL_BOCUT=1,SWEETGL_BOPOOL=1,SWEETGL_FLUSHT=1,SWEETGL_SPLITHEAP=1,SWEETGL_OVERLAP=1
+          sweetmali=1 sweetmaliirq=1 sweetmaliovl=1 sweetmalipend=3 sweetmalicache=2 sweetmalipoll=20 sweetwlan=26 sweetwlankeep=1
+          + xrun implicit: sweetremote=1 sweetwdt=60 sweetchgi2c=1 sweetchgicl=900 sweetepoch=<build time> sweetusblogport=64738 (+ board touch keys)
+
+Cooler choices (no functional cost observed): GPU pair 3 (572/750 MHz; gpu-o-up1: fps-bench pooled 43.6) instead of pair 1, no MIF request,
+no CPU dvfs request, cpus 8 (the count audio/Wi-Fi/BT were verified with; cpus 5 + X1-first order would make 0336's mask exact but is untested
+with audio/Wi-Fi and was not worth a boot of the budget). `sweetepoch` is the build time (the clock starts there on every boot; guess:
+network time corrects it later). Boot line 864 B (limit 2048). Payload: kernel 17404424 + aocf 3296808 + ampfw 41768 + wlanfw 1804688 +
+overlay archive 802816 + ADT ~22 KB + WLANCRED 128 = ~23.37 MB (oriole booted 24.3 MB before). Image `$A/boot-backup/boot_b-ios-daily-820ba87b-full.img`,
+sha256 ce54aa752daa045b07006f15c9266f1f867b01475afeebed47f049fd93e89caf, built by `$A/scratch/oriole-all/daily-build.sh` (not in git: it handles
+the credential env). It contains the user's Wi-Fi password and stays under ~/pixelios-artifacts.
+
+**Temperatures:** all1 39.5 -> 41.3 C (480 s), verify5 40.4 -> 40.6 C, verify6 42.3 -> 44.7 C (330 s), all2 46.2 -> 49.9 C (420 s, back-to-back);
+fastboot storage 44-58 C between boots. Idle lock screen in the full config heats the battery ~0.3-0.6 C/min on USB 2 (charger held at 500 mA).
+
+**Open items:**
+- Nav bench: the fixed Settings > General tap does not match this root's Settings list (gpu-o-up1: general-open/about-open 0/3).
+- Battery publish `external=0 charging=0` on USB (no charge indicator, no charge sound); USB 2 port keeps CNFG_09 at 500 mA.
+- Gate: `tools/check-all.sh` prints `GATE FAIL validate`; the failing lane is the clang-tidy ratchet, identical on pure upstream f084ce5.
+- up-reg2 silent stop (log ends ~+155 s, phone off USB 19 min, back in fastboot at 45 C storage): not reproduced, cause unknown.
+- 0336 X1-drop mask with cpus=8 (see above); no panic log region (pram) in the ADT.
+- Only the user can judge: picture correctness (no camera), sound by ear, Settings > Wi-Fi / Bluetooth UI.
