@@ -32,6 +32,9 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
    (stop/restore path, bounded waits, cited constants); the verdict is a few lines in the commit message. Then commit
    and push. No reviewer agents, review rounds or review files unless the user asks.
 
+User exception (2026-11-18, oriole audio bring-up only): the pre-run review and the amp-enable precondition are lifted. Still
+required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS sample clamp, patch 0182), never touch the haptics amp.
+
 ## Commands
 
 | Task | Command |
@@ -42,6 +45,7 @@ The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, dire
 | Build an XNU boot image | `tools/mkadt.py` -> `tools/mkpayload.py` -> `shim/build.sh --boot-xnu PAYLOAD` (see `docs/`) |
 | Kernel CI (macOS runner, ~8 min) | `gh workflow run xnu.yml` then `gh run download <id> -n xnu-kernel` |
 | Device helper | `tools/pix devices|info|check|build|new-device` |
+| Oriole speaker audio (build, run, how it works) | `audio/sweetaudio/build.sh driver+va`, then `tools/xrun ... --args 'sweetaoc=15 sweetenv=...'`: see `docs/research/55-oriole-audio-howto.md` |
 | Reverse-engineering container | `tools/rea/rea.sh` (offline) / `tools/rea/rea-phone.sh` (phone access) |
 
 `tools/check-all.sh` rebuilds default images and overwrites `shim/out/*.img`: rebuild with the flags you need right

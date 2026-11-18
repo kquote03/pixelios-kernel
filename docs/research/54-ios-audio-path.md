@@ -117,3 +117,4 @@ Archives (deterministic): `ov-sa-driver.bin` sha256 `e84ca5a2...`, 6 files, 1000
 - Limits [GUESS]: only `VAD [` aggregates are tapped (alternate VADs created later are tapped too, but two playing at once
   would interleave in the FIFO); host clock vs AOC clock drift ends as rare FIFO drops; SweetAudio.driver's own device stays idle.
 - Debug: `SALOG_OSLOG=1` prints every os_log message of mediaserverd to stderr (`sweetnull=mediaserverd` tees it).
+- How-to, boot-args, levels and limits after the polish pass (a12p, 2026-11-18): doc 55.
