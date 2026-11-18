@@ -276,6 +276,30 @@ class MonitorUnit(unittest.TestCase):
         m.feed(1012, MON % "45.0")
         self.assertTrue(m.check(1013).startswith("SAFETY FAIL S1"))
 
+    def test_s1_override(self):
+        """SAFETY_BATT_TEMP_MAX (user 2026-11-18): oriole only, (45, 55] C, logged; bluejay/default/out of range keep 45 C."""
+        env = dict(os.environ)
+        try:
+            for board, val, want in (("oriole", "55", 55.0), ("oriole", "50.5", 50.5), ("oriole", "56", 45.0), ("oriole", "45", 45.0),
+                                     ("oriole", "x", 45.0), ("bluejay", "55", 45.0), ("", "55", 45.0), ("oriole", "", 45.0)):
+                os.environ["BOARD"], os.environ["SAFETY_BATT_TEMP_MAX"] = board, val
+                lim, note = L.hot_limit()
+                self.assertEqual(lim, want, (board, val, note))
+                self.assertEqual(note is None, val == "", (board, val, note))
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+        m = self.mon(hot_c=55.0)
+        m.feed(1010, MON % "45.0")
+        self.assertEqual(m.check(1011), "")
+        self.assertTrue(m.notes and "OVERRIDDEN" in m.notes[0], m.notes)
+        m.feed(1012, MON % "54.9")
+        self.assertEqual(m.check(1013), "")
+        m.feed(1014, MON % "55.0")
+        self.assertEqual(m.check(1015), "SAFETY FAIL S1: battery temp 55.0 C >= 55.0 C")
+        self.assertEqual(self.mon(hot_c=60.0).hot_c, 55.0)   # never above the ceiling
+        self.assertEqual(self.mon(hot_c=40.0).hot_c, 45.0)   # never below the default
+
     def test_s3(self):
         m = self.mon()
         m.feed(1010, P3)

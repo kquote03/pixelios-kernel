@@ -29,7 +29,8 @@ CALL CONTRACT (tools/xrun does all of it for every boot it makes; tools/resident
   `fastboot boot` until the boot ends; its stop file ends the boot: park in fastboot (software reset, tools/phone goto fastboot). 4. an S6 stop
   or a park that fails: notify at once, mark the run HUMAN-NEEDED. 5. every caller uses the SAME --state DIR (default
   $ARTIFACTS/safety = ~/pixelios-artifacts/safety): the next boot's S2/S4 read what the last boot left. A resident job between boots may read
-  `status`; it never boots without pre. Thresholds are the checklist's; there is no override flag for S1-S6 (raise a limit only with the user).
+  `status`; it never boots without pre. Thresholds are the checklist's; no override flag for S1-S6 except the user's (2026-11-18, oriole):
+  SAFETY_NO_COOLDOWN=<reason> (S2) and SAFETY_BATT_TEMP_MAX=<C, 45 < C <= 55> (S1, BOARD=oriole only, logged by the monitor).
 SIM SEAM: SAFETY_TBOOT_BACKDATE=S (monitor: the boot started S s earlier; sandbox only, tools/simseams.py require). SAFETY_FASTBOOT=PATH (the
   fastboot binary of the fastboot mode; sandbox only). Exit: 0 PASS, 1 FAIL, 2 usage/error.
 """
@@ -97,6 +98,8 @@ def pre_items(a, now):
     ok2, t2, d2 = s2_state(st, now)
     if not ok2 and no_cooldown():
         ok2, t2 = True, "OVERRIDDEN by SAFETY_NO_COOLDOWN (%s): %s" % (no_cooldown(), t2)
+    if d2 and no_cooldown():   # the deferred S2 (first temp row < COOL_C, in-boot) is the same cool-down rule: overridden too; S1 still applies
+        d2, t2 = False, "OVERRIDDEN by SAFETY_NO_COOLDOWN (%s), first-row check off: %s" % (no_cooldown(), t2)
     items.append(("S2", ok2, t2))
     try:
         kb = L.kernel_bytes(a.kernel)
@@ -318,10 +321,13 @@ def cmd_monitor(a):
         except FileNotFoundError:   # lint-silent: expected no stale stop file, the normal case
             pass
     st = L.update_state(a.state, boot_at=t_boot, end_at=None, end_why=None)
-    m = L.Monitor(t_boot, defer_s2=bool(st.get("defer_s2")), defer_s4=bool(st.get("defer_s4")), p3_temp=bool(st.get("p3_temp")))
+    hot_c, hot_note = L.hot_limit()
+    m = L.Monitor(t_boot, defer_s2=bool(st.get("defer_s2")), defer_s4=bool(st.get("defer_s4")), p3_temp=bool(st.get("p3_temp")), hot_c=hot_c)
     term = []
     signal.signal(signal.SIGTERM, lambda *_: term.append(1))
-    out("SAFETY MONITOR: start log=%s t_boot=%.0f defer_s2=%s defer_s4=%s p3_temp=%s state=%s" % (a.log, t_boot, m.defer_s2, m.defer_s4, m.p3_temp, a.state))
+    out("SAFETY MONITOR: start log=%s t_boot=%.0f defer_s2=%s defer_s4=%s p3_temp=%s s1_limit=%.1f state=%s" % (a.log, t_boot, m.defer_s2, m.defer_s4, m.p3_temp, m.hot_c, a.state))
+    if hot_note:
+        out("SAFETY MONITOR: " + hot_note)
     pos, buf, cleared = 0, b"", False
     while True:
         now = time.time()
@@ -358,6 +364,8 @@ def cmd_monitor(a):
         ids = usb_ids(sysfs)
         m.usb(now, "1209" in ids, "18d1" in ids)
         why = m.check(now)
+        while m.notes:
+            out(m.notes.pop(0))
         if why:
             with open(stop, "w") as f:
                 f.write(why + "\n")

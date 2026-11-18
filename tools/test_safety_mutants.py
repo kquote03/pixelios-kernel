@@ -68,7 +68,7 @@ CLI_MUTANTS = [
     ("pre_fail_exit0", "    if bad:\n        out(\"RESULT: FAIL safety-check pre", "    if False:\n        out(\"RESULT: FAIL safety-check pre"),
     ("fb_product_ok", '    if prod != want:', "    if False:"),
     ("fb_vcell_ok", "    if mv is not None and mv < L.VCELL_MIN:", "    if False:"),
-    ("fb_storage_ok", "    if sc is not None and sc >= L.COOL_C:", "    if False:"),
+    ("fb_storage_ok", "    elif sc is not None and sc >= L.COOL_C:", "    elif False:"),
     ("fb_seam_free", '        simseams.require_sandbox(["SAFETY_FASTBOOT"])', "        pass"),
     ("mon_seam_free", '        simseams.require_sandbox(["SAFETY_TBOOT_BACKDATE"])', "        pass"),
     ("mon_no_stopfile", "            with open(stop, \"w\") as f:\n                f.write(why + \"\\n\")", "            pass"),

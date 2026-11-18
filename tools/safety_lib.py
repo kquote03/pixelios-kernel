@@ -2,13 +2,15 @@
 safety and comply with it, then enforce that"). Library of tools/safety-check (CLI), tools/xrun_report.py (waitusb stop + report) and the host
 tests tools/test_safety_check.py / tools/test_safety_mutants.py. stdlib only.
 
-Thresholds are the checklist's; there is no override flag or environment value for S1-S6 (raise a limit only with the user).
+Thresholds are the checklist's; no override for S1-S6 except the user's (2026-11-18, oriole only): SAFETY_NO_COOLDOWN (S2, tools/safety-check)
+and SAFETY_BATT_TEMP_MAX (S1, hot_limit(): at most HOT_OVERRIDE_MAX_C = 55 C).
 State (shared by every caller, default $ARTIFACTS/safety = ~/pixelios-artifacts/safety): state.json {temp_c, temp_at, soc, vcell, batt_at,
 hot, hot_why, hot_at, low, low_why, boot_at, end_at, end_why, defer_s2, defer_s4}; human-needed.log (one line per HUMAN-NEEDED stop).
 """
 import json, os, re, statistics, subprocess, time
 
 HOT_C = 45.0          # S1: battery temp at or above = stop + park
+HOT_OVERRIDE_MAX_C = 55.0   # S1 override ceiling (SAFETY_BATT_TEMP_MAX, oriole only, user 2026-11-18); = the kernel's own CRIT park (patch 0336 TH_CRIT_DC 550)
 COOL_C = 38.0         # S2: next boot only below this
 COOL_PARK_S = 900     # S2: >= 15 min parked when there is no reading
 TEMP_GAP_S = 60       # S3: no temp= row for longer than this while booted = hot
@@ -215,12 +217,33 @@ def median3(vals):
     return statistics.median(vals[-3:]) if vals else None
 
 
+def hot_limit():
+    """(S1 limit C, note or None). SAFETY_BATT_TEMP_MAX=<C> (user 2026-11-18, oriole GPU/combined runs: "dont tell agents to wait for the phone to
+    cool down"): on BOARD=oriole only, a value in (HOT_C, HOT_OVERRIDE_MAX_C] raises the in-boot S1 stop to it; anything else (unset, another
+    board incl. the bluejay default, not a number, out of range) keeps HOT_C and says why. Never above HOT_OVERRIDE_MAX_C."""
+    r = (os.environ.get("SAFETY_BATT_TEMP_MAX") or "").strip()
+    if not r:
+        return HOT_C, None
+    board = os.environ.get("BOARD") or "bluejay"
+    if board != "oriole":
+        return HOT_C, "SAFETY_BATT_TEMP_MAX=%s IGNORED: board %s (the override is oriole only); S1 stays %.1f C" % (r, board, HOT_C)
+    try:
+        v = float(r)
+    except ValueError:
+        return HOT_C, "SAFETY_BATT_TEMP_MAX=%r IGNORED: not a number; S1 stays %.1f C" % (r, HOT_C)
+    if not HOT_C < v <= HOT_OVERRIDE_MAX_C:
+        return HOT_C, "SAFETY_BATT_TEMP_MAX=%s IGNORED: outside (%.1f, %.1f] C; S1 stays %.1f C" % (r, HOT_C, HOT_OVERRIDE_MAX_C, HOT_C)
+    return v, "S1 OVERRIDE: SAFETY_BATT_TEMP_MAX=%.1f C (oriole, user 2026-11-18; default %.1f C, ceiling %.1f C)" % (v, HOT_C, HOT_OVERRIDE_MAX_C)
+
+
 class Monitor:
     """Live S1/S3/S4/S6 of one boot. feed(epoch, text) per console line (epoch = host arrival time), check(now) -> '' or 'SAFETY FAIL ...'.
     usb(now, gadget_on_bus, fastboot_on_bus) per poll: the iOS gadget leaving the bus starts the reset wait (RESET_BACK_S)."""
 
-    def __init__(self, t_boot, defer_s2=False, defer_s4=False, p3_temp=False):
+    def __init__(self, t_boot, defer_s2=False, defer_s4=False, p3_temp=False, hot_c=HOT_C):
         self.t_boot = t_boot
+        self.hot_c = max(HOT_C, min(hot_c, HOT_OVERRIDE_MAX_C))   # S1 limit: HOT_C unless hot_limit() raised it (never above the ceiling)
+        self.hot_said = None
         self.p3_temp = p3_temp   # the kernel prints temp= in the P3 rows (patch 0334): no blind window, S3 counts from the first USB log line
         self.first_line = self.last_line = None
         self.first_temp = self.last_temp_at = self.last_temp = None
@@ -258,7 +281,11 @@ class Monitor:
 
     def check(self, now):
         if self.last_temp is not None and self.last_temp >= HOT_C:
-            return "SAFETY FAIL S1: battery temp %.1f C >= %.1f C" % (self.last_temp, HOT_C)
+            if self.last_temp >= self.hot_c:
+                return "SAFETY FAIL S1: battery temp %.1f C >= %.1f C" % (self.last_temp, self.hot_c)
+            if self.hot_said is None or int(self.last_temp) > self.hot_said:   # logged once per whole degree above HOT_C
+                self.hot_said = int(self.last_temp)
+                self.notes.append("SAFETY S1 OVERRIDDEN: battery temp %.1f C >= %.1f C, below the SAFETY_BATT_TEMP_MAX limit %.1f C" % (self.last_temp, HOT_C, self.hot_c))
         if self.defer_s2 and self.first_temp is not None and self.first_temp >= COOL_C:
             return "SAFETY FAIL S2: first battery temp of this boot %.1f C >= %.1f C (the boot was admitted on a fastboot reading or a park time only)" % (self.first_temp, COOL_C)
         if self.defer_s4 and self.socs and self.socs[0] < SOC_FLOOR:
