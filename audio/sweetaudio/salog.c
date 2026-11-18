@@ -159,6 +159,21 @@ is_null_device(AudioObjectID id)
 	return r;
 }
 
+/* the device VirtualAudio actually runs IO on: its HAL aggregate ("VAD [vdef] AggDev 1", transport grup; run a12m: no IOProc is ever
+ * created on Null_Device itself, the aggregate holds it as sub-device) */
+static int
+is_tap_device(AudioObjectID id)
+{
+	AudioObjectPropertyAddress u = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	CFStringRef s = NULL;
+	UInt32 sz = sizeof s;
+	if (AudioObjectGetPropertyData(id, &u, 0, NULL, &sz, &s) != 0 || s == NULL)
+		return 0;
+	int r = CFStringHasPrefix(s, CFSTR("VAD [")) || CFStringCompare(s, CFSTR("Null_Device"), 0) == kCFCompareEqualTo;
+	CFRelease(s);
+	return r;
+}
+
 static OSStatus
 salog_get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qs, const void *qd, UInt32 *io, void *out)
 {
@@ -276,7 +291,7 @@ tap_proc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in
 static OSStatus
 salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioDeviceIOProcID *out)
 {
-	if (!tap_enabled() || proc == NULL || !is_null_device(dev))
+	if (!tap_enabled() || proc == NULL || !is_tap_device(dev))
 		return AudioDeviceCreateIOProcID(dev, proc, ctx, out);
 	struct tap *t = calloc(1, sizeof *t);
 	if (t == NULL)
@@ -292,7 +307,7 @@ salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioD
 	t->pos = 0;
 	OSStatus r = AudioDeviceCreateIOProcID(dev, tap_proc, t, out);
 	char m[160];
-	int l = snprintf(m, sizeof m, "valog[%d]: tap: wrapped IOProc on Null_Device %u (rate %.0f -> 48000), status %d\n", getpid(), (unsigned)dev, rate, (int)r);
+	int l = snprintf(m, sizeof m, "valog[%d]: tap: wrapped IOProc on device %u (rate %.0f -> 48000), status %d\n", getpid(), (unsigned)dev, rate, (int)r);
 	(void)write(2, m, (size_t)l);
 	if (r != 0)
 		free(t);
