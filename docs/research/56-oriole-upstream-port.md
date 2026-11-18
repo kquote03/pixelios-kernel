@@ -117,3 +117,13 @@ oriole; not renamed.
 
 (+ `XRUN_USERDATA_BYPASS="..."` if `$A/flashed-userdata.txt` does not end in an iOS root flash line; the charger defaults
 above apply unless Step 2 decides otherwise.)
+
+## Step 2 results (2026-11-18, observed; rows in device/google/oriole/docs/PORT.md)
+
+- boot_b = boot_b-orig.img again (2869bc43…). Charger path matches bluejay on oriole's live DT (HSI2C12 0x10D50000, slaves
+  0x25/0x36/0x66/0x69, gpp23-4/5 func 2 pull 3); upstream's charger code only reads gpp23. Upstream's charger args stay on;
+  on a USB 2 (480 Mb/s) port P3 refuses the CNFG_09 write (stays 500 mA, net discharge ~0.1-0.4 A).
+- batt-publish re-seated as **0395** (`sweet-batt-gauge-publish`): SweetBattery publishes FG RepSOC (84-88 % observed).
+- Merge regression fixed: xrun again adds `sweetusblogport=$SWEET_USBLOG_PORT` (a66b72a).
+- Passing kernel `$A/kernels/kernel-up-7089e31f.sweet` (run up-reg3). One unexplained stop in up-reg2 (log ends ~+155 s,
+  phone off USB 19 min, back in fastboot at 45 C storage temperature); not reproduced.
