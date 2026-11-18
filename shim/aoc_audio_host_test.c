@@ -372,6 +372,35 @@ t_parser_stock(void)
 	}
 }
 
+/* patch 0172: the tone pattern: 3 x 1 s of the 48-sample sine, 1 s apart, then silence; never above 1036 (-30 dBFS); L = R */
+static void
+t_tone(void)
+{
+	uint32_t f, on = 0, peak = 0;
+
+	for (f = 0; f < SWAU_TONE_FRAMES + 48000u; f++) {
+		uint32_t w = swau_tone_word(f);
+		int16_t l = (int16_t)(w & 0xFFFFu), r = (int16_t)(w >> 16);
+		uint32_t a = (uint32_t)(l < 0 ? -l : l);
+
+		CHECK(l == r, "tone frame %u: L %d != R %d", f, l, r);
+		CHECK(((f / 48000u) & 1u) || f >= SWAU_TONE_FRAMES || l == swau_sine48[f % 48u], "tone frame %u: not the sine", f);
+		CHECK(!(((f / 48000u) & 1u) || f >= SWAU_TONE_FRAMES) || w == 0u, "tone frame %u: not silent", f);
+		on += w != 0u;
+		peak = a > peak ? a : peak;
+	}
+	CHECK(peak == 1036u, "tone peak %u", peak);
+	CHECK(on == 3u * 48000u - 3u * 2u * 1000u, "tone non-zero frames %u", on);	/* 2 zero crossings per 48 samples */
+	CHECK(swau_tone_word(12u) == (1036u | 1036u << 16), "tone frame 12");
+	{
+		struct swau_res rr = { 0 };
+		struct swau_bus bb = { 0 };
+
+		swau_tone(&bb, &rr, 1);
+		CHECK(!rr.pb.tone, "tone not switched on before the stream started");
+	}
+}
+
 int
 main(void)
 {
@@ -393,6 +422,7 @@ main(void)
 	t_play_refuse();
 	t_parser_synthetic();
 	t_parser_stock();
+	t_tone();
 	printf("%s: %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
 	return fails != 0;
 }

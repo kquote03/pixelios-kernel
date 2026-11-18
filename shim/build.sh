@@ -627,7 +627,7 @@ else
 	# a 4th field names a later patch whose hunk for the same file is applied on top (0165 extends sweet_tipc.h); 0165 adds the A8 start (bsd/dev/sweet_aoc_start.h)
 	# 0166 (A9) changes sweet_aoc_start.h (the ssmt kept count) and adds sweet_audio.h (AOC queue I/O + commands) and sweet_cs_dsp.h (HALO file parser, read by aoc_audio_host_test)
 	awk '$0=="+++ b/bsd/dev/sweet_cs_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0166-aoc-audio.patch > $O/sweet_cs_dsp.h
-	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test:0165-aoc-start" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0165-aoc-start:sweet_aoc_start.h:aoc_start_host_test:0166-aoc-audio" "0166-aoc-audio:sweet_audio.h:aoc_audio_host_test:0167-aoc-playback+0168-aoc-reply-match"; do
+	for hp in "0161-aoc-pre:sweet_aoc.h:aoc_pre_host_test" "0162-trusty-tipc:sweet_tipc.h:tipc_host_test:0165-aoc-start" "0164-aoc-load:sweet_aoc_load.h:aoc_load_host_test" "0165-aoc-start:sweet_aoc_start.h:aoc_start_host_test:0166-aoc-audio" "0166-aoc-audio:sweet_audio.h:aoc_audio_host_test:0167-aoc-playback+0168-aoc-reply-match+0172-amp-tone"; do
 		IFS=: read -r hpp hph hpt hpx <<<"$hp"
 		awk -v f="+++ b/bsd/dev/$hph" '$0==f{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/$hpp.patch > $O/$hph
 		for px in ${hpx//+/ }; do     # several later patches joined by + are applied in order (0168 ../xnu/patches/0168-aoc-reply-match.patch on top of 0167)
@@ -663,6 +663,10 @@ else
 	# patch 0169 (sweetaoc=6) extends it again (DSP allowlist, bursts, the A9e hook) and adds sweet_amp_dsp.h (HALO load / start / stop; needs sweet_cs_dsp.h of 0166, extracted above)
 	awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0169-amp-dsp-load.patch > $O/ampx/p3.diff
 	chk "amp_xnu_host_test: 0169-amp-dsp-load applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p3.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
+	# patch 0172 (sweetaoc=7) extends it again (the armed power words, PWR_CTRL1 only through them, the A10 hook) and adds sweet_amp_pwr.h
+	awk -v f="diff --git a/bsd/dev/sweet_amp.h b/bsd/dev/sweet_amp.h" '$0==f{on=1;print;next} on&&/^diff --git/{exit} on{print}' ../xnu/patches/0172-amp-tone.patch > $O/ampx/p4.diff
+	chk "amp_xnu_host_test: 0172-amp-tone applied to sweet_amp.h" sh -c "cd $O/ampx && patch -s -p1 --no-backup-if-mismatch < p4.diff && cp bsd/dev/sweet_amp.h ../sweet_amp.h"
+	awk '$0=="+++ b/bsd/dev/sweet_amp_pwr.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0172-amp-tone.patch > $O/sweet_amp_pwr.h
 	awk '$0=="+++ b/bsd/dev/sweet_amp_dsp.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0169-amp-dsp-load.patch > $O/sweet_amp_dsp.h
 	# patch 0170 (A9f) changes sweet_amp_dsp.h: bursts of <= 480 bytes, the failure detail line
 	rm -rf $O/ampd && mkdir -p $O/ampd/bsd/dev && cp $O/sweet_amp_dsp.h $O/ampd/bsd/dev/sweet_amp_dsp.h

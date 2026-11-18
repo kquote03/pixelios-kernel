@@ -975,7 +975,7 @@ static void unit_writes(void)
 	}
 	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 2u << 6, 0x04u, 0, 0, 2, 0x47Cu, 0) && w32_allowed(R_TX, 3u << 6, 0x7Cu, 0, 0, 2, 0x47Cu, 0), "armed OTP_MEM31 read frame");
 	CHECK(!w32_allowed(R_TX, 3u << 6, 0x80u, 0, 0, 2, 0x47Cu, 0) && !w32_allowed(R_TX, 6u << 6, 0x00u, 0, 0, 2, 0x47Cu, 0), "armed read: another byte / a seventh byte refused");
-	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2018u, 0), "armed read of an unlisted register refused");
+	CHECK(!w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x480u, 0) && !w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x201Cu, 0), "armed read of an unlisted register refused");	/* patch 0172: PWR_CTRL2 0x2018 is read now; PWR_CTRL3 is not */
 	CHECK(w32_allowed(R_TX, 0u << 6, 0x80u, 0, 0, 2, 0x2014u, 0), "patch 0166: PWR_CTRL1 may be READ (GLOBAL_EN must read 0), never written");
 	CHECK(!w32_allowed(R_PKT, 0, 10u, 0, 0, 2, 0x400u, 0) && !w32_allowed(R_CH, 0, CH_TX | CH_RX, 10u << 6, 0, 2, 0x400u, 0), "an armed read never sends a write frame");
 	CHECK(w32_allowed(R_CH, 0, CH_TX | CH_RX, 6u << 6, 0, 2, 0x400u, 0), "an armed read sends its 6-byte frame");
@@ -1180,7 +1180,7 @@ static void dsp_cfg(int with_fw)
 static void dsp_run(int with_fw)
 {
 	reset_hw(); dsp_cfg(with_fw); tick_need = 20; tick_bad = 0;
-	amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 1 };
+	amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 1, NULL };
 }
 static int dsp_go(void)
 {
@@ -1374,7 +1374,7 @@ static void dsp_tests(void)
 		c[100] ^= 1;
 		reset_hw(); dsp_cfg(0); tick_need = 20; tick_bad = 0;
 		CHECK(amp_dsp_container(c, o, &amp_dsp_fw_in) == 0, "container");
-		amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 1 };
+		amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 1, NULL };
 		rc = dsp_go();
 		CHECK(rc == 0 && violations == 0 && has("SWEET AMP DSP: fw loaded l,r (id 400a4 rev 1d00), halo running l,r"), "stock files: pass line");
 		CHECK(amp_dsp_res.a[0].hb_reg == 0x2800784u && amp_dsp_res.a[0].cd_xm == 0x94u && amp_dsp_res.a[0].cd_ym == 0x0eu && amp_dsp_res.a[0].regions == 6u &&
@@ -1562,7 +1562,7 @@ int main(void)
 		CHECK(!amp_write_ok(0x3810u, 0x32u) && !amp_write_ok(0x2C04u, 0x510u), "unarmed A9 register refused");
 		printf("ok: A9 allowlist (rows armed one at a time, PWR_CTRL1 0x2014 never writable)\n");
 
-		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
+		reset_hw(); amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0, NULL }; rc = amp_init_run();
 		a9ok = rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && amp_a9_res.opened && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked;
 		CHECK(a9ok, "A9 good: run passes, opened once, closed once, PLL locked l,r");
 		CHECK(violations == 0, why_v);
@@ -1578,27 +1578,27 @@ int main(void)
 		CHECK(restored_exact(), "A9: the same restore (resets low, every word back)");
 		printf("ok: A9 good: %u / %u A9 writes, PLL locked l,r, AOC open + close once, restore exact\n", amp[0].a9_nwr, amp[1].a9_nwr);
 
-		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
+		reset_hw(); pll_never = 1; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0, NULL }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !amp_a9_res.a[0].locked && !amp_a9_res.a[1].locked && amp_a9_res.a[0].polls == 100u &&
 		      amp_a9_res.a[1].polls == 100u && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "PLL never locks: 100 polls each, closed, restored");
 		printf("ok: A9 PLL never locks (bounded 100 x 1 ms per amp, AOC closed, restore exact)\n");
 
-		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
+		reset_hw(); a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0, NULL }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !amp_a9_res.opened && amp_a9_res.a[0].polls == 0u && a9_closes == 1 && restored_exact(), "AOC open refused: no PLL poll, close called, restored");
 		printf("ok: A9 AOC open refused (no PLL poll, close still called)\n");
 
-		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
+		reset_hw(); amp[1].a9v[10] = 1u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0, NULL }; rc = amp_init_run();
 		CHECK(violations == 0 && amp_a9_res.a[0].cfg && !amp_a9_res.a[1].cfg && amp[1].a9_nwr == 0 && a9_opens == 0 && restored_exact(), "GLOBAL_EN found set on R: no R write, no AOC open");
 		printf("ok: A9 GLOBAL_EN found set: no write to that amp, no AOC open\n");
 
-		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0 }; rc = amp_init_run();
+		reset_hw(); amp[0].st1 = 0x40u; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open, cb_close, NULL, NULL, 0u, 0, NULL }; rc = amp_init_run();
 		CHECK(violations == 0 && amp[0].a9_nwr == 0 && amp[1].a9_nwr == 0 && a9_opens == 0, "error bit (H8): no A9 write, no open");
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 		printf("ok: A9 amp error bit: no TDM config, no AOC open\n");
 	}
 	/* ---- patch 0167 (sweetaoc=5): joint L/R poll <= 500 x 1 ms with a tick per ms, st3 snapshots, close on every path ---- */
 	{
-		reset_hw(); tick_need = 20; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0 }; rc = amp_init_run();
+		reset_hw(); tick_need = 20; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0, NULL }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && a9_opens == 1 && a9_closes == 1 && !tick_bad && amp_a9_res.a[0].locked && amp_a9_res.a[1].locked,
 		      "A9 play: locked l,r after the stream clocks, opened once, closed once, ticks inside");
 		CHECK(a9_ticks == 20 && amp_a9_res.a[0].polls == 20u && amp_a9_res.a[1].polls == 20u, "joint poll stops at the lock (20 ticks, 20 polls each)");
@@ -1607,22 +1607,32 @@ int main(void)
 		      "st3 line, PLL lines, restore exact, PWR_CTRL1 untouched");
 		printf("ok: A9 play: joint poll locks at tick 20, AOC closed once, restore exact\n");
 
-		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0 }; rc = amp_init_run();
+		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0, NULL }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && !tick_bad && a9_ticks == 500 && amp_a9_res.a[0].polls == 500u && amp_a9_res.a[1].polls == 500u &&
 		      !amp_a9_res.a[0].locked && a9_closes == 1 && has("a9 pll NOT locked") && restored_exact(), "never clocks: 500 joint polls, closed, restored");
 		CHECK(amp_a9_res.a[1].snap[4] == amp_a9_res.a[1].st3 && amp_a9_res.a[1].snap[0] == amp_a9_res.a[1].st3, "snapshots @1 and @500 taken");
 		printf("ok: A9 play: never clocks (bounded 500 x 1 ms joint, AOC closed, restore exact)\n");
 
-		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 9999u, 0 }; rc = amp_init_run();
+		reset_hw(); tick_need = 0; tick_bad = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 9999u, 0, NULL }; rc = amp_init_run();
 		CHECK(a9_ticks == 500 && amp_a9_res.a[0].polls == 500u && a9_closes == 1, "polls above 500 clamped to 500");
 		printf("ok: A9 play: poll bound clamped to 500\n");
 
-		reset_hw(); tick_need = 1; tick_bad = 0; a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0 }; rc = amp_init_run();
+		reset_hw(); tick_need = 1; tick_bad = 0; a9_open_ret = 0; amp_a9_cb = (struct amp_a9_cb){ 1, cb_open5, cb_close, NULL, cb_tick, 500u, 0, NULL }; rc = amp_init_run();
 		CHECK(rc == 0 && violations == 0 && a9_ticks == 0 && !amp_a9_res.opened && a9_closes == 1 && restored_exact(), "play open failed: no tick, close called");
 		printf("ok: A9 play: open failed (no tick, close still called)\n");
 		amp_a9_cb = (struct amp_a9_cb){ 0 };
 	}
 	dsp_tests();	/* patch 0169 */
+	/* patch 0172: PWR_CTRL1 and the power words pass only while armed for exactly that pair; never a DSP / init pair through the arm */
+	CHECK(!amp_write_ok(AMP_REG_PWR_CTRL1, 1u), "PWR_CTRL1 refused unarmed");
+	amp_pwr_row.on = 1; amp_pwr_row.reg = AMP_REG_PWR_CTRL1; amp_pwr_row.val = 1u;
+	CHECK(amp_write_ok(AMP_REG_PWR_CTRL1, 1u), "PWR_CTRL1 := 1 passes armed");
+	CHECK(!amp_write_ok(AMP_REG_PWR_CTRL1, 3u), "PWR_CTRL1 other value refused armed");
+	CHECK(!amp_write_ok(AMP_PWR_SPE, 1u), "another register refused while PWR_CTRL1 armed");
+	amp_pwr_row.reg = 0x4C50u; amp_pwr_row.val = 0x99u;
+	CHECK(!amp_write_ok(0x4C50u, 0x99u), "a non-power register refused even armed");
+	amp_pwr_row.on = 0; amp_pwr_row.reg = amp_pwr_row.val = 0;
+	CHECK(!amp_write_ok(AMP_REG_PWR_CTRL1, 1u) && !amp_write_ok(AMP_PWR_CTRL2, 1u), "refused again after the arm");
 	if (fails) {
 		printf("amp_xnu_host_test: %u FAILED\n", fails);
 		return 1;

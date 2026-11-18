@@ -12,6 +12,7 @@ PATCH_MATCH = ROOT / "xnu/patches/0168-aoc-reply-match.patch"
 PATCH_DSP = ROOT / "xnu/patches/0169-amp-dsp-load.patch"	# patch 0169 (sweetaoc=6): sweet_amp.h hunk + the new sweet_amp_dsp.h	# patch 0168: sweet_audio.h reply matching (id not compared, as stock)
 PATCH_CHUNK = ROOT / "xnu/patches/0170-amp-dsp-chunk.patch"	# patch 0170 (A9f): sweet_amp_dsp.h bursts of <= 480 bytes + failure detail
 PATCH_MPU = ROOT / "xnu/patches/0171-amp-dsp-mpu.patch"	# patch 0171 (A9g): MPU read-back logged, relock after a failed MPU write, detail lines
+PATCH_TONE = ROOT / "xnu/patches/0172-amp-tone.patch"	# patch 0172 (A10): sweet_amp.h power words + sweet_amp_pwr.h, sweet_audio.h tone
 TEST_AUDIO = ROOT / "shim/aoc_audio_host_test.c"
 TEST = ROOT / "shim/amp_xnu_host_test.c"
 
@@ -125,12 +126,13 @@ def header_dsp() -> str:
 
 def header_a9() -> str:
     """The 0158 header with the sweet_amp.h hunks of patches 0166 and 0167 applied on top."""
-    return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY, PATCH_DSP])
+    return apply(header(), "sweet_amp.h", [PATCH_A9, PATCH_PLAY, PATCH_DSP, PATCH_TONE])
 
 
 def run(hdr: str, d: pathlib.Path) -> bool:
     (d / "sweet_amp.h").write_text(hdr)
     (d / "sweet_amp_otp.h").write_text(header("sweet_amp_otp.h"))
+    (d / "sweet_amp_pwr.h").write_text(header("sweet_amp_pwr.h", PATCH_TONE))
     (d / "sweet_cs_dsp.h").write_text(header("sweet_cs_dsp.h", PATCH_A9))
     if not (d / "sweet_amp_dsp.h").exists() or not getattr(run, "dsp_mut", False):
         (d / "sweet_amp_dsp.h").write_text(header_dsp())
@@ -165,7 +167,7 @@ def sweep(good: str, mutants, runner, d: pathlib.Path):
 
 def main() -> int:
     good = header_a9()
-    good_audio = apply(header("sweet_audio.h", PATCH_A9), "sweet_audio.h", [PATCH_PLAY, PATCH_MATCH])
+    good_audio = apply(header("sweet_audio.h", PATCH_A9), "sweet_audio.h", [PATCH_PLAY, PATCH_MATCH, PATCH_TONE])
     with tempfile.TemporaryDirectory() as td:
         d = pathlib.Path(td)
         if not run(good, d) or not run_audio(good_audio, d):
