@@ -39,7 +39,7 @@ CF=(--target=arm64-apple-ios16.0 -isysroot "$SDK" -miphoneos-version-min=16.0 -O
 "$CLANG" "${CF[@]}" -Wno-deprecated-declarations -framework CoreFoundation -framework CoreAudio -framework AudioToolbox -o "$OUT/sweetaudio_play" "$HERE/sweetaudio_play.c"
 for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play"; do ldid -S "$f"; done
 python3 -I - "$OUT/SweetAudio.driver/Info.plist" <<'EOF'
-import plistlib, sys
+import os, plistlib, sys
 FACTORY = "7F3C2A61-5B0E-4E57-9C1D-0A5E1D6B9F42"           # ours (random); type = kAudioServerPlugInTypeUUID
 pl = {"CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "SweetAudio", "CFBundleIdentifier": "org.pixelios.audio.SweetAudio",
       "CFBundleInfoDictionaryVersion": "6.0", "CFBundleName": "SweetAudio", "CFBundlePackageType": "BNDL",
@@ -47,7 +47,7 @@ pl = {"CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "SweetAudio", "CF
       "MinimumOSVersion": "16.0", "UIDeviceFamily": [1], "UIRequiredDeviceCapabilities": ["arm64"],
       "CFPlugInFactories": {FACTORY: "SweetAudio_Create"},
       "CFPlugInTypes": {"443ABAB8-E7B3-491A-B985-BEB9187030DB": [FACTORY]},
-      "SweetAudioTransportType": "usb ", "SweetAudioName": "PixOS Speaker"}
+      "SweetAudioTransportType": os.environ.get("SWEETAUDIO_TRANSPORT", "usb "), "SweetAudioName": "PixOS Speaker"}
 open(sys.argv[1], "wb").write(plistlib.dumps(pl, fmt=plistlib.FMT_XML))
 EOF
 # symbol + link checks (gpu/ios/check-sdk-symbols.py: every undefined symbol resolves against the SDK .tbd files)
