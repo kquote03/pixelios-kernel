@@ -493,3 +493,34 @@ No bench args (sweetnav*, sweetfps, sweetfb_copytime/drawn) in the daily image. 
 40.3 C at nav end (+320 s), 40.5 C at +616 s (state NORMAL in every 10 s sample; the host listener stopped at +640 s when the step agent was
 stopped, the phone reset itself at +780 s). Well below 48 C, so the fastest configuration measured is also the daily one; no hotter/cooler choice
 was needed. Not tried: GPU pair 1, CPU dvfs raises, MIF top row (not needed for the panel ceiling; upstream saw resets at top clocks).
+
+## Step 12: Safari black page, daily image 9 (2026-11-19; rows safari-*, daily-verify11@, daily image 9 in device/google/oriole/docs/PORT.md)
+
+User report on daily image 8: "Safari only renders a black screen". Plan woolly-floating-parrot step 2 (6 boots) + 3. Details and evidence: doc 57 s.6.
+
+- **Cause found** (*observed*): Safari's chrome is composited; the page backing stores WebKit's GPU process draws are IOSurface **'w30r'**
+  (CoreGraphics CIF10: x2 R10 G10 B10, extended range) and libsweetgl sampled them as B10G10R10A2_UNORM: alpha = the two zero pad bits, so the
+  page tiles blend away to the black window, and the colour values would be biased (384..894). `WKCPU=bitmap` (WebKit's own switch, doc 57 s.3)
+  does not change that. Sel 44 and Metal are not involved for page drawing.
+- **Fix (userland d0ff1a4, libsweetgl 2fc47f4b on userdata)**: W30R rule in `eagl_mesa.c` (CPU remap copy, alpha 1, render-target and reused-name
+  guards). Runs in every boot since safari-w30r-lean without a regression (UI, unlock, bench, audio, BT). **Not proven on screen**: the one clean
+  Safari picture (safari-w30r-full, guest join failed, 3 s after launch) is still black; the evidence boot was lost to a silent USB-log stop.
+  The user's eyes decide; doc 57 s.6 lists the next boot.
+- **Payload**: the dylib cannot ride in a full-configuration image (~28.1 MB, oriole limit between 24.3 and 28 MB): it is delivered by a LEAN run
+  and stays on userdata (ledger 2fc47f4b); daily images do not carry it. A later `--intent gpu` run restores the std extra 8efaad3e (no W30R rule).
+- **Daily image 9** = daily image 8 (guest-network blob, audio with the 3 s AOC wait, pixos-bluetool, 3 dB volume keys, 0397 charger) on kernel
+  1c843b0c with the Step 11 set (cpus 5 X1-first ADT, MIF 1352, `--gui --fb-hz 60`, gate/fifo/gatekick, recores 0x1e, malicfg, vsync 17172,
+  REALFLUSH, overlay ov-free without CA_BACKDROP_SCALE); libsweetgl 2fc47f4b from userdata. Built by `$A/speed/daily-build9.sh` (not in git:
+  credential env); boot line 995 B. Image `$A/boot-backup/boot_b-ios-daily-8a9cde0a-full5.img`, sha256
+  8a9cde0aa60b8598a02ff7bb48b1109eb2ef8d84cbc6c7456fb62cc82fffda66.
+- **daily-verify11-full** (tethered, exact file, 784 s): sweetgl +73 s, display on +78 s, lock screen +82 s, `/dev/sweetaudio up` +81 s, connect
+  sound `dev open pid 28` +83 s, touch +101 s, bluetoothd +71 s, patchram 203 +111 s, fuel gauge +85 s, MIF `421000 -> 1352000`; **battery 37.1 C
+  (+75 s) -> 38.4 C (+616 s) -> 38.8 C (end)**, state NORMAL, no panic. **Wi-Fi: no lease** (`L23 STOP event cap 48 reached`: the scan filled its
+  event cap before the target BSS; same in daily-verify12-full). The same kernel, blob and args joined and leased in speed-cpus5 / speed-final10
+  and image 8 has the same Wi-Fi code, so this is the open-network join gap at a crowded location (3 of 7 speed boots, safari-bitmap, -full),
+  not a property of image 9. fps spot-check: the daily image has no bench args; the identical set measured 58.5 pooled in speed-final10.
+- **Flashed**: daily image 9 to boot_b after daily-verify11/12-full (product oriole, slot b, 67108864 B): `Sending 'boot_b' (65536 KB) OKAY`,
+  `Writing 'boot_b' OKAY`. Phone left in fastboot. Undo / fallback: image 8 (`boot_b-ios-daily-255ccd52-full4-guest.img`).
+- **For the user's eyes**: Safari page area (open a simple page while the guest network is joined; Settings > Wi-Fi shows it); scrolling feel
+  (58 fps class on most steps; Settings launch is the slowest step at ~47); sound, BT, volume keys as in image 8; Wi-Fi joins at boot only
+  when the guest network wins the scan (L23 event cap gap at crowded places, open item).

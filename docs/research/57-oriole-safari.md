@@ -100,3 +100,33 @@ MobileSafari process instead.
 
 Open: whether tiles are deep colour on this port (UIScreen gamut from MobileGestalt), whether Safari's chrome shows, whether
 cfprefsd honours unmanaged-device managed prefs (only matters for the fallback).
+
+## 6. Results on the phone (2026-11-19, Step 2 of plan woolly-floating-parrot; rows safari-* in device/google/oriole/docs/PORT.md)
+
+Boots: 6 of 6 (budget). Kernel 1c843b0c, the Step 11 daily set (cpus 5 X1-first, MIF 1352, fb 60 Hz set), `sweetnull=backboardd,SpringBoard,MobileSafari`,
+`sweetfbhash=1`, a 1-rep nav for the unlock and the labelled 0403 thumbnails. Boot line 1245-1330 B: the real limit is 2048 (0320), so the
+1023 B concern of s.5 does not apply and audio stayed in.
+
+- **Diagnosis came from this round's speed runs** (*observed*, no extra boot): iOS resumed Safari at the unlock in speed-base / speed-free (0403
+  thumbnails: Safari's toolbar and address bar drawn, page area black: s.4 answered, the context is composited). Right after
+  `exec com.apple.WebKit.GPU`, backboardd attaches **'w30r' 1125x1905 / 1536 / 1473 / 1194 / 1098 / 579 / 210** surfaces (page backing stores,
+  double-buffered pairs) and 'b3a8' 1125x1311 / 183 / 159 (Safari's own bars, drawn fine as BGRA8). No import failure, no REJECTED/SURFFAIL;
+  the only texImage refusal is one `plane 1` (b3a8 alpha plane) in free2/free3. Sel 44 from the GPU process as before (harmless, s.1).
+- **A `WKCPU=bitmap`** (safari-bitmap, `wkcpu[273]: mode bitmap ... registered 1`): the page still arrives as 'w30r' 1125x1905 surfaces; page area
+  black. The switch does not move the page off the 10-bit IOSurface path on this build. `WKCPU=both` not run (budget spent on C).
+- **C libsweetgl W30R rule** (userland d0ff1a4, dylibs 6223d228 -> 7113f7c5 -> 2fc47f4b): CPU copy with the CIF10 remap and alpha 1 for
+  non-full-screen, non-render-target 'w30r' attaches. *Observed*: 8-20 copies per Safari launch, 10-23 ms per 1125x1905 surface (CA attaches on
+  content change, not per frame); no crash; unlock, home screen and bench steps unchanged (safari-w30r-lean, -full). First version re-pointed
+  textures at the surface when CA reused the NAME for an FBO target 10 s later (would let CA render into Safari's surface); fixed (check the
+  name still holds our RGBA8 copy; `reused ... forgotten` x9 in safari-w30r-full, only real 281x609 blur targets reverted).
+- **Page visibility: NOT proven.** safari-w30r-full (Safari opened by the bench tap at 424,2266 = dock icon, guest join failed `set_ssid status=1`):
+  the probe thumbnail 3 s after launch still shows a black page area; its page-area pixels are bit-identical to speed-free's (near-black dither),
+  while the status band changed (white before, #22242a now). So either the tiles were still empty (no network, 3 s) or the page layer is not
+  what covers that region. The copy-content thumbnails (`SWEETGL_W30RTHUMB=8`) that would decide it were lost: safari-w30r3-lean's USB log
+  stopped 22 s into the boot (known intermittent silent stop; phone ran on and reset itself at +567 s).
+- **Payload limit**: the 22 MB dylib in the run overlay (5.5 MB compressed) makes a full-config payload ~28.1 MB: back in fastboot at +7 s
+  (safari-w30r, PORT G5 ramp: 24.3 MB passes, >= 32.7 MB fails). The dylib goes in by a lean boot (no AOC/amp/Wi-Fi firmware, ~22.9 MB) and stays
+  on userdata; daily images rely on that copy. A later `--intent gpu` run restores the std extra 8efaad3e (no W30R rule): re-deliver 2fc47f4b
+  (`$A/safari/sweetgl-out/libsweetgl.dylib`, overlay `$A/safari/ov-s4`, `LEAN=1 $A/safari/run-s.sh`) or revert by delivering 8efaad3e the same way.
+- Next if the user still sees a black page: one boot with Wi-Fi joined and `SWEETGL_W30RTHUMB=8` (needs a dylib already on userdata, so the
+  full config fits), then `SWEETGL_W30R=opaque` / `WKCPU=both` as A/B; also the b3a8 plane-1 alpha.
