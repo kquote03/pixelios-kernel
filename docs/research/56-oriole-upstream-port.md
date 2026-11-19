@@ -385,3 +385,46 @@ libsalog 05b76b40); built by `$A/uifix/daily-build7.sh` (not in git: credential 
 sha256 54909f7754fcea12a0d9a67f4c87df53a0f07a2f36b73f1191563a2e5b438229, flashed to boot_b after daily-verify8-full. Boots: 4 of 16 (listen1, vol1, vol2,
 verify8). User reports (relayed) during this round: "sound works now", "the volume keys are working now". To check by the user: sound within
 ~2 min of an UNTETHERED boot (charger only), the volume keys change the level, Settings > Wi-Fi at home.
+
+## Step 10: open guest network at boot, volume keys in 3 dB steps (2026-11-19; rows guest1, daily-verify9-full, daily image 8 in device/google/oriole/docs/PORT.md)
+
+User request: away from home the stored network is not in range (status 3, Step 9); join the campus open guest network (no password) at boot.
+Later report on the same round: volume keys still make no audible change on daily image 7.
+
+- **Open-network mode did not exist** (*read from source*): mkwlancred refused any security but wpa2-psk, the shim/kernel reader any security word
+  but 0; L24 sent `wpa_auth` WPA2_AUTH_PSK / `wsec` AES; L25 required a PMK, the target's RSNE and a finished host 4-way before the en0 hand-over.
+- **Added (patch 0400 `sweet-wlan-open-network`, host side ecb83bc)**: `PIXOS_WIFI*_SECURITY=open` (no PSK; a PSK with open is refused) -> blob
+  security word 1, psk_len 0, zero psk. Kernel: the reader accepts it without a PMK; L24 builds the same six commands with `wpa_auth 0`, `wsec 0`
+  (sup_wpa 0, auth 0 open system, mfp 0, v1 join unchanged) [src OpenBSD sys/dev/ic/bwfm.c:2036-2040, no-privacy branch of bwfm_connect;
+  bwfmreg.h:167/180/188]; L25 requires an RSNE-free target record (one with an RSNE is refused), skips the supplicant and the 4-way and sets
+  `hs_done`; the 0282 re-join is not armed for an open link (GAP: the link stays down after an AP loss until the next boot); the kept Apple80211
+  link answers sec=open (no privacy bit; Get 2 auth lower 1 / upper 0 [guess from the observed WPA2-PSK pair]). WPA2 blobs take the old path.
+  Kernel `$A/kernels/kernel-up-027d0dce.sweet` (sha256 027d0dceba25c3df47baba922fc5ec7ec781a7a04bb9ac2199534813289b39aa; 91e56777 stack + 0400).
+  Credentials: `$A/wifi-guest.env` (0600, outside git: `PIXOS_WIFI2_SSID`, `PIXOS_WIFI2_SECURITY=open`), used with `PIXOS_WIFI_NET=2` (DHCP);
+  `$A/wifi.env` (home network) unchanged. Host tests: `shim/wlan_open_host_test.c` (2 hand mutants caught), test_mkwlancred 18/18.
+- **pixping `gw`** (90b5dae): pings the interface's DHCP default gateway (route table), for a network whose gateway is unknown at staging time.
+- **guest1** (*observed*, one boot, kernel 027d0dce, the open guest network): `credentials loaded security=open`, `L23 join target is an open BSS
+  (no RSNE)`, `L24 join done: SET_SSID status 0, link up`, `L25 done: open network (no keys)`, `A80211 kept link is an open network`, en0 hand-over;
+  iOS DHCP lease on en0 (pixping `iface en0 ready addr=172.13.x.x`, gateway from the default route), gateway ping 10/10 (rtt 5-33 ms); pixnet
+  9 pass / 0 fail: DNS (one.one.one.one a=2), TCP 443, HTTP to 1.1.1.1:80 status 301 (Cloudflare's own http->https redirect, not a portal page),
+  TLS 1.2 trust ok, HTTPS GET status 200 56614 B. **No captive portal and no client isolation seen** from the phone at this location: the guest
+  network carried real internet without a browser login. wifid: `devices 1`, power 1, `current network present (joined)`, scan 22 results.
+  The user, watching this boot, reported "wifi is working!".
+- **Volume keys** (*read from source* + *observed* guest1): the Step 9 agent stepped the tap by 1/16 of v (amplitude v^2): about -1.1 dB per press
+  near the top, which is not audible; it also started its HID listener only after the AVSystemController lookup (up to 120 s). The job itself
+  ran in the daily image (`exec sweetaudio_vol`, no exit, verify8) and nothing in it waits for USB. New (61a70fa): 16 levels of 3 dB (level 0 =
+  mute), one level per press, a log line per press with level and dB, the level kept in `/private/var/root/org.pixelios.sweetaudio.level` and
+  restored at start, the HID monitor client started first. guest1: the 0398 test presses (volume-down) and **5 physical presses by the user**
+  (`SWEET KEYS: key=1/2` GPIO lines, then `SWEET HID: key 0xe9/0xea down`) each gave `sweetaudio_vol: key volume-up|down: level N/16 (-X dB)`;
+  the physical keys and the test presses go through the same kernel HID service (SweetHIDButtons::key, patch 0087/0398). Loudness by ear: user.
+  Remaining: the first press can be missed if it comes within ~35 s of the agent start (the HID client came up 35 s after the job started);
+  no volume HUD (no Speaker route with a volume control, doc 55 s.4).
+- **Credential intermediates**: xrun and the daily build removed the image copies and the blob dir; a stale `wlancred-*` dir from 09:19
+  (earlier session, tmpfs) was deleted by hand.
+
+**Daily image 8** = daily image 7 args and flags on kernel 027d0dce (+0400) + the open guest network blob (`$A/wifi-guest.env`, net 2 DHCP) +
+overlay ov-daily8 (61a70fa `sweetaudio_vol`); built by `$A/step10/daily-build8.sh` (not in git: credential env). Image
+`$A/boot-backup/boot_b-ios-daily-255ccd52-full4-guest.img`, sha256 255ccd52b0e8967dc0ace3083e43af9ea4f8c56a57455bea40c54f5d68e713e0, booted tethered
+twice (daily-verify9-full: all markers, the en0 marker matched only a link-local address; daily-verify10-full: DHCP lease on the guest network
++81 s, all 11 markers at +113 s, battery 36.1 -> 36.5 C). **Built, not flashed**: the round was interrupted before the flash; boot_b holds
+boot_b-orig.img (recovery) at the start of Step 11. Image 8 is the fallback daily image.
