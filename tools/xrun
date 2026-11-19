@@ -287,7 +287,8 @@ cleanup() { stop_capture; ovstd_record; plock_drop
 	[ -z "$wlcdir" ] || case $wlcdir in */wlancred-*) rm -rf -- "$wlcdir" ;; esac
 	cred_clean; }
 # L-12: every image copy that holds the Wi-Fi credentials, removed before any report scans the run dir (die) and again on EXIT
-cred_clean() { [ "$wlcimg" = 0 ] || rm -f -- shim/out/shim-boot-avb.img shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img"; }
+# the build intermediates also hold the payload with the WLANCRED blob (doc 56 Step 7): shim-boot-lz4-avb.img, shim-boot-lz4.img, shim-boot.img, ramdisk.bin
+cred_clean() { [ "$wlcimg" = 0 ] || rm -f -- shim/out/shim-boot-avb.img shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img" shim/out/shim-boot-lz4-avb.img shim/out/shim-boot-lz4-avb.img.meta.json shim/out/shim-boot-lz4.img shim/out/shim-boot.img shim/out/ramdisk.bin; }
 trap cleanup EXIT
 die() { cred_clean; $R error "$D" "$*" || exit $?; exit 2; }
 tailog() { tail -n 3 "$LOG" | tr '\n' ' ' | cut -c1-200; }
