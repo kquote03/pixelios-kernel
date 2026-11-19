@@ -509,6 +509,7 @@ sweethang	patch:0191
 sweethfstrace	patch:0171
 sweethidcount	patch:0155
 sweethidtest	patch:0058
+sweethidtestkey	patch:0398
 sweetiolog	patch:0049
 sweetiortc	patch:0123
 sweetkdbg	patch:0264

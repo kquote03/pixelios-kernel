@@ -1,0 +1,35 @@
+SWEET HID test key (patch 0398, oriole upstream port Step 8; applies after 0155): boot-arg sweethidtestkey=1 makes the existing sweethidtest=N timer (patch 0058/0155: a press every N s, sweethidcount presses) press consumer Volume Decrement instead of Menu, =2 Volume Increment; absent or any other value = Menu as before. The press goes through SweetHIDButtons::key -> dispatchEvent, the path of a real button (patch 0087), so a run can check what backboardd / SpringBoard / the audio path do with a volume key without a finger. No hardware access.
+
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index b8c471d..9158686 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -355,6 +355,7 @@ private:
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
+ 	UInt32 fTestLimit;   /* patch 0155: events (2 per press) before the bench is done, boot-arg sweethidcount presses, default 30 */
++	UInt32 fTestUsage;   /* patch 0398: the key the test presses: Menu (default), sweethidtestkey=1 volume down, =2 volume up */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+@@ -565,6 +566,11 @@ SweetHIDButtons::start(IOService *provider)
+ 	UInt32 presses = 30;
+ 	(void)PE_parse_boot_argn("sweethidcount", &presses, sizeof(presses));
+ 	fTestLimit = 2 * (presses ? presses : 30);
++	{
++		UInt32 tk = 0;  /* patch 0398 */
++		(void)PE_parse_boot_argn("sweethidtestkey", &tk, sizeof(tk));
++		fTestUsage = tk == 1 ? kHIDUsage_Csmr_VolumeDecrement : tk == 2 ? kHIDUsage_Csmr_VolumeIncrement : kHIDUsage_Csmr_Menu;
++	}
+ 	if (PE_parse_boot_argn("sweethidtest", &fTestSecs, sizeof(fTestSecs)) && fTestSecs) {
+ 		fTest = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::testFired);
+ 		if (fTest && _hidWorkLoop->addEventSource(fTest) == kIOReturnSuccess) {
+@@ -606,7 +612,7 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool press = (self->fTestCount & 1) == 0;
+-	self->key(kHIDUsage_Csmr_Menu, press);
++	self->key(self->fTestUsage, press);     /* patch 0398: Menu unless sweethidtestkey */
+ 	self->fTestCount++;
+ 	if (self->fTestCount >= self->fTestLimit) {
+ 		sender->setTimeoutMS(6000);

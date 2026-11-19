@@ -1,0 +1,142 @@
+SWEET BATTERY EXTERNAL = CHGIN_OK (patch 0397, oriole upstream port Step 8; applies after 0395): SweetBattery showed external=0 charging=0 while the phone was on USB (doc 56 Step 7 open item), because 0395 took External/Charging from FG Current > +50 mA only and a USB 2 port at 500 mA leaves the phone in net discharge; iOS therefore showed no charging state and never played the connect sound (the "chime" the user heard with the static fallback). The thermal thread's 30 s read set (sweet_chg_fg_batt) now also reads the charger 0x69 reg 0xB4 CHG_INT_OK, one byte (already on the i2c_rd_slave_ok allowlist: 0x69 n == 1, 0xB0..0xCC; the decode CHGIN_OK = bit 6 is upstream 0284 phase 2), with the same guards and the same failure rule as the FG reads (a failed read stops the bus). sweet_batt_ext() hands the last CHGIN_OK to SweetBattery: External/Capable/Charging = CHGIN_OK || Current > +50 mA; one log line `SWEET BATTERY: external N (CHGIN_OK N, FG current N mA) (patch 0397)` on every change. READS ONLY: no write, no new register outside the allowlist, no boot-arg.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+index 5a0f51e..4179fa9 100644
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -1490,11 +1490,13 @@ sweet_chg_fg_sample(int32_t *deci_c, int32_t *cur_uA)
+  * Patch 0395 (oriole battery publish, the old oriole 0153 re-seated): one state-of-charge read set for SweetBattery, called by the thermal thread every 30 s after a good
+  * sweet_chg_fg_sample(). FG 0x36 reg 0x06 RepSOC (LSB 1/256 %) and reg 0x09 VCell (LSB 78.125 uV): the registers and conversions mon_row (patch 0298/0307) and i2c_g_fg
+  * (patch 0284) already read, both on the i2c_rd_slave_ok allowlist. Reads only; same guards and return codes as sweet_chg_fg_sample (a failed read stops the bus).
++ * Patch 0397: also the charger 0x69 reg 0xB4 CHG_INT_OK, one byte (on the allowlist: 0x69 n == 1, 0xB0..0xCC), *chgin_ok = bit 6 CHGIN_OK (the phase-2 decode of patch 0284,
++ * `INT_OK[0xb4] ... CHGIN_OK=(>>6)&1`; a status register, the latched one is CHG_INT 0xB0). Same failure rule as the FG reads.
+  */
+ int
+-sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv)
++sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv, int *chgin_ok)
+ {
+-	uint8_t sc[2], vc[2];
++	uint8_t sc[2], vc[2], iok = 0;
+ 	int rc = 0;
+ 
+ 	if (!sweet_chg_enter()) {
+@@ -1508,7 +1510,7 @@ sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv)
+ 		rc = -2;
+ 	} else if (!i2c_gate(!i2c_xfer_seen)) {
+ 		rc = -1;
+-	} else if (chg_i2c_read(0x36, 0x06, 2, sc) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0) {
++	} else if (chg_i2c_read(0x36, 0x06, 2, sc) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0 || chg_i2c_read(0x69, 0xb4, 1, &iok) != 0) {
+ 		(void)i2c_wr(I_INTEN, 0);
+ 		i2c_log("SWEET CHG GAP: BATT fuel-gauge read failed: bus stopped, no more battery samples this boot\n");
+ 		rc = -1;
+@@ -1517,6 +1519,7 @@ sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv)
+ 		i2c_xfer_seen = 1;
+ 		*soc_centi = ((uint32_t)(sc[0] | ((uint32_t)sc[1] << 8)) * 100u) / 256u;
+ 		*mv = (uint32_t)(((uint64_t)(vc[0] | ((uint32_t)vc[1] << 8)) * 78125u) / 1000000u);
++		*chgin_ok = (iok >> 6) & 1;     /* patch 0397 */
+ 	}
+ 	sweet_chg_leave();
+ 	return rc;
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index c5806ef..33d4252 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -27,7 +27,7 @@ extern void thread_deallocate(thread_t);
+ extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);   /* osfmk/kern/sched_prim.c; the call of patch 0270 */
+ extern unsigned int ml_get_cpu_count(void);                                          /* patch 0270 */
+ extern int sweet_chg_fg_sample(int32_t *deci_c, int32_t *cur_uA);                    /* bsd/dev/sweet_chg_i2c.c (patch 0336) */
+-extern int sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv);                     /* bsd/dev/sweet_chg_i2c.c (patch 0395) */
++extern int sweet_chg_fg_batt(uint32_t *soc_centi, uint32_t *mv, int *chgin_ok);       /* bsd/dev/sweet_chg_i2c.c (patch 0395, chgin_ok: 0397) */
+ extern int sweet_chg_icl_thermal(int hold);                                          /* bsd/dev/sweet_chg_i2c.c (patch 0336) */
+ extern void sweet_chg_tick(int log_pending);                                         /* bsd/dev/sweet_chg.c */
+ extern int sweet_thermal_reboot_bootloader(void);                                    /* bsd/dev/sweet_restart.c (patch 0336) */
+@@ -44,6 +44,7 @@ static volatile uint64_t th_g_ms;       /* when th_g_cc was read; 0 = never */
+ static volatile uint32_t th_b_soc;      /* centi-% */
+ static volatile uint32_t th_b_mv;
+ static volatile int32_t th_b_ma;        /* positive = charging */
++static volatile int32_t th_b_ext;       /* patch 0397: charger CHGIN_OK of the same read set (1 = input power present), -1 = not read yet */
+ static volatile uint64_t th_b_ms;
+ #define TH_BATT_MS 30000u       /* one RepSOC/VCell read set every 30 s (the old 0153 cadence), after a good temperature sample */
+ 
+@@ -110,6 +111,13 @@ sweet_batt_get(uint32_t *soc_centi, uint32_t *mv, int32_t *ma, uint32_t *age_ms)
+ 	return 1;
+ }
+ 
++/* Patch 0397: CHGIN_OK of the last published read set: 1 / 0, -1 = none yet. */
++int
++sweet_batt_ext(void)
++{
++	return __atomic_load_n(&th_b_ms, __ATOMIC_ACQUIRE) ? th_b_ext : -1;
++}
++
+ /* Patch 0395: after a good temperature sample, at most every TH_BATT_MS; an implausible set (VCell outside 2800..4600 mV, RepSOC above 102 %) is not published (GAP once). */
+ static void
+ th_batt_sample(uint64_t now, int32_t cur_uA)
+@@ -117,13 +125,13 @@ th_batt_sample(uint64_t now, int32_t cur_uA)
+ 	static uint64_t last_try;
+ 	static int said;
+ 	uint32_t soc = 0, mv = 0;
+-	int rd;
++	int rd, chgin = -1;
+ 
+ 	if (last_try != 0 && now - last_try < TH_BATT_MS) {
+ 		return;
+ 	}
+ 	last_try = now;
+-	rd = sweet_chg_fg_batt(&soc, &mv);
++	rd = sweet_chg_fg_batt(&soc, &mv, &chgin);
+ 	if (rd != TH_RD_OK) {
+ 		return;
+ 	}
+@@ -137,6 +145,7 @@ th_batt_sample(uint64_t now, int32_t cur_uA)
+ 	th_b_soc = soc > 10000u ? 10000u : soc;
+ 	th_b_mv = mv;
+ 	th_b_ma = cur_uA / 1000;
++	th_b_ext = chgin;
+ 	__atomic_store_n(&th_b_ms, now ? now : 1, __ATOMIC_RELEASE);
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 950ee4b..49a5f49 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -21,6 +21,7 @@ extern "C" int sweet_thermal_get(int32_t *centi_c, uint32_t *state, uint32_t *ag
+ #define SWEET_TEMP_STALE_MS 60000u      /* = TH_STALE_MS of bsd/dev/sweet_thermal.h */
+ /* bsd/dev/sweet_thermal.c (patch 0395): the MAX77759 fuel-gauge RepSOC / VCell / Current the thermal thread reads every 30 s */
+ extern "C" int sweet_batt_get(uint32_t *soc_centi, uint32_t *mv, int32_t *ma, uint32_t *age_ms);
++extern "C" int sweet_batt_ext(void);   /* patch 0397: charger CHGIN_OK of the same set, -1 = unknown */
+ #define SWEET_BATT_STALE_MS 120000u    /* four missed 30 s read sets */
+ 
+ class SweetBattery : public IOPMPowerSource {
+@@ -40,6 +41,7 @@ private:
+ 	bool fGaugeSeen;       /* patch 0395: a gauge set was published once (then a stale gauge keeps the last set, never the 100 % fallback) */
+ 	unsigned fGaugePct, fGaugeMv;
+ 	int fGaugeMa;
++	int fLastExt;          /* patch 0397: last external state logged, -1 = none */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -68,6 +70,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fGauge = fGaugeSeen = false;
+ 	fGaugePct = fGaugeMv = 0;
+ 	fGaugeMa = 0;
++	fLastExt = -1;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -304,7 +307,14 @@ SweetBattery::pollGauge(void)
+ 		fGaugeMa = ma;
+ 		fGaugeSeen = true;
+ 		fGauge = true;
+-		bool in = ma > 50;
++		/* patch 0397: external power = charger CHGIN_OK (input present), or the old 0153 rule (FG current > +50 mA). On a 500 mA USB 2 port the phone is
++		 * plugged in but discharges net (doc 56), so the current rule alone showed "not connected" and iOS never played the connect sound. */
++		int ext = sweet_batt_ext();
++		bool in = ext == 1 || ma > 50;
++		if ((int)in != fLastExt) {
++			IOLog("SWEET BATTERY: external %d (CHGIN_OK %d, FG current %d mA) (patch 0397)\n", in, ext, ma);
++			fLastExt = in;
++		}
+ 		putBool("SweetBatteryStale", false);
+ 		publish(fGaugePct, fGaugeMv, fGaugeMa, in, in, in, false, true, true);
+ 		return;
