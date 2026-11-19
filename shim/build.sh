@@ -812,6 +812,12 @@ else
 	cp wlan_open_host_test.c $O/op400/bsd/dev/
 	chk "wlan_open_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -o $O/wlan_open_host_test $O/op400/bsd/dev/wlan_open_host_test.c
 	chk "wlan_open_host_test" $O/wlan_open_host_test
+	# xnu patch 0406 (robust boot join): the pure helpers (new file sweet_wlan_join_pick.h) extracted from the patch; the test is copied next to it (quoted include)
+	rm -rf $O/jp406; mkdir -p $O/jp406
+	awk 'index($0,"+++ b/bsd/dev/sweet_wlan_join_pick.h")==1{on=1;next} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0406-sweet-wlan-robust-join.patch > $O/jp406/sweet_wlan_join_pick.h
+	cp wlan_join_pick_host_test.c $O/jp406/
+	chk "wlan_join_pick_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -o $O/wlan_join_pick_host_test $O/jp406/wlan_join_pick_host_test.c
+	chk "wlan_join_pick_host_test" $O/wlan_join_pick_host_test
 	# the pure NVRAM part of the same header (process_nvram_vars port): known answers, no bus
 	chk "wlan_nv_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_nv_host_test wlan_nv_host_test.c
 	chk "wlan_nv_host_test" $O/wlan_nv_host_test

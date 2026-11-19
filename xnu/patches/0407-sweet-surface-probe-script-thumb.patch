@@ -1,0 +1,196 @@
+SWEET large-surface pixel probe + script thumbnails (patch 0407, oriole Safari 2026-11-19, PixOS doc 57 s.7; LOG ONLY, both default off). (1) Boot-arg sweetsurfprobe=SEC: every SEC s (60 rounds) per surface >= 256x128 (plane 0 of a planar one): non-zero and differ-from-first counts on a 64x64 word grid, a 16-word fingerprint, creator process (new field SweetSurface::creator, set at create), lock/write-unlock counts, last locker and seed; logged on change, <= 48 lines per round (`SWEET SURFPROBE r R: id ...`). Answers whether WebKit drew into its w30r page tiles. Read only (kernelAddress() loads under a retain). (2) sweetscript (patch 0156) takes a 1-number step "T" = the 0403 labelled thumbnail scriptN of the last presented surface (no touch), so a scripted boot can photograph an app N seconds after launching it.
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-19 16:43:22.663880714 +0400
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-19 16:43:38.991010806 +0400
+@@ -399,7 +399,7 @@
+ 	static void scriptFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fScript;
+ 	UInt32 fScriptIdx, fScriptStep, fScriptN;
+-	struct { UInt32 t; SInt32 x0, y0, x1, y1; bool swipe; } fScriptEnt[24];
++	struct { UInt32 t; SInt32 x0, y0, x1, y1; bool swipe, thumb; } fScriptEnt[24];   /* patch 0407: thumb = a 1-number step "T": the 0403 labelled thumbnail 'scriptN' of the last presented surface, no touch */
+ 	/* patch 0243: boot-arg sweetnav=R runs a built-in human-paced navigation session R times (G-10b nav bench) */
+ 	static void navFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fNav;
+@@ -797,9 +797,16 @@
+ 				fScriptEnt[fScriptN].swipe = (nv == 5);
+ 				fScriptEnt[fScriptN].x1 = (nv == 5) ? v[3] : v[1];
+ 				fScriptEnt[fScriptN].y1 = (nv == 5) ? v[4] : v[2];
++				fScriptEnt[fScriptN].thumb = false;
++				fScriptN++;
++			} else if (nv == 1) {   /* patch 0407: "T" alone = a labelled thumbnail at T (log only, no touch) */
++				fScriptEnt[fScriptN].t = (UInt32)(v[0] > 3600 ? 3600 : v[0]);
++				fScriptEnt[fScriptN].x0 = fScriptEnt[fScriptN].y0 = fScriptEnt[fScriptN].x1 = fScriptEnt[fScriptN].y1 = 0;
++				fScriptEnt[fScriptN].swipe = false;
++				fScriptEnt[fScriptN].thumb = true;
+ 				fScriptN++;
+ 			} else {
+-				IOLog("SWEET HID: touch script: entry with %u numbers dropped (3 = tap, 5 = swipe)\n", nv);
++				IOLog("SWEET HID: touch script: entry with %u numbers dropped (1 = thumbnail, 3 = tap, 5 = swipe)\n", nv);
+ 			}
+ 		}
+ 		fScript = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::scriptFired);
+@@ -1567,6 +1574,21 @@
+ 	}
+ 	unsigned i = self->fScriptIdx, st = self->fScriptStep;
+ 	bool swipe = self->fScriptEnt[i].swipe;
++	if (self->fScriptEnt[i].thumb) {   /* patch 0407: thumbnail step: no finger, the next step after its own delay */
++		char lb[16];
++		snprintf(lb, sizeof(lb), "script%u", i);
++		IOLog("SWEET SCRIPT: step %u thumbnail %s\n", i, lb);
++		sweet_fb_navthumb(lb);
++		self->fScriptStep = 0;
++		self->fScriptIdx = i + 1;
++		if (self->fScriptIdx < self->fScriptN) {
++			UInt32 dt = self->fScriptEnt[i + 1].t > self->fScriptEnt[i].t ? self->fScriptEnt[i + 1].t - self->fScriptEnt[i].t : 1;
++			sender->setTimeoutMS(dt * 1000);
++		} else {
++			sender->setTimeoutMS(6000);
++		}
++		return;
++	}
+ 	unsigned steps = swipe ? SWEET_SCRIPT_STEPS : 10;   /* a tap: finger down for 10 x 10 ms */
+ 	unsigned ms = swipe ? 8 : 10;
+ 	if (st == 0) {
+diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-19 16:43:22.654826443 +0400
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-19 16:44:20.969007455 +0400
+@@ -296,6 +296,110 @@
+ 	}
+ }
+ 
++/*
++ * Patch 0407 (oriole Safari 2026-11-19, PixOS doc 57 s.7): boot-arg sweetsurfprobe=SEC (default off; 1..600) reads the PIXELS of every LARGE surface (the
++ * 0160 scan covers only <= 1200x1200 single-plane ones; WebKit's page backing stores are 'w30r' 1125x1905): every SEC seconds (60 rounds) per surface of at least
++ * 256x128 px (plane 0 of a planar one), on a 64 x 64 grid of 32-bit words inside width x height: how many are non-zero, how many differ from the first sample, and a
++ * 16-word fingerprint (4 x 4 grid). Logged on first sight and whenever these or the lock counts change, at most 48 lines per round:
++ * `SWEET SURFPROBE r R: id I WxH fmt F planes P bpr B creator C nonzero N/S differ D/S fp w0..w15 locks L wunlocks U locker K seed E`.
++ * It answers "did WebKit draw into its tiles?" (all zero / uniform = nothing drawn; varying = pixels there). READ ONLY: loads of surface memory the kernel
++ * already maps (kernelAddress()), under a retain; no store, no register.
++ */
++static thread_call_t sweet_surf_probe_tc;
++static uint32_t      sweet_surf_probe_secs, sweet_surf_probe_round;
++static uint64_t      sweet_surf_probe_last[SWEET_SURFACE_MAX_ID];
++
++static void
++sweet_surf_probe_fire(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	uint32_t round = ++sweet_surf_probe_round, logged = 0, skipped = 0, seen = 0;
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL) {
++			sweet_surf_probe_last[id] = 0;
++			continue;
++		}
++		uint32_t w = s->width, h = s->height, bpr = s->bytesPerRow, off = s->offset;
++		if (s->planeCount > 0) {
++			w = s->planes[0].width;
++			h = s->planes[0].height;
++			bpr = s->planes[0].bytesPerRow;
++			off = s->planes[0].offset;
++		}
++		uintptr_t va = (w >= 256 && h >= 128 && bpr >= 4 && s->memory != NULL) ? s->kernelAddress() : 0;
++		uint64_t len = s->memory != NULL ? s->memory->getLength() : 0;
++		if (va != 0 && (uint64_t)off + (uint64_t)h * bpr <= len) {
++			const uint8_t *base = (const uint8_t *)va + off;
++			uint32_t wpr = bpr / 4, ww = w <= wpr ? w : wpr;   /* words per row inside the image (4 B per px for the formats of interest) */
++			uint32_t nz = 0, diff = 0, n = 0, first = 0, fp[16];
++			for (uint32_t gy = 0; gy < 64; gy++) {
++				const uint32_t *row = (const uint32_t *)(base + (uint64_t)(h * (2 * gy + 1) / 128) * bpr);
++				for (uint32_t gx = 0; gx < 64; gx++) {
++					uint32_t v = row[ww * (2 * gx + 1) / 128];
++					if (n == 0) {
++						first = v;
++					}
++					n++;
++					nz += v != 0;
++					diff += v != first;
++				}
++			}
++			for (uint32_t k = 0; k < 16; k++) {
++				const uint32_t *row = (const uint32_t *)(base + (uint64_t)(h * (2 * (k / 4) + 1) / 8) * bpr);
++				fp[k] = row[ww * (2 * (k % 4) + 1) / 8];
++			}
++			uint64_t sig = 1469598103934665603ull;
++			for (uint32_t k = 0; k < 16; k++) {
++				sig = (sig ^ fp[k]) * 1099511628211ull;
++			}
++			sig = (sig ^ ((uint64_t)nz << 32 | diff)) * 1099511628211ull;
++			sig = (sig ^ ((uint64_t)sweet_surf_locks[id] << 32 | sweet_surf_wunlocks[id])) * 1099511628211ull;
++			sig |= 1;
++			seen++;
++			if (sweet_surf_probe_last[id] != sig) {
++				if (++logged > 48) {
++					skipped++;
++				} else {
++					sweet_surf_probe_last[id] = sig;
++					IOLog("SWEET SURFPROBE r %u: id %u %ux%u fmt 0x%x planes %u bpr %u creator %s nonzero %u/%u differ %u/%u fp %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x"
++					    " locks %u wunlocks %u locker %s seed %u\n", round, id, w, h, s->pixelFormat, s->planeCount, bpr, s->creator[0] ? s->creator : "-", nz, n, diff, n,
++					    fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7], fp[8], fp[9], fp[10], fp[11], fp[12], fp[13], fp[14], fp[15],
++					    sweet_surf_locks[id], sweet_surf_wunlocks[id], sweet_surf_locker[id][0] ? sweet_surf_locker[id] : "-", s->state != NULL ? sweet_surface_seed_peek(s) : 0);
++				}
++			}
++		}
++		s->release();
++	}
++	IOLog("SWEET SURFPROBE r %u: %u large surfaces, %u lines, %u not logged (next round)\n", round, seen, logged > 48 ? 48 : logged, skipped);
++	if (round < 60 && sweet_surf_probe_tc != NULL) {
++		uint64_t dl;
++		clock_interval_to_deadline(sweet_surf_probe_secs, NSEC_PER_SEC, &dl);
++		thread_call_enter_delayed(sweet_surf_probe_tc, dl);
++	}
++}
++
++static void
++sweet_surf_probe_start(void)
++{
++	static UInt32 started;
++	uint32_t secs = 0;
++	if (!OSCompareAndSwap(0, 1, &started)) {
++		return;
++	}
++	if (PE_parse_boot_argn("sweetsurfprobe", &secs, sizeof(secs)) && secs != 0) {
++		sweet_surf_probe_secs = secs > 600 ? 600 : secs;
++		sweet_surf_probe_tc = thread_call_allocate(sweet_surf_probe_fire, NULL);
++		if (sweet_surf_probe_tc != NULL) {
++			uint64_t dl;
++			clock_interval_to_deadline(sweet_surf_probe_secs, NSEC_PER_SEC, &dl);
++			thread_call_enter_delayed(sweet_surf_probe_tc, dl);
++			IOLog("SWEET SURFPROBE: large-surface pixel probe every %u s (60 rounds)\n", sweet_surf_probe_secs);
++		}
++	}
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)
+@@ -307,6 +411,7 @@
+ 		}
+ 	}
+ 	sweet_surf_scan_start();
++	sweet_surf_probe_start();   /* patch 0407 */
+ }
+ 
+ static SweetSurface *
+@@ -1080,6 +1185,9 @@
+ 	}
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
++	if (s != NULL) {
++		strlcpy(s->creator, name, sizeof(s->creator));   /* patch 0407 */
++	}
+ 	bool first_log = (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64);
+ 	bool pref_log = false;
+ 	if (ret == kIOReturnSuccess && strncmp(name, "Preferences", sizeof(name)) == 0) {   /* patch 0261 */
+diff -ruN a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h	2026-11-19 16:43:22.659755555 +0400
++++ b/iokit/Kernel/arm/SweetSurface.h	2026-11-19 16:43:48.126012096 +0400
+@@ -48,6 +48,7 @@
+ 	uint32_t                  useCount[2];  /* patch 0290: clients holding the surface per use category (state page +0x18 / +0x1c) */
+ 	uint32_t                  valueGen;     /* patch 0290: value generation, (old + 2) | 1 per change (research 134 s.2) */
+ 	uint32_t                  purgeable;    /* patch 0290: last SetPurgeable state (0 NonVolatile, 1 Volatile); memory is never purged */
++	char                      creator[28];  /* patch 0407: proc_selfname of the creating process (log only, the sweetsurfprobe lines) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
