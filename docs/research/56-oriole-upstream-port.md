@@ -428,3 +428,68 @@ overlay ov-daily8 (61a70fa `sweetaudio_vol`); built by `$A/step10/daily-build8.s
 twice (daily-verify9-full: all markers, the en0 marker matched only a link-local address; daily-verify10-full: DHCP lease on the guest network
 +81 s, all 11 markers at +113 s, battery 36.1 -> 36.5 C). **Built, not flashed**: the round was interrupted before the flash; boot_b holds
 boot_b-orig.img (recovery) at the start of Step 11. Image 8 is the fallback daily image.
+
+
+## Step 11: speed (2026-11-19; rows speed-base .. speed-final10 in device/google/oriole/docs/PORT.md)
+
+User report on daily image 8: "The GPU is very slow". Plan woolly-floating-parrot step 1. Boots: 7 of 10. All runs = the full daily configuration
+(GPU pair 3 + audio + open guest network Wi-Fi + BT) plus the nav bench (`sweetnav=3`, gpu-fps-bench v2.1), guest WLANCRED, `--gpu-clk-level 3`.
+
+**Panel** (*observed*, patch 0401 `sweette=3`, run speed-base): the primary TE pin (gpp0-3, live DT `te-gpio`) toggles at **58.23 Hz** (TE period
+median 17172 us, min 17169, max 17175 over three 1 s windows, pulse ~972 us). DPU dump (0165 mask 1): DECON0 `GLOBAL_CON 0x113 (command mode)
+TRIG_CON 0x3061`. The aftermarket panel is a 60 Hz-class panel (not 90 Hz) running 3 % slow; the emulated vsync tick ran 60.00 Hz
+(`SWEET VSYNC: n 60 <20:60`, 0148), i.e. ~1.8 copies per second that the panel never showed. Patch **0404** makes the tick period a boot-arg;
+the daily set uses `sweetfb_vsync_us=17172`, so the frame ceiling on this phone is 58.2 per second, not 60.
+
+**Bench on this root** (*observed*, 0401/0403 thumbnails of the probed surface): upstream's calibrated taps do not fit the oriole root. 676,1720 is
+Photos here (Settings is column 2 row 4, 413,1717; Clock column 2 row 2, 417,1150), and iOS resumes the user's last app (Safari) at the unlock, so
+earlier benches (gpu-o-up1, speed-base, speed-free) ran their Settings steps in Photos/Safari. Patches **0403** (`sweetnavset`, `sweetnavclk`,
+`sweetnavgy`, labelled thumbnails, `tools/navthumb2png`) and **0405** (`sweetnavhome=1`: home swipe after every unlock) fix it; from speed-mif on
+the General probe finds the row and every step is measured. Runs speed-free3 and rep 0 of speed-cpus5 had touch-downs that the bench did not send
+(swipes on the home screen during the run: a person or ghost touches of the aftermarket digitizer, not separable from the log): speed-free3 is not
+used; speed-cpus5 is also scored on repetitions 1-2 only.
+
+| run | configuration | gpu-fps-bench pooled / slowest step | reps 1-2 pooled / slowest | best drawn s | panel copy | battery start -> nav end (-> idle end) | thermal action / reset |
+|---|---|---|---|---|---|---|---|
+| speed-base | daily image 8 (sweetfb_hz 30, MIF 421 MHz, cpus 8, no recores) | 36.8 / 14.0 app-launch (Settings steps in Photos) | 35.4 / 11.5 | 30 | 8.7-12.2 ms | 31.5 -> 33.8 (-> 37.1 at +900 s) | none / none |
+| speed-free | + free wins (below), cpus 8 recores 0xfe | 42.5 / 22.5 app-close (in Safari) | 41.2 / 26.3 | 53 | 9.7-12.0 ms | 37.3 -> 38.4 | none / none |
+| speed-free2 | + sweetnavhome | 40.2 / 18.3 app-launch (Settings steps in Photos) | 41.5 / 23.4 | 46 | 7.1-8.6 ms | 37.8 -> 38.3 | none / none |
+| speed-free3 | + Settings/Clock taps | invalid (18 foreign touches) | - | 35 | 9.4-13.8 ms | 38.6 -> 39.8 | none / none |
+| speed-mif | + MIF 1352 MHz | 54.3 / 37.3 settings-open | 54.6 / 37.4 | 59 | 2.0-2.6 ms | 39.6 -> 40.0 | none / none |
+| speed-cpus5 | + cpus 5, X1-first order, recores 0x1e | 57.5 / 47.0 settings-open | 58.5 / 48.2 | 59 | 1.7-2.3 ms | 39.4 -> 40.1 | none / none |
+| speed-final10 | = speed-cpus5 (the daily set), bench + idle to +780 s | **58.5 / 47.1 settings-open** | 58.7 / 45.4 | 59 | 1.5-1.6 ms | 39.9 -> 40.3 (-> 40.5 at +616 s) | none / none |
+
+Free wins = `sweetfb_hz=60` (`--fb-hz 60`), `sweetfb_gate=1` + backboardd `SWEETGL_REALFLUSH=1`, `sweetfb_fifo=1`, `sweetfb_gatekick=1`,
+`sweetmalicfg=0x81b00` (END_CLEAN job flush), `sweetfb_vsync_us=17172`, `CA_BACKDROP_SCALE` removed from backboardd's launchd job (overlay
+`$A/speed/ov-free`, plist sha b800714f; `pixelios-userland/tools/sweet-root-tweaks.py` no longer sets it). Witness lines: `vsync tick 17172 us`,
+`present gate ON`, `swap fifo ON`, `gate kick ON`, `JS_CONFIG_NEXT=0x81b00`, `REALFLUSH pid .. mode 1`, `recommended cores late: requested ..`.
+Drawn presents (0368 rows) during animations reach 58-59 per second (best seconds); the per-second mean over every second with frames (35-43/s)
+mixes animation and still seconds and is not a frame-rate figure.
+
+**What limited it** (*observed*): (1) the memory clock: the CPU panel copy took 8.7-12 ms per present at the bootloader's MIF 421 MHz, 1.5-2.6 ms
+at 1352 MHz (+12 pooled); (2) the core set: with cpus 8 the scheduler (one homogeneous cluster in the ADT) also puts UI threads on the three A55
+cores that recores 0xfe leaves in; upstream's cpus 5 X1-first order with recores 0x1e (threads on the 2 X1 + 2 A76 only, cpu0 = A55 for
+interrupts) raised the slowest step from 37 to 47 (settings-open = the Settings launch) and pooled to the panel's 58.2 ceiling; (3) the panel
+rate itself (58.23 Hz). Not needed: CPU clock raises (`--dvfs`), GPU pair 1. Still below 45 in single repetitions: settings-open rep low1 ~5
+(one long frame at the app launch); spotlight-open 53.
+
+**Thermal** (*observed* + host test): patch **0402** (hot mask by topology: the X1 drop keeps the boot mask minus the X1 cores, never fewer
+than 3 cores; cpus 8 + recores 0xfe -> 0x3e; cpus 5 X1-first keeps 0336's 0x18 = the A76 pair) was armed in every cpus 8 run (`hot mask 0x3e`)
+and the 0336 line in the cpus 5 runs; no run reached 48 C, so no mask fired. `tools/test_sweet_thermal.py` PASS cases=501 (new
+test_0402_hot_mask, 6 mutants caught). 55 C CRIT park unchanged.
+
+**Audio / Wi-Fi / BT with cpus 5** (*observed* speed-cpus5, speed-final10): `/dev/sweetaudio up`, connect sound (detector MOVED), BT patchram
+203 + bluetoothd, open guest network joined + DHCP lease. The guest join stopped at L24 in 3 of 7 boots (speed-base: `WIFI GAP: scan event data
+length 54`; speed-free2 / speed-mif: `set_ssid status=1`), with cpus 8 and cpus 5 alike: an open-network join reliability gap, not a speed effect.
+
+**Daily set (for the daily image build)**: kernel `$A/kernels/kernel-up-1c843b0c.sweet` (sha256
+1c843b0c02df8b7ac6ec05dbba60a051d643b34e12d9264d7210652c715bfff3 = 027d0dce stack + 0401..0405; the daily needs 0404, the rest is default off),
+`--cpus 5` with mkadt `--cpu-order 0,6,7,4,5,1,2,3`, `--mif-clk-level 1352000`, `--gpu-clk-level 3`, `--gui --fb-hz 60`, overlay `$A/speed/ov-free`,
+args = daily image 8 args + backboardd `SWEETGL_REALFLUSH=1` + `sweetfb_gate=1 sweetfb_fifo=1 sweetfb_gatekick=1 sweetrecores=0x1e
+sweetmalicfg=0x81b00 sweetfb_vsync_us=17172`. Script: `$A/speed/daily-build9.sh OUT_IMG` (not in git: credential env; all of the above is in it).
+No bench args (sweetnav*, sweetfps, sweetfb_copytime/drawn) in the daily image. Daily image 9: Step 12.
+
+**10-minute check** (*observed*, speed-final10): the chosen set ran the full bench and then idled on the lock screen; battery 39.9 C at +76 s,
+40.3 C at nav end (+320 s), 40.5 C at +616 s (state NORMAL in every 10 s sample; the host listener stopped at +640 s when the step agent was
+stopped, the phone reset itself at +780 s). Well below 48 C, so the fastest configuration measured is also the daily one; no hotter/cooler choice
+was needed. Not tried: GPU pair 1, CPU dvfs raises, MIF top row (not needed for the panel ceiling; upstream saw resets at top clocks).
