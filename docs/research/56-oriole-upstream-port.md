@@ -524,3 +524,34 @@ User report on daily image 8: "Safari only renders a black screen". Plan woolly-
 - **For the user's eyes**: Safari page area (open a simple page while the guest network is joined; Settings > Wi-Fi shows it); scrolling feel
   (58 fps class on most steps; Settings launch is the slowest step at ~47); sound, BT, volume keys as in image 8; Wi-Fi joins at boot only
   when the guest network wins the scan (L23 event cap gap at crowded places, open item).
+
+## Step 13: robust guest join, Safari measured, daily image 10 (2026-11-19; rows wsd1..wsd8, daily-verify13/14, daily image 10 in device/google/oriole/docs/PORT.md)
+
+User report on daily image 9: "Wifi didn't work and safari is still black (cant even show the no network message)". Speed fine.
+
+- **Why the scan missed** (*observed* daily-verify11/12 vs wsd1): the boot escan was a passive broadcast scan; the firmware sends one
+  ESCAN_RESULT per heard beacon (the same BSS up to 9 times, 7 SSIDs here), and the boot run's 48-event cap (ring 0 does not wrap at
+  L21..L24) filled before the join. **Patch 0406** (`sweet-wlan-robust-join`, pure helpers `sweet_wlan_join_pick.h`, host test
+  `shim/wlan_join_pick_host_test.c`, 4 hand mutants caught): (1) directed boot scan: SSID in `wl_scan_params.ssid` + scan_type active
+  [src OpenBSD bwfm.c:2232-2236], engine and glue; `sweetwlandscan=0` restores the old scan. *Observed*: the firmware then reports only the
+  guest SSID (6-18 records per boot, all of it; no cap stop in 8 boots). (2) Strongest AP: a stronger record of the SSID replaces the wildcard
+  target (wsd1: -70 -> -41 dBm); the firmware's own join still picks the AP it joins. (3) Join retries: up to 3 attempts of the same join on
+  SET_SSID != 0 or no events, while ring 0 / event cap have room (glue: request + re-post per extra attempt). (4) An event frame below the
+  72 B header (54 B, seen after a failed join) is consumed unread instead of stopping the run. (5) The 0282 re-join machine now re-joins an
+  open network after an AP loss (no PMK/RSNE/4-way, wpa_auth never SET; *not exercised on hardware*: no AP loss happened).
+- **Join results** (8 diagnostic boots + 2 verifies, same place): first attempt joined 7 of 10; `set_ssid status=1` (LINK up, then FAIL
+  2.7 s later) 3 of 10: wsd3 (retry cut by the 54 B event, fixed), wsd5b (retry joined, but no DHCP lease: 169.254 only), wsd7b (retry got
+  status 5, no room for a third). The last three boots (wsd8, daily-verify13, daily-verify14) joined with a lease = the 3-in-a-row pass,
+  but the status-1 join failure itself is not understood ([guess] AP/firmware side; the firmware reports no deauth/disassoc reason).
+  A boot whose join fails still has no Wi-Fi until the next boot: a periodic scan+join from the keep phase without a first join is not
+  built (the keep phase needs the boot run's flow ring).
+- **Safari**: doc 57 s.7. WebKit never writes pixels into its page tiles (probe: `nonzero 0/4096` all run; WebKit locks/unlocks them);
+  CoreGraphics' IOSurface context is CoreAnimation's accelerated drawing path inside the WebKit process, which has no working renderer
+  here. Blocker for this round; WKCPU=dom/both, CA_NO_ACCEL, libsweetgl in the GPU process (SweetMali not reachable) did not change it.
+  Patch **0407** (log only): `sweetsurfprobe=SEC` large-surface pixel probe, `sweetscript` thumbnail step.
+- **Daily image 10** = image 9 configuration on kernel `$A/kernels/kernel-up-63aa0f6d.sweet` (sha256 63aa0f6df5feee16ba19b7fa1edf0b690b6dd1dca665d3f23b0b1e83c42c2d66;
+  stack through 0407 + local BCM.hcd image via `tools/bcm-hcd-stack`; a kernel built without it refuses patchram, daily-verify13).
+  Built by `$A/speed/daily-build10.sh` (not in git); boot line 995 B; image `$A/boot-backup/boot_b-ios-daily-89f5c780-full6.img`, sha256
+  89f5c780a3ee0cfe03c2c3eba52b123ca0394c5028a5c3f25ae62fdf216dcf88. daily-verify14: all checks of image 9 incl. Wi-Fi lease +82 s and BT
+  patchram; the connect-sound device open did not occur in that boot (it did in verify13, same userland). Flashed to boot_b (OKAY).
+  libsweetgl on userdata unchanged (2fc47f4b; no libsweetgl change this round, std-extras untouched).

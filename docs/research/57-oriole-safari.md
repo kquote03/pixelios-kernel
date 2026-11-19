@@ -130,3 +130,37 @@ Boots: 6 of 6 (budget). Kernel 1c843b0c, the Step 11 daily set (cpus 5 X1-first,
   (`$A/safari/sweetgl-out/libsweetgl.dylib`, overlay `$A/safari/ov-s4`, `LEAN=1 $A/safari/run-s.sh`) or revert by delivering 8efaad3e the same way.
 - Next if the user still sees a black page: one boot with Wi-Fi joined and `SWEETGL_W30RTHUMB=8` (needs a dylib already on userdata, so the
   full config fits), then `SWEETGL_W30R=opaque` / `WKCPU=both` as A/B; also the b3a8 plane-1 alpha.
+
+## 7. Measured split (2026-11-19 wifi+safari round; rows wsd1..wsd8 in device/google/oriole/docs/PORT.md)
+
+User report on daily image 9: Safari's page area stays black even for its own offline error page, so the network does not matter and the
+s.6 W30R rule did not fix it. 7 Safari boots (budget 8; wsd5/wsd7 first tries never booted: a host image-build race, rerun as wsd5b/wsd7b).
+Tools: patch 0407 (`sweetsurfprobe=SEC`: pixel probe of every surface >= 256x128, creator, locks, write-unlocks, seed, purgeable; WebKit
+creates and first 24 locks logged; `sweetscript` 1-number step = labelled thumbnail). Script: unlock, home swipe, thumbnail (home control),
+tap the Safari dock icon, thumbnails 15-120 s later (`tools/navthumb2png --label scriptN`).
+
+- **The tiles hold no pixels** (*observed*, every boot): every 'w30r' page tile and 'b3a8' surface WebKit creates (1125x1536 / 1905 / 312 /
+  366 ..., 2481x1483) stays `nonzero 0/4096 differ 0/4096` for the whole run (60 s+ after launch). WebKit's process locks each one 1-3 times
+  (`SWEET SURFPROBE lock: com.apple.WebKit.GPU id N options 0 -> held`), write-unlocks it (seed 1-3), then marks the spare buffer volatile
+  (purg 1). libsweetgl's W30R copies in backboardd agree: `mean 0 lit 0%`, and the W30R copy thumbnails are black. The home-screen control
+  thumbnail is correct; Safari's bars draw (light mode now, white), the page area is black. So **WebKit does not draw; backboardd shows what
+  is there** (nothing). Injection was real: `SWEET ENV: com.apple.WebKit.GPU <- ...` + `|com.apple.WebKit.GPU| valog[267]: libsalog loaded`
+  (sweetenv matches the full executable base name, patch 0110; no 16-char truncation). libsalog `SALOG_OSLOG=2` printed no WebKit os_log line.
+- **Switches** (*observed*): `WKCPU=both` (wsd2): the tiles are now created by `com.apple.WebKit.WebContent` (DOM moved out of the GPU process),
+  still 'w30r' IOSurfaces (the bitmap key has no effect), still all zero. `CA_NO_ACCEL=1` in both WebKit processes (wsd4): no change.
+  libsweetgl forced into the GPU process (`SWEETGL_FORCE=1`, wsd8): loads, then `SweetMali user client unavailable (errno 60)`, CA keeps its
+  CPU renderer; tiles still zero.
+- **Why** [bin, 20H392 dyld cache]: WebKit draws a tile through `CGIOSurfaceContextCreate`; CoreGraphics' IOSurface context is implemented by
+  QuartzCore (`CAIOSurfaceContextVTable`, queue label `com.apple.coreanimation.CGIOSurfaceContext`): `CA::CG::IOSurfaceContext::create_delegate`
+  (0x188379070) maps 'w30r' / 'b3a8' with `CA::Render::fourcc_to_format` and builds a `CA::CG::AccelContextDelegate<CA::CG::IOSurfaceDrawable>`
+  with an `AccelQueue`: the drawing commands are rendered by CoreAnimation's own renderer inside the WebKit process. There is no Metal device,
+  Apple's EAGL cannot start (doc 33), and the SweetMali client is not reachable from the GPU process, so that renderer never writes the
+  surface. UIKit apps draw through CABackingStore (CPU bitmap contexts), which is why every other app renders. [guess for the exact failing
+  step inside the Accel path: CA's CPU renderer does not render into a 10-bit IOSurface drawable, or drops the queue without a GPU.]
+- **Blocker (this round)**: page drawing needs CA's accelerated IOSurface context in a WebKit process. Next steps, cheapest first: (1) make
+  WebKit use shared-memory bitmap backing stores (the `WebKitDebugAcceleratedDrawingEnabled` registration did not take; find where 615
+  reads it, e.g. the UI process's WKPreferences of the WKWebView, or a managed pref); (2) deep colour off (8-bit 'BGRA' tiles; same Accel
+  path, so only useful together with (3)); (3) a GL renderer for CA in the GPU process: SweetMali open from the sandboxed process
+  (errno 60 = timed out waiting for the service/second client) + the W30R/b3a8 render-target rules.
+- Thumbnails: `$A/scratch/r19/wsd1/script5.png` (home control), `script8.png` (Safari +37 s, page black), `w30r-124-6.png` (backboardd's
+  copy of a page tile: black); `$A/scratch/r19/wsd2/script8.png` (WKCPU=both: black); `$A/scratch/r19/wsd8-script8.png` (+120 s, black).
