@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 PixOS-Project contributors.
  *
- * Usage: pixping [-c N] [-s interval_ms] [-W wait_for_iface_s] [-D delay_s] [-i iface] A.B.C.D
+ * Usage: pixping [-c N] [-s interval_ms] [-W wait_for_iface_s] [-D delay_s] [-i iface] A.B.C.D|gw
+ *   gw (doc 56 Step 10): ping the IPv4 default gateway of the interface (a DHCP network whose gateway is not known when the overlay is
+ *   staged); it is read from the route table after the interface is ready (Darwin sysctl NET_RT_DUMP, Linux /proc/net/route) and printed.
  *
  * Stock iOS ships no ping binary [guess: no root listing was available to check], so the
  * Wi-Fi rung "ping the gateway from iOS userland over en0" needs our own.
@@ -42,6 +44,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -59,8 +64,103 @@ static int64_t now_us(void)
 
 static void usage(void)
 {
-	printf("pixping: GAP usage: pixping [-c N] [-s interval_ms] [-W wait_for_iface_s] [-D delay_s] [-i iface] A.B.C.D\n");
+	printf("pixping: GAP usage: pixping [-c N] [-s interval_ms] [-W wait_for_iface_s] [-D delay_s] [-i iface] A.B.C.D|gw\n");
 }
+
+/* Step 10: the IPv4 default gateway via interface `name` -> *gw (network order). 1 = found, 0 = none, -1 = unreadable (why filled).
+ * Darwin: sysctl {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0}, rt_msghdr + sockaddrs in RTA_* bit order, each rounded to 4 bytes
+ * (the same reader as tools/pixnet.c default_route, which ran on the phone); Linux: /proc/net/route Gateway column (host tests). */
+#ifdef __APPLE__
+struct pp_rt_msghdr {
+	u_short rtm_msglen;
+	u_char rtm_version;
+	u_char rtm_type;
+	u_short rtm_index;
+	int rtm_flags;
+	int rtm_addrs;
+	pid_t rtm_pid;
+	int rtm_seq;
+	int rtm_errno;
+	int rtm_use;
+	uint32_t rtm_inits;
+	uint32_t rtm_metrics[14];
+};
+#define PP_ROUNDUP32(a) ((a) > 0 ? (1 + (((a)-1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))
+static int default_gw(const char *name, uint32_t *gw, char *why, size_t wl)
+{
+	int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
+	size_t len = 0;
+	unsigned idx = if_nametoindex(name);
+	if (sysctl(mib, 6, NULL, &len, NULL, 0) != 0) {
+		snprintf(why, wl, "sysctl NET_RT_DUMP size: %s", strerror(errno));
+		return -1;
+	}
+	len += len / 8 + 1024;
+	char *buf = malloc(len);
+	if (!buf || sysctl(mib, 6, buf, &len, NULL, 0) != 0) {
+		snprintf(why, wl, "sysctl NET_RT_DUMP: %s", buf ? strerror(errno) : "out of memory");
+		free(buf);
+		return -1;
+	}
+	int found = 0;
+	for (size_t off = 0; off + sizeof(struct pp_rt_msghdr) <= len;) {
+		const struct pp_rt_msghdr *h = (const void *)(buf + off);
+		if (h->rtm_msglen < sizeof *h || off + h->rtm_msglen > len)
+			break;
+		const char *p = (const char *)h + sizeof *h, *end = (const char *)h + h->rtm_msglen;
+		uint32_t dst = 1, mask = 1, g = 0;
+		int have_dst = 0, have_gw = 0;
+		for (int bit = 0; bit < 8 && p < end; bit++) {
+			if (!(h->rtm_addrs & (1 << bit)))
+				continue;
+			const struct sockaddr *sa = (const void *)p;
+			uint32_t v = 0;
+			if (sa->sa_len >= 8)
+				v = ((const struct sockaddr_in *)(const void *)p)->sin_addr.s_addr;
+			if (bit == 0) {
+				have_dst = sa->sa_family == AF_INET;
+				dst = v;
+			} else if (bit == 1) {
+				have_gw = sa->sa_family == AF_INET;
+				g = v;
+			} else if (bit == 2) {
+				mask = v;
+			}
+			p += PP_ROUNDUP32(sa->sa_len);
+		}
+		if (have_dst && dst == 0 && have_gw && g != 0 && (h->rtm_flags & 0x2) && ((h->rtm_addrs & 0x4) ? mask == 0 : 1) && h->rtm_index == idx) {
+			*gw = g;
+			found = 1;
+		}
+		off += h->rtm_msglen;
+	}
+	free(buf);
+	return found;
+}
+#else
+static int default_gw(const char *name, uint32_t *gw, char *why, size_t wl)
+{
+	char line[256], nm[32];
+	unsigned long dst, g, flags;
+	int found = 0;
+	FILE *f = fopen("/proc/net/route", "r");
+	if (!f) {
+		snprintf(why, wl, "open /proc/net/route: %s", strerror(errno));
+		return -1;
+	}
+	if (!fgets(line, sizeof line, f)) {
+		fclose(f);
+		return 0;
+	}
+	while (fgets(line, sizeof line, f))
+		if (sscanf(line, "%31s %lx %lx %lx", nm, &dst, &g, &flags) == 4 && dst == 0 && g != 0 && (flags & 2) && !strcmp(nm, name)) {
+			*gw = (uint32_t)g;      /* the column is the in_addr word as the kernel stores it (network order in memory) */
+			found = 1;
+		}
+	fclose(f);
+	return found;
+}
+#endif
 
 static uint16_t cksum(const void *buf, size_t len)
 {
@@ -168,7 +268,8 @@ int main(int argc, char **argv)
 	struct sockaddr_in dst;
 	memset(&dst, 0, sizeof dst);
 	dst.sin_family = AF_INET;
-	if (inet_pton(AF_INET, argv[optind], &dst.sin_addr) != 1) {
+	int use_gw = strcmp(argv[optind], "gw") == 0;
+	if (!use_gw && inet_pton(AF_INET, argv[optind], &dst.sin_addr) != 1) {
 		printf("pixping: GAP '%s' is not a dotted IPv4 address\n", argv[optind]);
 		usage();
 		return 2;
@@ -204,6 +305,23 @@ int main(int argc, char **argv)
 		usleep(500000);
 	}
 
+	/* phase 1b (Step 10): the default gateway of the interface, waited for within the same budget */
+	if (use_gw) {
+		char rwhy[96] = "";
+		int r;
+		uint32_t g = 0;
+		while ((r = default_gw(ifname, &g, rwhy, sizeof rwhy)) == 0 && now_us() - t0 < (int64_t)waitiface * 1000000)
+			usleep(500000);
+		if (r != 1) {
+			printf("pixping: GAP no IPv4 default gateway via %s (%s)\n", ifname, r < 0 ? rwhy : "no default route");
+			printf("pixping: summary sent=0 got=0 lost=0\n");
+			return 3;
+		}
+		dst.sin_addr.s_addr = g;
+		char gs[INET_ADDRSTRLEN] = "";
+		inet_ntop(AF_INET, &dst.sin_addr, gs, sizeof gs);
+		printf("pixping: gateway of %s = %s (default route)\n", ifname, gs);
+	}
 	/* phase 2: ping */
 	int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	if (fd < 0) {

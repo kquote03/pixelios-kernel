@@ -56,6 +56,13 @@ class Host(unittest.TestCase):
         self.assertRegex(out, r'(?m)^pixping: GAP interface nosuch0 not ready after 1s \(interface missing\)$')
         self.assertRegex(out, r'(?m)^pixping: summary sent=0 got=0 lost=0$')
 
+    def test_gw_without_default_route_is_a_gap_exit_3(self):
+        # doc 56 Step 10: target `gw` = the interface's default gateway; lo never has one
+        rc, out = self.run_px('-W', '1', '-i', 'lo', 'gw')
+        self.assertEqual(rc, 3, out)
+        self.assertRegex(out, r'(?m)^pixping: GAP no IPv4 default gateway via lo \(no default route\)$')
+        self.assertRegex(out, r'(?m)^pixping: summary sent=0 got=0 lost=0$')
+
     def test_unreachable_destination_is_loss_not_success(self):
         self.need_icmp()
         # 127.0.0.1 is answered; an unrouted TEST-NET address on lo is not: either sendto fails (GAP) or replies time out
