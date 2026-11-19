@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""navthumb2png: rebuild the patch-0401 nav probe thumbnail from a run log (oriole speed round 2026-11-19).
+
+  tools/navthumb2png LOG OUT.png [--scale N] [--label L]   LOG = merged.log / usbnet.log; L = a patch-0403 label (home, general-probe); default: the first thumbnail
+  tools/navthumb2png --self-test
+
+Reads the lines `SWEET NAVTHUMB: begin ...`, `SWEET NAVTHUMB: y Y h H RRGGBB...` (27 pixels per half row, 54 x 120 grid, one pixel per
+20 touch px) and writes a PNG scaled by N (default 8). Missing rows are left magenta and counted.
+Last line: `RESULT: PASS navthumb2png LOG -> OUT rows=R missing=M` | `RESULT: FAIL navthumb2png <why>`."""
+import re
+import sys
+
+W, H, HALF = 54, 120, 27
+ROW = re.compile(r"SWEET NAVTHUMB: y (\d+) h ([01]) ([0-9a-f]+)\s*$")
+
+
+def parse(lines, label=None):
+    """rows of ONE thumbnail: the one whose begin line names `label` (patch 0403 `begin label L`), else the first one."""
+    grid, begin, cur, done = {}, None, None, False
+    for ln in lines:
+        if "SWEET NAVTHUMB: begin" in ln:
+            b = ln.split("SWEET NAVTHUMB: ", 1)[1].strip()
+            lm = re.search(r"begin label (\S+)", b)
+            cur = lm.group(1) if lm else "general-probe"
+            if begin is None and (label is None or cur == label) and not done:
+                begin = b
+            elif begin is not None:
+                done = True
+            continue
+        if "SWEET NAVTHUMB: end" in ln and begin is not None:
+            done = True
+        m = ROW.search(ln)
+        if m and len(m.group(3)) == HALF * 6 and begin is not None and not done:
+            y, h, hx = int(m.group(1)), int(m.group(2)), m.group(3)
+            if y < H:
+                grid[(y, h)] = [tuple(int(hx[i + k:i + k + 2], 16) for k in (0, 2, 4)) for i in range(0, len(hx), 6)]
+    return begin, grid
+
+
+def render(grid, out, scale):
+    from PIL import Image
+    img = Image.new("RGB", (W, H), (255, 0, 255))
+    missing = 0
+    for y in range(H):
+        for h in (0, 1):
+            px = grid.get((y, h))
+            if px is None:
+                missing += 1
+                continue
+            for i, p in enumerate(px):
+                img.putpixel((h * HALF + i, y), p)
+    img.resize((W * scale, H * scale), Image.NEAREST).save(out)
+    return missing
+
+
+def main(argv):
+    if argv[1:2] == ["--self-test"]:
+        import os
+        import tempfile
+        d = tempfile.mkdtemp()
+        lines = ["x SWEET NAVTHUMB: begin w 1125 h 2436\n"] + ["SWEET NAVTHUMB: y %d h %d %s\n" % (y, h, "0a141e" * HALF) for y in range(H) for h in (0, 1) if y != 5]
+        b, g = parse(lines)
+        out = os.path.join(d, "t.png")
+        miss = render(g, out, 1)
+        from PIL import Image
+        ok = b is not None and miss == 2 and Image.open(out).getpixel((3, 0)) == (10, 20, 30) and Image.open(out).getpixel((3, 5)) == (255, 0, 255)
+        print("RESULT: %s navthumb2png self-test" % ("PASS" if ok else "FAIL"))
+        return 0 if ok else 1
+    if len(argv) < 3:
+        print(__doc__)
+        return 2
+    scale = int(argv[argv.index("--scale") + 1]) if "--scale" in argv else 8
+    label = argv[argv.index("--label") + 1] if "--label" in argv else None
+    with open(argv[1], "r", errors="replace") as f:
+        begin, grid = parse(f, label)
+    if not grid:
+        print("RESULT: FAIL navthumb2png no NAVTHUMB rows in %s" % argv[1])
+        return 1
+    print("navthumb2png: begin %s" % begin)
+    miss = render(grid, argv[2], scale)
+    print("RESULT: PASS navthumb2png %s -> %s rows=%d missing=%d" % (argv[1], argv[2], len(grid), miss))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

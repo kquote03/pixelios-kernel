@@ -314,3 +314,4 @@ date	tool	old	new	reason	evidence
 2026-11-18	pack_aocfw.py	-	active	oriole: AOCFW zlib container of the stock aoc.bin for mkpayload --aocfw (xnu patch 0376)	tools/test_pack_aocfw.py
 2026-11-18	phone-battery	-	active	TP-031 fastboot battery read before a phone run (oriole lane rules)	tools/test_phone_battery.py
 2026-11-18	ref-capture	-	active	TP-056 read-only stock Linux reference capture in recovery	tools/test_ref_capture.py
+2026-11-19	navthumb2png	-	allowlisted	rebuilds the patch-0401 nav General-probe thumbnail (SWEET NAVTHUMB rows) from a run log as a PNG; oriole speed round	oriole upstream port doc 56 Step 11; --self-test

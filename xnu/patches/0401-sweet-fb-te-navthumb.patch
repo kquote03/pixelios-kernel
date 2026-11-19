@@ -1,0 +1,217 @@
+SWEET TE refresh measurement + nav General-probe thumbnail (patch 0401, oriole speed round 2026-11-19; user: this oriole has an aftermarket 60 Hz panel, stock is 90 Hz; the 0269 General probe found no row on the oriole root, rc -2 purple_last -1 in gpu-o-up1/up2). (1) Boot-arg sweette=N (default 0 = off, 1..5): a kernel thread waits 60 s, then N times samples the primary TE pin gpp0-3 (live DT drmdsim@1C2C0000 te-gpio = <&gpp0 3 0xf>; pinctrl-pins gpp0-3 CON 0xf EINT, oriole Android capture 20261114T072643Z) through its bank DAT register 0x10840004 (gpp0 bank 0x10840000 derived from soc.json gpp14 0x108401C0 with the 0x20 bank stride; DAT +0x4 as soc.json gpp23-dat) in a 1 s busy loop and logs 'SWEET TE: window K samples S edges E period_us median M min A max B -> F Hz high_us H' (edges 0 = GAP). READ ONLY: one ml_io_map of the pad page, loads only, no store anywhere. (2) At the first 0269 probe of a boot the probed surface is copied into a 54x120 thumbnail (every 20th touch pixel, the probe's byte order) under the probe's own surface reference, and a kernel thread logs it paced as 'SWEET NAVTHUMB: y Y h H RRGGBB...' between 'begin' (surface w/h/bpr/format, probe rc/runs/purple_last) and 'end'; tools/navthumb2png rebuilds the picture. Log only. Both default off / once per boot; nothing else changes.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b64d124..3bc7583 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -52,6 +52,7 @@ extern "C" int sweet_qr_hold;          /* bsd/dev/sweet_qr.c: the QR log is on s
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>   /* patch 0401: kernel_thread_start for the TE and NAVTHUMB threads */
+ #include <sys/proc.h>
+ #include <sys/sysctl.h>
+ 
+@@ -598,6 +599,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);   /* patch 0270: osfmk/kern/sched_prim.c */
+ extern "C" unsigned int ml_get_cpu_count(void);   /* patch 0270 */
+ extern "C" void sweet_recores_point(int late);   /* patch 0344: osfmk/kern/sched_prim.c */
++static void sweet_te_arm(void);   /* patch 0401 */
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -606,6 +608,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	sweet_te_arm();   /* patch 0401: boot-arg sweette, read-only TE refresh measurement */
+ 	/*
+ 	 * Patch 0270 (sprint-gpu 2026-11-09; scheduler hint only, no register or memory write outside the scheduler's own state): boot-arg sweetrecores=MASK
+ 	 * hands MASK to sched_perfcontrol_update_recommended_cores() (osfmk/kern/sched_prim.c, the hook CLPC uses): cores outside MASK stay online for
+@@ -1469,6 +1472,7 @@ sweet_fps_tick(uint64_t now_ns)
+  */
+ extern "C" uint32_t sweet_fb_last_surface;
+ uint32_t sweet_fb_last_surface;
++static void sweet_navthumb_take(SweetSurface *s, int rc, int runs, int purple);   /* patch 0401 */
+ extern "C" int sweet_fb_probe_general(int *out_y, int *runs, int *purple_last);
+ int
+ sweet_fb_probe_general(int *out_y, int *runs, int *purple_last)
+@@ -1522,10 +1526,179 @@ sweet_fb_probe_general(int *out_y, int *runs, int *purple_last)
+ 			run0 = -1;
+ 		}
+ 	}
++	sweet_navthumb_take(s, *out_y > 0 ? 0 : -2, *runs, *purple_last);   /* patch 0401: once per boot, log only */
+ 	OSSafeReleaseNULL(s);
+ 	return *out_y > 0 ? 0 : -2;
+ }
+ 
++/*
++ * Patch 0401 (oriole speed round 2026-11-19, LOG ONLY, no register, no store outside this file's buffers): the 0269 probe found no General row on the oriole root
++ * (gpu-o-up1/up2: `rc -2 runs 21 purple_last -1` on every repetition) and nobody has seen that root's Settings list (no camera). At the first probe of a boot the
++ * probed surface is reduced to a 54 x 120 thumbnail (every 20th touch pixel, the probe's own byte order: r = bits 23:16, g = 15:8, b = 7:0 of the little-endian
++ * word) and a kernel thread logs it, paced (2 lines per row, IOSleep 4 ms per line), as `SWEET NAVTHUMB: y Y h H RRGGBB...` (h 0 = touch x 0..520, 1 = 540..1060),
++ * so the host can rebuild the picture (tools/navthumb2png). The thread never touches the surface: the copy is made inside the probe, under its reference.
++ */
++#define NT_W 54
++#define NT_H 120
++static uint8_t sweet_nt_rgb[NT_H][NT_W][3];
++static int sweet_nt_state;   /* 0 = not taken, 1 = taken + thread started, 2 = refused */
++static int sweet_nt_rc, sweet_nt_runs, sweet_nt_purple;
++static uint32_t sweet_nt_w, sweet_nt_h, sweet_nt_bpr, sweet_nt_fmt;
++
++static void
++sweet_navthumb_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	char line[8 + 6 * (NT_W / 2) + 1];
++	IOLog("SWEET NAVTHUMB: begin w %u h %u bpr %u fmt %#x probe rc %d runs %d purple_last %d grid %dx%d step 20 (touch px)\n", sweet_nt_w, sweet_nt_h, sweet_nt_bpr,
++	    sweet_nt_fmt, sweet_nt_rc, sweet_nt_runs, sweet_nt_purple, NT_W, NT_H);
++	for (int y = 0; y < NT_H; y++) {
++		for (int h = 0; h < 2; h++) {
++			int o = 0;
++			for (int x = h * (NT_W / 2); x < (h + 1) * (NT_W / 2); x++) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, "%02x%02x%02x", sweet_nt_rgb[y][x][0], sweet_nt_rgb[y][x][1], sweet_nt_rgb[y][x][2]);
++			}
++			IOLog("SWEET NAVTHUMB: y %d h %d %s\n", y, h, line);
++			IOSleep(4);
++		}
++	}
++	IOLog("SWEET NAVTHUMB: end\n");
++	thread_terminate(current_thread());
++}
++
++static void
++sweet_navthumb_take(SweetSurface *s, int rc, int runs, int purple)
++{
++	if (sweet_nt_state != 0) {
++		return;
++	}
++	sweet_nt_state = 2;
++	const int offx = ((int)s->width - 1080) / 2, offy = ((int)s->height - 2400) / 2;
++	for (int y = 0; y < NT_H; y++) {
++		const uint8_t *row = (const uint8_t *)(s->kernelAddress() + s->offset + (uint64_t)(y * 20 + offy) * s->bytesPerRow);
++		for (int x = 0; x < NT_W; x++) {
++			uint32_t px;
++			memcpy(&px, row + (uint64_t)(x * 20 + offx) * 4, 4);
++			sweet_nt_rgb[y][x][0] = (uint8_t)(px >> 16);
++			sweet_nt_rgb[y][x][1] = (uint8_t)(px >> 8);
++			sweet_nt_rgb[y][x][2] = (uint8_t)px;
++		}
++	}
++	sweet_nt_rc = rc;
++	sweet_nt_runs = runs;
++	sweet_nt_purple = purple;
++	sweet_nt_w = s->width;
++	sweet_nt_h = s->height;
++	sweet_nt_bpr = s->bytesPerRow;
++	sweet_nt_fmt = s->pixelFormat;
++	thread_t t = THREAD_NULL;
++	if (kernel_thread_start(sweet_navthumb_thread, NULL, &t) != KERN_SUCCESS) {
++		IOLog("SWEET GAP: NAVTHUMB kernel_thread_start failed: no thumbnail\n");
++		return;
++	}
++	thread_deallocate(t);
++	sweet_nt_state = 1;
++}
++
++/*
++ * Patch 0401: the panel's real refresh rate (user 2026-11-19: this oriole has an aftermarket 60 Hz panel; the stock one is 90 Hz). The panel is command mode and its
++ * tearing-effect (TE) output is the primary TE pin: live DT (oriole Android capture 20261114T072643Z) drmdsim@1C2C0000 te-gpio = <0x2e 3 0xf>, phandle 0x2e =
++ * pinctrl@10840000/gpp0, so gpp0-3; pinctrl-pins.txt of the same capture: `pin 116 (gpp0-3) CON(0xf)` (EINT input). Bank address: soc.json gpp14 = 0x108401C0
++ * [read from source] = 0x10840000 + 14 x 0x20, so gpp0 = 0x10840000 (bank stride 0x20 [derived]); DAT = bank + 0x4 (soc.json gpp23-dat). Boot-arg sweette=N
++ * (default 0 = off, 1..5 windows): a kernel thread waits 60 s, then N times samples DAT bit 3 in a 1 s busy loop (READ ONLY, no write anywhere) and logs
++ * `SWEET TE: window K samples S edges E period_us median M min A max B -> F.FF Hz high_us H`, 60 s apart. Edges 0 = GAP (pin quiet, or DAT does not follow an EINT input).
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++#define TE_BANK_PA   0x10840000ull
++#define TE_DAT_OFF   0x4u
++#define TE_BIT       3u
++#define TE_MAXP      512
++
++static uint32_t sweet_te_per[TE_MAXP];
++
++static void
++sweet_te_thread(void *arg, wait_result_t wr)
++{
++	(void)wr;
++	uint32_t n = (uint32_t)(uintptr_t)arg;
++	vm_offset_t va = ml_io_map((vm_offset_t)TE_BANK_PA, 0x1000);
++	if (va == 0) {
++		IOLog("SWEET GAP: TE ml_io_map(%#llx) failed: no refresh measurement\n", TE_BANK_PA);
++		thread_terminate(current_thread());
++		return;
++	}
++	volatile uint32_t *dat = (volatile uint32_t *)(va + TE_DAT_OFF);
++	IOSleep(60000);
++	for (uint32_t k = 0; k < n; k++) {
++		uint64_t t0 = mach_absolute_time(), win = 0, now = t0, last_rise = 0, rise_t = 0, high_sum = 0;
++		nanoseconds_to_absolutetime(1000000000ull, &win);
++		uint32_t samples = 0, edges = 0, np = 0, highs = 0;
++		int prev = (int)((*dat >> TE_BIT) & 1u);
++		while ((now = mach_absolute_time()) - t0 < win) {
++			int v = (int)((*dat >> TE_BIT) & 1u);
++			samples++;
++			if (v && !prev) {
++				edges++;
++				if (last_rise != 0 && np < TE_MAXP) {
++					uint64_t ns = 0;
++					absolutetime_to_nanoseconds(now - last_rise, &ns);
++					sweet_te_per[np++] = (uint32_t)(ns / 1000u);
++				}
++				last_rise = now;
++				rise_t = now;
++			} else if (!v && prev && rise_t != 0) {
++				uint64_t ns = 0;
++				absolutetime_to_nanoseconds(now - rise_t, &ns);
++				high_sum += ns / 1000u;
++				highs++;
++			}
++			prev = v;
++		}
++		if (edges == 0) {
++			IOLog("SWEET TE: GAP window %u samples %u edges 0 level %d: pin gpp0-3 quiet (or DAT does not follow the EINT input): no refresh rate\n", k, samples, prev);
++		} else {
++			/* insertion sort (<= 512 entries, once per window) for the median */
++			for (uint32_t i = 1; i < np; i++) {
++				uint32_t x = sweet_te_per[i], j = i;
++				while (j > 0 && sweet_te_per[j - 1] > x) {
++					sweet_te_per[j] = sweet_te_per[j - 1];
++					j--;
++				}
++				sweet_te_per[j] = x;
++			}
++			uint32_t med = np ? sweet_te_per[np / 2] : 0, mn = np ? sweet_te_per[0] : 0, mx = np ? sweet_te_per[np - 1] : 0;
++			uint32_t hz100 = med ? (uint32_t)(100000000ull / med) : 0;
++			IOLog("SWEET TE: window %u samples %u edges %u period_us median %u min %u max %u -> %u.%02u Hz high_us %llu\n", k, samples, edges, med, mn, mx,
++			    hz100 / 100u, hz100 % 100u, highs ? high_sum / highs : 0ull);
++		}
++		if (k + 1 < n) {
++			IOSleep(60000);
++		}
++	}
++	thread_terminate(current_thread());
++}
++
++static void
++sweet_te_arm(void)
++{
++	uint32_t n = 0;
++	if (!PE_parse_boot_argn("sweette", &n, sizeof(n)) || n == 0) {
++		return;
++	}
++	if (n > 5) {
++		IOLog("SWEET GAP: TE sweette=%u above 5, using 5\n", n);
++		n = 5;
++	}
++	thread_t t = THREAD_NULL;
++	if (kernel_thread_start(sweet_te_thread, (void *)(uintptr_t)n, &t) != KERN_SUCCESS) {
++		IOLog("SWEET GAP: TE kernel_thread_start failed\n");
++		return;
++	}
++	thread_deallocate(t);
++	IOLog("SWEET TE: armed (patch 0401, sweette=%u): read-only gpp0-3 (TE) DAT samples, 1 s windows from +60 s\n", n);
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
