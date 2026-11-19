@@ -338,3 +338,50 @@ pixos-bluetool, pixos-bluetool, libsalog fa4de81e); built by `$A/uifix/daily-bui
 `$A/boot-backup/boot_b-ios-daily-4413f62a-full2.img`, sha256 4413f62a8696cee8e948c54294eec935e4562d5bcb32719ad3b01e91285d8558, flashed to boot_b
 after daily-verify7-full. Still for the user's eyes/ears: the Settings > Bluetooth switch and device list, the connect sound on a charger, lock /
 key-click sounds, Settings > Wi-Fi at home (stored network in range at boot), the volume HUD.
+
+## Step 9: sound untethered, volume keys, Wi-Fi status 3 (2026-11-19; rows listen1, vol1, vol2, daily-verify8-full, daily image 7 in device/google/oriole/docs/PORT.md)
+
+User report on daily image 6 (untethered): BT works; Wi-Fi off in Settings; volume keys do nothing; all sounds silent. Later (relayed): "sound works now".
+
+- **Sound: root cause = the AOC load waited 300 s without a USB host** (*read from source*, consistent with every observation). Patch 0376's load
+  thread waits (bounded 300 s) for the first USB log datagram (`sweet_usblog_sent`, 0374). Upstream 0184 sends nothing until 192.168.7.1 answers
+  ARP, so on a charger or away from the host the counter stays 0: the AOC, amps and `/dev/sweetaudio` came up only ~5 min after boot. Tethered runs
+  always log `load start after 0 ms (usb log up)` (verify7, listen1), which is why every tethered check passed. The old audio-only kernel counted
+  a send that ARP still held as sent, so it did not wait. **Patch 0399**: wait 3 s by default, `sweetaocwait=<ms>` (<= 300000) for bring-up runs.
+  Kernel `$A/kernels/kernel-up-91e56777.sweet` (sha256 91e567779aa0e0d118e496c60162aa2e9fed70ac68e259943c54191a059d2366; deee3753 stack + 0399).
+  The untethered effect can only be confirmed off USB (the user's next untethered boot): with USB attached the log is up at once.
+- **Levels in the full configuration equal the audio-only image** (*observed* listen1): boot connect sound tap `peak in 4337 out 17268`, kernel
+  `peak 8654` (a12p/verify4: 4337 / 17269 / 8654); /dev tone kernel peak 11628; AudioQueue `peak in 23198 out 29196`; system sound `in 6426 out
+  25587`. System volume Audio/Video 1.000, Ringtone 1.000, ringer state 1 (not silent); amps power up again after the 30 s idle (`open #N ... amps
+  on, detector MOVED` for later opens). Nothing in the merged kernel changed the amp side: the only amp-pad difference vs verify4 is BT_REG_ON
+  (gpp16-2, CON16 0x133 / DAT16 7). Objective loudness witness: not built. The 0389 detector reads PCM at the amp input (it scales with the input:
+  0x74214 boot chime, 0xa3a80 tone), not the speaker drive. SPK_OUTPUT_POWER needs the DSP in the path (bypassed). A VMON/IMON witness needs
+  DSP1 RX3/RX4 back on VMON/IMON plus a calibrated read: open.
+- **Volume keys: root cause = no volume control on VirtualAudio's Null_Device route** (*observed* vol1). Physical keys work up to backboardd
+  (`SWEET KEYS: key=1/2`, `SWEET HID: key 0xe9/0xea down (1 clients)`; the user pressed during vol1). SpringBoard reacts only with keybag calls
+  (`SWEET AKS: SpringBoard sel 8 -> 0xe00002c7`), and no volume change reaches mediaserverd. VirtualAudio: `VolumeProperties for Port: pnul is
+  [ ]`, `Device Speaker does not support hardware volume range property`. A `setActiveCategoryVolumeTo 0.25` changes no HAL property
+  (SALOG_PROPLOG: only `airs`/`nsrt`/`datc` sets) and no tap level. So iOS never scales the mix the tap reads. **Fix (userland)**:
+  `sweetaudio_vol` watches the HID event stream (monitor client) for consumer Volume Increment/Decrement, steps its own volume by 1/16, sets it on
+  AVSystemController (best effort) and publishes it to the libsalog tap (volume stage from Step 8, amplitude v^2). *Observed* vol2: `key
+  volume-down: volume 0.938 ... tap gain 0.8789`, AQ tone `out 29196 -> 25661`, system sound `25587 -> 19667` at 0.875. In daily image 7 (job
+  org.pixelios.sweetaudio-vol, KeepAlive). Not done: the volume HUD (SpringBoard draws none for a route without a volume control; a real
+  Speaker route is the proper fix, doc 55 s.4).
+- **Wi-Fi boot join status 3 = WLC_E_STATUS_NO_NETWORKS** (bcmevent.h:411, dhd_common.c:4341 "no matching network found"). The cause is location, not
+  intermittent (*observed*, counted per boot): the 2026-11-18 boots that joined (wlan-up4, all1) saw 9-19 BSSs with home-router OUIs and the
+  stored SSID once each. All five 2026-11-19 boots (ui-diag1..4, verify7: 18-31 BSSs) saw only one campus OUI (00:35:1a, AAU-* networks) and the
+  stored SSID 0 times. The credential blob is built the same way for both (mkwlancred, PIXOS_WIFI_NET=2, wpa2-psk). BT was on by default in all1,
+  which joined, so coexistence is not the cause.
+- **Wi-Fi in Settings without a boot join: open** (*read from source*). Upstream has no Settings flow that works without a boot join. The registry
+  objects (0200) are published at boot, but en0, its BSD name, the Apple80211 kept radio and the live scan (0268/0281/0282/0292) exist only after a
+  finished L26 (join + ping) in the keep hand-over (`sweet_wlan.c` keep thread). The standalone `sweet_wlan_en0_init` (0199) is "NOT CALLED by
+  anything yet". The engine runs as one scripted G2 list (L22..L26): a failed L24 ends it with the undo. A Settings-visible radio without a link
+  needs a new engine exit (hand over after L23 with the link down, no flow ring until a later join, a scan-only kept radio) and is kernel work
+  on upstream's Wi-Fi stack (Wi-Fi parked, user 2026-11-18). Today: Settings shows Wi-Fi when the stored network is in range at boot (home).
+- **Tools**: `pixui_probe seq` (PIXUI_SEQ timed patterns, PIXUI_FINAL_VOL), libsalog `SALOG_PROPLOG=1`, AGENTS.md pointer row + flash-pair approval line.
+
+**Daily image 7** = daily image 6 args and flags on kernel 91e56777 (+0399) + overlay ov-daily7 (daily6 overlay + `sweetaudio_vol` and its job,
+libsalog 05b76b40); built by `$A/uifix/daily-build7.sh` (not in git: credential env). Image `$A/boot-backup/boot_b-ios-daily-54909f77-full3.img`,
+sha256 54909f7754fcea12a0d9a67f4c87df53a0f07a2f36b73f1191563a2e5b438229, flashed to boot_b after daily-verify8-full. Boots: 4 of 16 (listen1, vol1, vol2,
+verify8). User reports (relayed) during this round: "sound works now", "the volume keys are working now". To check by the user: sound within
+~2 min of an UNTETHERED boot (charger only), the volume keys change the level, Settings > Wi-Fi at home.
