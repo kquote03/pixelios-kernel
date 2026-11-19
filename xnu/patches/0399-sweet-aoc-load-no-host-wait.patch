@@ -1,0 +1,46 @@
+SWEET AOC load without a USB host (patch 0399, oriole upstream port Step 9). The AOC firmware load thread (patch 0376) waited up to 300 s for
+the first USB log datagram (sweet_usblog_sent, patch 0374). Upstream patch 0184 makes the log send nothing until 192.168.7.1 answers ARP, so on
+a charger or a host without the usbnet address (every untethered daily boot) the counter stays 0 and the AOC load, and with it the amps and
+/dev/sweetaudio, started only after 300 s (tethered runs log "load start after 0 ms" / "500 ms": daily-verify7-full, daily-verify4-audio).
+The wait is now 3 s by default; boot-arg sweetaocwait=<ms> (clamped to 300000) gives bring-up runs the long wait back. Nothing else changes.
+
+diff --git a/bsd/dev/sweet_aoc_load.c b/bsd/dev/sweet_aoc_load.c
+--- a/bsd/dev/sweet_aoc_load.c
++++ b/bsd/dev/sweet_aoc_load.c
+@@ -12,7 +12,7 @@
+  *     body extent, unmapped before the GSA call. Round 1 used ml_io_map_wcomb for all 48 MiB: that allocates from io_submap,
+  *     which is 8 MiB (IO_MAP_SIZE, osfmk/arm/io_map.c:65) with KMA_NOFAIL (:120-130), i.e. a panic in kmem_alloc that the
+  *     thread-based USB log cannot show (run o6-a6-aocload: silent stop right after the "pass 2" line); a dsb sy after every register write and after the carveout copy.
+- * Waits: the USB log (300 s, as patch 0374), 300 ms after each progress line, the GSA reply (10 s, 1 ms polls). No retry.
++ * Waits: the USB log (patch 0399: sweetaocwait ms, default 3 s; was 300 s as patch 0374), 300 ms after each progress line, the GSA reply (10 s, 1 ms polls). No retry.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -45,7 +45,12 @@
+ extern void sweet_aoc_start_after_load(uint32_t image_size);   /* bsd/dev/sweet_aoc_start.c (patch 0377), sweetaoc=3 */
+ static int swal_mode = 2;      /* 3 = patch 0377: after "gsa load ok" go on with the AOC start (step A8) */
+ 
+-#define SWAL_WAIT_USB_MS  300000u
++/* patch 0399: the wait for the first USB log datagram. Since upstream patch 0184 the log sends nothing until 192.168.7.1 answers ARP,
++ * so sweet_usblog_sent stays 0 on a charger or on a host without the usbnet address (every untethered daily boot): the AOC load, and
++ * with it /dev/sweetaudio, waited the full 300 s there (tethered runs: "load start after 0 ms" / "500 ms"). Default 3 s; boot-arg
++ * sweetaocwait=<ms> (0..300000) restores a longer wait for bring-up runs that must see every line before a possible stall. */
++#define SWAL_WAIT_USB_MS  3000u
++#define SWAL_WAIT_USB_MAX 300000u
+ #define SWAL_SETTLE_MS    300u
+ #define SWAL_CHUNK        (64u * 1024u)
+ 
+@@ -276,7 +281,12 @@
+ 	const char *en;
+ 	int rc;
+ 
+-	for (ms = 0; sweet_usblog_sent == 0 && ms < SWAL_WAIT_USB_MS; ms += 100u) {
++	uint32_t wmax = SWAL_WAIT_USB_MS;       /* patch 0399 */
++
++	if (PE_parse_boot_argn("sweetaocwait", &wmax, sizeof(wmax)) && wmax > SWAL_WAIT_USB_MAX) {
++		wmax = SWAL_WAIT_USB_MAX;
++	}
++	for (ms = 0; sweet_usblog_sent == 0 && ms < wmax; ms += 100u) {
+ 		swal_sleep_ms(NULL, 100);
+ 	}
+ 	printf("SWEET AOC: load start after %u ms (usb log %s); GSA command 90 only, %s\n", ms, sweet_usblog_sent ? "up" : "NOT up", swal_mode == 3 ? "then the A8 start (sweetaoc=3)" : "no AOC start");
