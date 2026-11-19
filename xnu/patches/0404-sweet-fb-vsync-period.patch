@@ -1,0 +1,36 @@
+SWEET FB vsync period boot-arg (patch 0404, oriole speed round 2026-11-19; plan: match the kernel's vsync timer to the panel). Patch 0401 measured oriole's aftermarket panel TE at 58.23 Hz (period median 17172 us, min 17169, max 17175, three 1 s windows, run speed-base), while the emulated vsync tick (patches 0046/0101/0149) runs 16667 us = 60.00 Hz: about 1.8 panel copies per second are overwritten before the panel scans them, and CoreAnimation is told a 16.667 ms frame interval (the vsync notification's period word, patch 0101). Boot-arg sweetfb_vsync_us=US (8000..40000; absent or 0 = 16667 as before; outside = GAP line, default kept) sets the tick period used everywhere SWEET_FB_VSYNC_US was used (timer arm, absolute re-arm 0149, the period in the vsync notification, the 0190 resume). Software timer only: no register, no store to hardware. Phase is still free-running (no TE interrupt).
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ac502c9..8cf5553 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,7 +92,11 @@ enum {
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
++/* patch 0404: the vsync tick period is a variable (boot-arg sweetfb_vsync_us, default 16667 = 60.00 Hz as before) so it can match the panel: oriole's aftermarket panel runs
++ * 58.23 Hz (TE period 17172 us median, patch 0401 run speed-base); a 60.00 Hz tick copies ~1.8 frames per second the panel never shows. */
++#define SWEET_FB_VSYNC_US_DEFAULT       16667
++static uint32_t sweet_fb_vsync_us = SWEET_FB_VSYNC_US_DEFAULT;
++#define SWEET_FB_VSYNC_US               (sweet_fb_vsync_us)
+ 
+ /*
+  * Patch 0361 (lowclk A5-3, research 160 s.1.1 / U2): skip the panel copy when nothing the copy reads has changed since the last copy. A present() is queued by
+@@ -689,6 +693,17 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	{
++		uint32_t vu = 0;   /* patch 0404 */
++		if (PE_parse_boot_argn("sweetfb_vsync_us", &vu, sizeof(vu)) && vu != 0) {
++			if (vu < 8000 || vu > 40000) {
++				IOLog("SWEET FB: GAP sweetfb_vsync_us=%u outside 8000..40000: %u us kept\n", vu, SWEET_FB_VSYNC_US_DEFAULT);
++			} else {
++				sweet_fb_vsync_us = vu;
++				IOLog("SWEET FB: vsync tick %u us (sweetfb_vsync_us, patch 0404; default %u)\n", vu, SWEET_FB_VSYNC_US_DEFAULT);
++			}
++		}
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
