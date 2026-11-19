@@ -1,0 +1,45 @@
+SWEET nav: home swipe after every unlock (patch 0405, oriole speed round 2026-11-19; follow-up of 0255). On the oriole root iOS resumes the user's last app (Safari) at the unlock: the 0403 'home' thumbnail of run speed-free (right before the settings-open tap of repetition 0) shows Safari's black page and toolbar, not the home screen, so the whole rep 0 (and the probe of every rep) ran inside Safari. Patch 0255 ends the unlock row with the calibrated app-home swipe only when Preferences exec'd in the unlock window; boot-arg sweetnavhome=1 (default 0 = unchanged) does it after every unlock, with its own log line. Input injection only (the same 540,2398 -> 1200 swipe), no register.
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index f6584e7..8557fb6 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -539,6 +539,7 @@ extern "C" int sweet_fb_probe_general(int *out_y, int *runs, int *purple_last);
+ extern "C" void sweet_fb_navthumb(const char *label);   /* patch 0403: labelled thumbnail of the last presented surface (log only) */
+ /* patch 0403: per-root tap overrides, (x << 16) | y in touch px, 0 = the calibrated table value (boot-args sweetnavset, sweetnavclk; sweetnavgy = General fallback y) */
+ static UInt32 gNavSet, gNavClk, gNavGenY;
++static UInt32 gNavHome;   /* patch 0405: boot-arg sweetnavhome=1: always end the unlock row with the app-home swipe */
+ extern "C" void sweet_fb_display_state(uint64_t *vsync, uint64_t *last_swap_abs);   /* patch 0260 */
+ extern "C" uint32_t sweet_exec_pref_count;   /* patch 0255: execs of "Preferences" so far, counted in bsd/kern/kern_exec.c */
+ 
+@@ -873,6 +874,9 @@ SweetHIDTouch::start(IOService *provider)
+ 		if (PE_parse_boot_argn("sweetnavclk", &gNavClk, sizeof(gNavClk)) && gNavClk) {
+ 			IOLog("SWEET NAV: app-launch tap %u,%u (sweetnavclk, patch 0403)\n", gNavClk >> 16, gNavClk & 0xffffu);
+ 		}
++		if (PE_parse_boot_argn("sweetnavhome", &gNavHome, sizeof(gNavHome)) && gNavHome) {   /* patch 0405 */
++			IOLog("SWEET NAV: unlock ends with the app-home swipe (sweetnavhome, patch 0405): iOS may resume the last app at unlock\n");
++		}
+ 		if (PE_parse_boot_argn("sweetnavgy", &gNavGenY, sizeof(gNavGenY)) && gNavGenY) {
+ 			if (gNavGenY < 700 || gNavGenY > 2340) {
+ 				IOLog("SWEET GAP: HID sweetnavgy=%u outside 700..2340: 1900 kept\n", gNavGenY);
+@@ -1156,15 +1160,19 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 			sender->setTimeoutMS(100);
+ 			return;
+ 		}
+-		if (sweet_exec_pref_count != self->fNavPref0 && self->fNavHomeSt == 0) {
++		if ((sweet_exec_pref_count != self->fNavPref0 || gNavHome) && self->fNavHomeSt == 0) {   /* patch 0405: or always (sweetnavhome=1) */
+ 			/*
+ 			 * Patch 0255 (T-c87c, G-10b-nav): Preferences exec'd inside the unlock window in nav8/nav9/nav10 [obs docs/reviews/T-c87c-proof.md s1: 7-9 s after the first swipe,
+ 			 * with the wake tap at 540,1200 and at 540,70 alike], so rep 0 ran inside Settings: settings-open / general-open / about-open out of step. Whatever launched it
+ 			 * [cause not yet known: the witness lines SWEET NAV: EVT and SWEET EXEC of this patch name the touch], the session is inside the app, so the unlock row ends with the
+ 			 * calibrated app-home swipe and rep 0 then starts from the home screen as in a healthy boot. Input injection only.
+ 			 */
+-			IOLog("SWEET NAV: unlock: Preferences launched inside the unlock window (exec count %u -> %u, swaps %llu): app-home swipe before rep 0 goes on\n",
++			if (sweet_exec_pref_count == self->fNavPref0) {   /* patch 0405 */
++				IOLog("SWEET NAV: unlock: app-home swipe before rep 0 goes on (sweetnavhome=1; oriole run speed-free: Safari, the last app, was in front after the unlock), swaps %llu\n", d);
++			} else {
++				IOLog("SWEET NAV: unlock: Preferences launched inside the unlock window (exec count %u -> %u, swaps %llu): app-home swipe before rep 0 goes on\n",
+ 			    (unsigned)self->fNavPref0, (unsigned)sweet_exec_pref_count, d);
++			}
+ 			self->fNavHomeSt = 1;
+ 			self->touch(0, true, 540, 2398);
+ 			sender->setTimeoutMS(100);

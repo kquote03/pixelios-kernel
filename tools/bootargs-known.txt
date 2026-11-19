@@ -532,6 +532,7 @@ sweetmmio	patch:0170
 sweetnav	patch:0243
 sweetnavclk	patch:0403
 sweetnavgy	patch:0403
+sweetnavhome	patch:0405
 sweetnavset	patch:0403
 sweetnavstart	patch:0243
 sweetnull	patch:0048
