@@ -1,4 +1,4 @@
-SWEET Wi-Fi robust boot join (patch 0406, oriole 2026-11-19; user: the open guest network did not join on daily image 9). (1) Directed boot scan: the L23 escan carries the credentials SSID (wl_scan_params.ssid, escan arg +12/+16) and scan_type active (OpenBSD bwfm_scan_v2 with a desired ESSID), engine and glue alike; boot-arg sweetwlandscan=0 = the old broadcast passive scan. Dense campus: the broadcast scan filled the 48-event cap of the boot run before the join (daily-verify11/12). (2) Strongest AP: a stronger scan record of the join SSID replaces the wildcard target (Get 103 IEs). (3) L24 join retries: up to 3 attempts of the same join on SET_SSID != 0 or no SET_SSID/LINK in the budget, only while ring 0 and the event cap keep room; glue: one request + re-post pair per extra attempt (payload unchanged, no payload store). (4) Open re-join: the 0282 machine re-joins an open network after an AP loss (no PMK/RSNE/4-way; wpa_auth never SET). Pure helpers in sweet_wlan_join_pick.h (host test shim/wlan_join_pick_host_test.c). No new register, address or store kind.
+SWEET Wi-Fi robust boot join (patch 0406, oriole 2026-11-19; user: the open guest network did not join on daily image 9). (1) Directed boot scan: the L23 escan carries the credentials SSID (wl_scan_params.ssid, escan arg +12/+16) and scan_type active (OpenBSD bwfm_scan_v2 with a desired ESSID), engine and glue alike; boot-arg sweetwlandscan=0 = the old broadcast passive scan. Dense campus: the broadcast scan filled the 48-event cap of the boot run before the join (daily-verify11/12). (2) Strongest AP: a stronger scan record of the join SSID replaces the wildcard target (Get 103 IEs). (3) L24 join retries: up to 3 attempts of the same join on SET_SSID != 0 or no SET_SSID/LINK in the budget, only while ring 0 and the event cap keep room; glue: one request + re-post pair per extra attempt (payload unchanged, no payload store). (4) Open re-join: the 0282 machine re-joins an open network after an AP loss (no PMK/RSNE/4-way; wpa_auth never SET). Pure helpers in sweet_wlan_join_pick.h (host test shim/wlan_join_pick_host_test.c). (5) A ring-2 event frame shorter than the 72 B header (54 B after a failed join, observed) is consumed unread and re-posted instead of stopping the run. No new register, address or store kind.
 diff -ruN a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 --- a/bsd/dev/sweet_wlan.c	2026-11-19 16:39:25.606995617 +0400
 +++ b/bsd/dev/sweet_wlan.c	2026-11-19 16:42:49.623983194 +0400
@@ -97,8 +97,30 @@ diff -ruN a/bsd/dev/sweet_wlan_g2e.h b/bsd/dev/sweet_wlan_g2e.h
  		ex = swg_d4d_waitn(x, 1u, polls, &w, &waited);
 diff -ruN a/bsd/dev/sweet_wlan_g2.h b/bsd/dev/sweet_wlan_g2.h
 --- a/bsd/dev/sweet_wlan_g2.h	2026-11-19 16:39:25.612471547 +0400
-+++ b/bsd/dev/sweet_wlan_g2.h	2026-11-19 16:41:27.393852361 +0400
-@@ -3105,9 +3105,10 @@
++++ b/bsd/dev/sweet_wlan_g2.h	2026-11-19 17:46:29.803382421 +0400
+@@ -2222,6 +2222,21 @@
+ 		return 0;
+ 	}
+ 	bp = x->in.evbuf + (uint64_t)sl * SWD_EVBUF_LEN;
++	if (dlen < SWG_E_FRAME && x->rxoff <= SWD_EVBUF_LEN) {     /* patch 0406: a frame shorter than the 72 B event header (observed: 54 B after a failed join, speed-base / wsd3) is consumed unread and its buffer re-posted like any other, no stop; type ~0 matches no handler */
++		static uint32_t nshort;
++
++		ev->type = 0xFFFFFFFFu;
++		ev->dlen = dlen;
++		if (nshort++ < 8u) {
++			swl_gap("scan", "short event frame consumed unread", "medium");
++			printf("SWEET WLAN: L%u event of %u B (below the %u B header) consumed unread, buffer re-posted\n", (unsigned)x->elv, dlen, SWG_E_FRAME);
++		}
++		x->epid[sl] = 0u;
++		x->evqb[x->evq] = sl;
++		x->evn++;
++		x->evq++;
++		return 0;
++	}
+ 	if (dlen < SWG_E_FRAME || x->rxoff > SWD_EVBUF_LEN || dlen > SWD_EVBUF_LEN - x->rxoff) {
+ 		SWG_E_STOP(x, "event data length %u, rx offset %u", dlen, x->rxoff);
+ 		return 0;
+@@ -3105,9 +3120,10 @@
  	return 0;
  }
  
@@ -111,7 +133,7 @@ diff -ruN a/bsd/dev/sweet_wlan_g2.h b/bsd/dev/sweet_wlan_g2.h
  {
  	char what[16 + 4u * SWG_E_PAYW];
  	struct swd4b_ioctl_d2h cm;
-@@ -3161,6 +3162,10 @@
+@@ -3161,6 +3177,10 @@
  			}
  		}
  	}
@@ -122,7 +144,7 @@ diff -ruN a/bsd/dev/sweet_wlan_g2.h b/bsd/dev/sweet_wlan_g2.h
  	if (j->ssid_seen && j->ssid_status != 0u) {
  		SWG_J_STOP(x, "H5", "join set_ssid status=%u", j->ssid_status);
  	} else if (!j->ssid_seen || !j->link_up) {
-@@ -3176,7 +3181,7 @@
+@@ -3176,7 +3196,7 @@
  	struct swg_ej ej;
  	struct swd4b_ioctl_d2h cm;
  	char what[16 + 4u * SWG_E_PAYW];
@@ -131,7 +153,7 @@ diff -ruN a/bsd/dev/sweet_wlan_g2.h b/bsd/dev/sweet_wlan_g2.h
  	int ex;
  
  	memset(&ej, 0, sizeof ej);
-@@ -3231,11 +3236,32 @@
+@@ -3231,11 +3251,32 @@
  			printf("SWEET WLAN: sup_wpa set 0 ok\n");
  		}
  	}

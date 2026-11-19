@@ -1,4 +1,4 @@
-SWEET large-surface pixel probe + script thumbnails (patch 0407, oriole Safari 2026-11-19, PixOS doc 57 s.7; LOG ONLY, both default off). (1) Boot-arg sweetsurfprobe=SEC: every SEC s (60 rounds) per surface >= 256x128 (plane 0 of a planar one): non-zero and differ-from-first counts on a 64x64 word grid, a 16-word fingerprint, creator process (new field SweetSurface::creator, set at create), lock/write-unlock counts, last locker and seed; logged on change, <= 48 lines per round (`SWEET SURFPROBE r R: id ...`). Answers whether WebKit drew into its w30r page tiles. Read only (kernelAddress() loads under a retain). (2) sweetscript (patch 0156) takes a 1-number step "T" = the 0403 labelled thumbnail scriptN of the last presented surface (no touch), so a scripted boot can photograph an app N seconds after launching it.
+SWEET large-surface pixel probe + script thumbnails (patch 0407, oriole Safari 2026-11-19, PixOS doc 57 s.7; LOG ONLY, both default off). (1) Boot-arg sweetsurfprobe=SEC: every SEC s (60 rounds) per surface >= 256x128 (plane 0 of a planar one): non-zero and differ-from-first counts on a 64x64 word grid, a 16-word fingerprint, creator process (new field SweetSurface::creator, set at create), lock/write-unlock counts, last locker and seed; logged on change, <= 48 lines per round (`SWEET SURFPROBE r R: id ...`). Answers whether WebKit drew into its w30r page tiles. Read only (kernelAddress() loads under a retain); while the probe runs, WebKit processes' creates and first 24 locks are logged too. (2) sweetscript (patch 0156) takes a 1-number step "T" = the 0403 labelled thumbnail scriptN of the last presented surface (no touch), so a scripted boot can photograph an app N seconds after launching it.
 diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-19 16:43:22.663880714 +0400
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-19 16:43:38.991010806 +0400
@@ -53,8 +53,8 @@ diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cp
  	if (st == 0) {
 diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-19 16:43:22.654826443 +0400
-+++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-19 16:44:20.969007455 +0400
-@@ -296,6 +296,110 @@
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-19 17:34:54.822158513 +0400
+@@ -296,6 +296,112 @@
  	}
  }
  
@@ -125,10 +125,12 @@ diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cp
 +					skipped++;
 +				} else {
 +					sweet_surf_probe_last[id] = sig;
-+					IOLog("SWEET SURFPROBE r %u: id %u %ux%u fmt 0x%x planes %u bpr %u creator %s nonzero %u/%u differ %u/%u fp %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x"
-+					    " locks %u wunlocks %u locker %s seed %u\n", round, id, w, h, s->pixelFormat, s->planeCount, bpr, s->creator[0] ? s->creator : "-", nz, n, diff, n,
-+					    fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7], fp[8], fp[9], fp[10], fp[11], fp[12], fp[13], fp[14], fp[15],
-+					    sweet_surf_locks[id], sweet_surf_wunlocks[id], sweet_surf_locker[id][0] ? sweet_surf_locker[id] : "-", s->state != NULL ? sweet_surface_seed_peek(s) : 0);
++					/* two lines: IOLog cuts a line near 256 characters */
++					IOLog("SWEET SURFPROBE r %u: id %u %ux%u fmt 0x%x planes %u bpr %u creator %s nonzero %u/%u differ %u/%u locks %u wunlocks %u locker %s seed %u purg %u\n",
++					    round, id, w, h, s->pixelFormat, s->planeCount, bpr, s->creator[0] ? s->creator : "-", nz, n, diff, n,
++					    sweet_surf_locks[id], sweet_surf_wunlocks[id], sweet_surf_locker[id][0] ? sweet_surf_locker[id] : "-", s->state != NULL ? sweet_surface_seed_peek(s) : 0, s->purgeable);
++					IOLog("SWEET SURFPROBE fp r %u: id %u %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", round, id,
++					    fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7], fp[8], fp[9], fp[10], fp[11], fp[12], fp[13], fp[14], fp[15]);
 +				}
 +			}
 +		}
@@ -165,7 +167,7 @@ diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cp
  /* The table lock; the framebuffer may publish a surface before the root starts. */
  static void
  sweet_surface_init_lock(void)
-@@ -307,6 +411,7 @@
+@@ -307,6 +413,7 @@
  		}
  	}
  	sweet_surf_scan_start();
@@ -173,7 +175,7 @@ diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cp
  }
  
  static SweetSurface *
-@@ -1080,6 +1185,9 @@
+@@ -1080,7 +1187,14 @@
  	}
  	char name[32];
  	proc_selfname(name, sizeof(name));
@@ -181,8 +183,28 @@ diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cp
 +		strlcpy(s->creator, name, sizeof(s->creator));   /* patch 0407 */
 +	}
  	bool first_log = (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64);
++	if (!first_log && sweet_surf_probe_secs != 0 && strncmp(name, "com.apple.WebKit", 16) == 0) {   /* patch 0407: WebKit's creates too while the probe runs (at most 32) */
++		static uint32_t wk_creates;
++		first_log = OSAddAtomic(1, (volatile SInt32 *)&wk_creates) < 32;
++	}
  	bool pref_log = false;
  	if (ret == kIOReturnSuccess && strncmp(name, "Preferences", sizeof(name)) == 0) {   /* patch 0261 */
+ 		pref_log = (uint32_t)OSAddAtomic(1, (volatile SInt32 *)&sweet_surf_pref_creates) < SWEET_SURF_PREF_LOG_MAX;
+@@ -1596,6 +1710,14 @@
+ {
+ 	SweetSurfCpuScope cpuScope(1, 2);   /* patch 0194 */
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	if (sweet_surf_probe_secs != 0) {   /* patch 0407: with the probe on, the first 24 locks by a WebKit process are logged (id, result, options) */
++		static uint32_t wk_locks;
++		char nm[32];
++		proc_selfname(nm, sizeof(nm));
++		if (strncmp(nm, "com.apple.WebKit", 16) == 0 && OSAddAtomic(1, (volatile SInt32 *)&wk_locks) < 24) {
++			IOLog("SWEET SURFPROBE lock: %s id %u options %#lx -> %s\n", nm, (uint32_t)(uintptr_t)id, (unsigned long)(uintptr_t)options, s != NULL ? "held" : "NOT FOUND");
++		}
++	}
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
 diff -ruN a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
 --- a/iokit/Kernel/arm/SweetSurface.h	2026-11-19 16:43:22.659755555 +0400
 +++ b/iokit/Kernel/arm/SweetSurface.h	2026-11-19 16:43:48.126012096 +0400
