@@ -124,6 +124,20 @@ main(void)
 		CHECK(sa_vol_from_state(5000000u) == 1.0f);            /* out of range state: unity, never > 1 */
 	}
 
+	/* volume key steps (Step 10): 3 dB per level through the v^2 curve, level 0 = mute, round trip, clamp */
+	{
+		CHECK(sa_vol_from_state(sa_vol_to_state(sa_vol_level_v[0])) == 0.0f);
+		CHECK(sa_vol_from_state(sa_vol_to_state(sa_vol_level_v[SA_VOL_LEVELS])) == 1.0f);
+		for (int n = 1; n <= SA_VOL_LEVELS; n++) {
+			float g = sa_vol_from_state(sa_vol_to_state(sa_vol_level_v[n]));
+			float db = 20.0f * log10f(g);
+			CHECK(fabsf(db - (float)(-SA_VOL_STEP_DB * (SA_VOL_LEVELS - n))) < 0.01f);
+			CHECK(sa_vol_level_of(sa_vol_level_v[n]) == n);
+		}
+		CHECK(sa_vol_level_of(0.0f) == 0 && sa_vol_level_of(1.0f) == SA_VOL_LEVELS && sa_vol_level_of(0.0f / 0.0f) == 0);
+		CHECK(sa_vol_level_clamp(-1) == 0 && sa_vol_level_clamp(17) == SA_VOL_LEVELS && sa_vol_level_clamp(5) == 5);
+	}
+
 	printf("sa_host_test: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
 	return fails != 0;
 }

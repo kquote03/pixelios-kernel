@@ -176,4 +176,39 @@ sa_vol_to_state(float v)
 	return 1u + (uint64_t)(v * 1e6f + 0.5f);
 }
 
+/* ---- volume key steps (doc 56 Step 10): the Step 9 agent stepped v by 1/16, i.e. about -1.1 dB per press near the top (v^2 curve): not
+ * audible (user report 2026-11-19). Now 16 steps of 3 dB: level n (0..16) = tap amplitude -3 * (16 - n) dB, level 0 = mute (16 presses from
+ * full to silent). The table holds the published v (amplitude = v^2, so v = 10^(-3 (16 - n) / 40)); sa_host_test checks it with powf. ---- */
+#define SA_VOL_LEVELS 16
+#define SA_VOL_STEP_DB 3
+
+static const float sa_vol_level_v[SA_VOL_LEVELS + 1] = {
+	0.000000f, 0.074989f, 0.089125f, 0.105925f, 0.125893f, 0.149624f, 0.177828f, 0.211349f, 0.251189f,
+	0.298538f, 0.354813f, 0.421697f, 0.501187f, 0.595662f, 0.707946f, 0.841395f, 1.000000f };
+
+static inline int
+sa_vol_level_clamp(int n)
+{
+	return n < 0 ? 0 : n > SA_VOL_LEVELS ? SA_VOL_LEVELS : n;
+}
+
+/* the level whose v is nearest to v (an outside volume change, e.g. AVSystemController, mapped onto the steps) */
+static inline int
+sa_vol_level_of(float v)
+{
+	int best = 0;
+	float bd = 2.0f;
+
+	if (!(v >= 0.0f))
+		v = 0.0f;
+	for (int n = 0; n <= SA_VOL_LEVELS; n++) {
+		float d = v > sa_vol_level_v[n] ? v - sa_vol_level_v[n] : sa_vol_level_v[n] - v;
+		if (d < bd) {
+			bd = d;
+			best = n;
+		}
+	}
+	return best;
+}
+
 #endif
