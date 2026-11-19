@@ -8,6 +8,7 @@
 #   --restart S[,bootloader]  sweetrestart=: XNU resets the phone itself after S seconds (patch 0083; then tools/to-fastboot.sh)
 #   --cpus N     cpus=N (default 8; the ADT has all 8 cores: 4x A55, 2x A76, 2x X1)
 #   --gui        sweetfb_noconsole=1 sweetfb_hz=30: stop drawing kernel text over the iOS UI
+#   --fb-hz N    with --gui: sweetfb_hz=N instead of 30 (oriole daily image: 60, doc 56 Step 11; one key, never a duplicate)
 #   --usbnet     sweetusb=2 instead of sweetusb=0: USB Ethernet + UDP console log (docs/research/09, host: tools/usbnet-log.py)
 #   --usbdma     with --usbnet: sweetusbdma=1 (DMA experiment: kernel RAM instead of ABL's pool page)
 #   --dvfs K0,K1,K2  shim asks the ACPM firmware for these CPU cluster rates (kHz; table rows below the ceilings, 0 = leave; docs/research/25) before XNU starts; --dvfs read = read the rates only (dvfsr)
@@ -37,9 +38,10 @@ case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/
 set -euo pipefail
 cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
-kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; gpuclklvl=""; mifclk=0; sweetprobe=0; mifclevel=""; pmicsrc=0; pmicclr=0; dvfs=""; restart=""; cpus=8; extra=""; out=""; overlay=""; compress=""; wlanfw=""; wlancred=""; wlan=0; wlanlvl=1; el2=0; el2b3=0; spin=""; aocfw=""; ampfw=""; board=""; adt_given=0
+kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; fbhz=30; usbnet=0; usbdma=0; rails=0; handover=0; gpuclklvl=""; mifclk=0; sweetprobe=0; mifclevel=""; pmicsrc=0; pmicclr=0; dvfs=""; restart=""; cpus=8; extra=""; out=""; overlay=""; compress=""; wlanfw=""; wlancred=""; wlan=0; wlanlvl=1; el2=0; el2b3=0; spin=""; aocfw=""; ampfw=""; board=""; adt_given=0
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; adt_given=1; shift 2 ;; --board) board=$2; shift 2 ;; --aocfw) aocfw=$2; shift 2 ;; --ampfw) ampfw=$2; shift 2 ;; --qr) qr=$2; shift 2 ;;
+	--fb-hz) fbhz=${2:?--fb-hz needs a rate}; case $fbhz in ""|*[!0-9]*) echo "--fb-hz needs a number" >&2; exit 2 ;; esac; shift 2 ;;
 	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --wlan-hold) wlan=1; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --gpu-handover) handover=1; shift ;; --gpu-clk-level) gpuclklvl=$2; shift 2 ;; --mif-clk-level) mifclk=1; mifclevel=${2:?--mif-clk-level needs a MIF table row in kHz}; shift 2 ;; --mif-clk) mifclk=1; shift ;; --sweet-probe) sweetprobe=1; shift ;; --pmic-src) pmicsrc=1; shift ;; --pmic-src-clear) pmicsrc=1; pmicclr=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --compress) compress=--compress; shift ;; --wlanfw) wlanfw=$2; shift 2 ;; --wlancred) wlancred=$2; shift 2 ;; --el2-trap) el2=1; shift ;; --el2-b3) el2b3=1; shift ;; --panic-spin) spin=$2; shift 2 ;;
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
 # one target for ADT, payload and shim; bluejay (the default) keeps upstream's path, any other board is checked by tools/boards.py --target
@@ -61,7 +63,7 @@ args="debug=0x8 serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress 
 [ "$usbnet" = 1 ] && args=${args/sweetusb=0/sweetusb=2}   # replace, never add: a duplicate key is ambiguous (review 17 L5: for key=value the LAST one wins in PE_parse_boot_argn, so `--gui --args sweetfb_noconsole=2` gives 2)
 [ "$usbdma" = 1 ] && args="$args sweetusbdma=1"
 [ "$rw" = 1 ] && args="$args ufsrw=1 rootrw=1"
-[ "$gui" = 1 ] && args="$args sweetfb_noconsole=1 sweetfb_hz=30"
+[ "$gui" = 1 ] && args="$args sweetfb_noconsole=1 sweetfb_hz=$fbhz"
 case "$qr" in off|0) ;; *[!0-9]*) echo "--qr needs seconds or off" >&2; exit 2 ;; *) args="$args sweetqr=$qr" ;; esac
 [ -n "$restart" ] && args="$args sweetrestart=$restart"
 [ "$handover" = 0 ] || args="$args sweetgpu=0x1C500000"   # patch 0102 reads the GPU; sweetgpujob=1 (patch 0103, WRITES) only via --args
