@@ -37,6 +37,9 @@ required: the stock CS35L41 power-down order, the kernel gain clamp (now -3 dBFS
 
 User instructions (2026-11-18, oriole runs): no cool-down waits between boots (`SAFETY_NO_COOLDOWN=<reason>` overrides the S2 storage
 gate only); the in-boot battery ceiling may be raised with `SAFETY_BATT_TEMP_MAX` to at most 55 C (never higher).
+Standing user approval (2026-11-19, oriole only): the boot_b flash pair of a run round, i.e. `fastboot flash boot_b` of `$A/boot-backup/boot_b-orig.img`
+(sha256 2869bc43...) before the runs and of the verified daily image (the exact file booted tethered) after them, each once, after checking
+product oriole, current-slot b and partition-size 67108864. No other partition and no other image.
 
 ## Commands
 
@@ -53,6 +56,7 @@ gate only); the in-boot battery ceiling may be raised with `SAFETY_BATT_TEMP_MAX
 | Oriole Bluetooth | on by default in a kernel with the BCM.hcd stack (`tools/bcm-hcd-stack`): see doc 56 (Step 4) |
 | Oriole GPU UI | `tools/xrun --board oriole --intent gpu --gpu-clk-level 3 ...` (libsweetgl std extra): see doc 56 (Step 5) |
 | Oriole combined run / daily image (audio + Wi-Fi + BT + GPU) | see doc 56 (Step 7: command, daily boot-args, image build and flash) |
+| Oriole UI checks (Settings Wi-Fi/BT, volume, sounds) and listening boots | `tools/ios-uiprobe/pixui_probe` (modes `all`, `seq` with `PIXUI_SEQ`): see doc 56 (Steps 8-9) |
 | Reverse-engineering container | `tools/rea/rea.sh` (offline) / `tools/rea/rea-phone.sh` (phone access) |
 
 `tools/check-all.sh` rebuilds default images and overwrites `shim/out/*.img`: rebuild with the flags you need right
