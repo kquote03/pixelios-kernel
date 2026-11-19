@@ -1,4 +1,4 @@
-# 56: oriole on the upstream release 2026-11-15 (Steps 1-7: merge, Wi-Fi, BT, GPU, daily image 5)
+# 56: oriole on the upstream release 2026-11-15 (Steps 1-8: merge, Wi-Fi, BT, GPU, daily images 5 and 6, UI fixes)
 
 Branch `wip/oriole-upstream` (kernel) = `wip/oriole-next` (33af822, audio daily image 4) + `origin/main` f084ce5
 ("PixOS release 2026-11-15", bluejay Wi-Fi/BT/GPU, patches up to 0368). Userland: `pixelios-userland`
@@ -294,3 +294,47 @@ fastboot storage 44-58 C between boots. Idle lock screen in the full config heat
 - up-reg2 silent stop (log ends ~+155 s, phone off USB 19 min, back in fastboot at 45 C storage): not reproduced, cause unknown.
 - 0336 X1-drop mask with cpus=8 (see above); no panic log region (pram) in the ADT.
 - Only the user can judge: picture correctness (no camera), sound by ear, Settings > Wi-Fi / Bluetooth UI.
+
+## Step 8: UI integration fixes (2026-11-19; rows ui-diag1..4, daily-verify7-full, daily image 6 in device/google/oriole/docs/PORT.md)
+
+User report on daily image 5 (untethered): GPU fine; Settings shows no Wi-Fi; the Bluetooth switch will not turn on; no sound; volume keys do nothing.
+Evidence tool: `tools/ios-uiprobe/pixui_probe` (one-shot launchd job; MobileGestalt answers, MobileWiFi devices/power/scan, BluetoothManager
+power as the Settings switch sets it, AVSystemController volume, HID services + dispatched keys, system sounds, AudioQueue tones; counts only).
+Boots: 4 diagnostic + 1 verify (of 14).
+
+- **MobileGestalt is not the cause** (*observed* ui-diag1): `wifi=1 bluetooth=1 volume-buttons=1` from the cache on the phone. No userdata reflash
+  (the dev overlay delivered everything needed; Step 6 "iOS root" stays unexecuted).
+- **Bluetooth: root gap = the chip-boot service** (*observed* ui-diag1 vs ui-diag4). With the stock `com.apple.BlueTool` (`/usr/sbin/BlueTool -R`,
+  relaunched every ~31 s, "Device not open yet") bluetoothd never opened its Skywalk channel (no `BT SK: kernel-pipe nexus instance ... ready` in
+  bt-up1, verify6 or ui-diag1) and `setPowered:YES` left `powered 0`. Upstream's open `pixos-bluetool` (userland `bluetool/`, root tweak
+  `PIXOS_BLUETOOL_BIN`; our root was built without it) installed by the dev overlay (`bluetool/overlay.sh`: only the BlueTool job's ProgramArguments
+  change): boot script `result 0`, bluetoothd channel connected, `available 1, powered 1, enabled 1`, scanning on. In daily image 6.
+  (libsalog SALOG_OSLOG in bluetoothd crashes it, SIGSEGV in the renderer: do not inject it there; ui-diag2/3.)
+- **Sound: the chain was never broken** (*observed* ui-diag1/2/3): AudioServices 1100 (lock) / 1104 (key click) and AudioQueue tones reach the tap,
+  `/dev/sweetaudio` and the amps in the full configuration. What changed for the ear: daily image 4 published the static `external=1`, so iOS played
+  its connect sound at every boot / plug-in; daily image 5 published `external=0` on USB (FG-current rule, 500 mA net discharge), so iOS never did.
+  **Patch 0397**: External/Charging = charger CHGIN_OK (0x69 reg 0xB4 bit 6, one allowlisted read in the 30 s set) or FG current > +50 mA.
+  *Observed* ui-diag3 / verify7: `external 1 (CHGIN_OK 1, FG current -358 mA)`, the connect sound plays (`dev open pid 28`, detector MOVED).
+- **Wi-Fi: open (location)** (*observed* ui-diag1..4, verify7): the kept-link design hands en0 + the Apple80211 radio to wifid only after the boot
+  join (L24..L26) succeeds. Away from the stored network the join ends `L24 STOP ... H5 join set_ssid status=3` (no networks, 31 BSSs seen), the
+  engine stops, and wifid has no device (`wifi: devices 0`): Settings shows no Wi-Fi. Within range (Step 3/7 boots) en0 is handed over and
+  wifid had `devices=1`. Settings with a live list at this location needs the hand-over without a joined link (keep engine up, link DOWN, 0282
+  rejoin attempts and 0292 keep scans; joins of other networks would still be refused) or a real Settings join (host 4-way with a PMK derived from
+  the typed passphrase): kernel work on upstream's Wi-Fi stack, not started (Wi-Fi parked, user 2026-11-18).
+- **Volume keys: open** (*observed* ui-diag3/4): real kernel presses (patch **0398** `sweethidtestkey=1` on the `sweethidtest` timer) reach
+  backboardd (`SWEET HID: key 0xea down (1 clients)`); after 7 presses the next AudioQueue tone had the same tap input peak (23197). Not separated:
+  (a) SpringBoard ignores the key, or (b) the volume is applied after VirtualAudio's mix that the tap reads. AVSystemController read from another
+  process stayed at 1.000 even after a set, so no in-phone volume witness exists yet. Prepared, not in the daily image: libsalog volume stage
+  (notify state `org.pixelios.sweetaudio.volume`, unity without a publisher) + `sweetaudio_vol` (job `sweetvol`). Next: a HUD/volume witness from
+  SpringBoard (SBVolumeControl) or VirtualAudio's own volume property, then decide (a)/(b).
+- **Tools**: xrun `cred_clean` now deletes the WLANCRED-bearing intermediates too (shim-boot-lz4-avb, shim-boot-lz4, shim-boot, ramdisk.bin);
+  `audio/sweetaudio/build.sh` carries the SDK symbol check that lived in the removed `gpu/ios`. Patches 0397/0398 on kernel
+  `$A/kernels/kernel-up-deee3753.sweet` (sha256 deee375356b1368c79d9ddca24165975db4604efa3af579b270b27e2d9bfa5ce; 820ba87b stack + 0397 + 0398).
+- **Std-overlay ledger trap**: a file a test overlay rewrote (here `/usr/local/lib/libsalog.dylib`) is whited out by the next overlay_std prepare
+  unless the run's own overlay carries it; daily image 6 therefore carries the pre-Step-8 libsalog (fa4de81e) itself.
+
+**Daily image 6** = daily image 5 args and flags on kernel deee3753 + own overlay (root launchd.plist + org.pixelios.sweetaudio + BlueTool ->
+pixos-bluetool, pixos-bluetool, libsalog fa4de81e); built by `$A/uifix/daily-build6.sh` (not in git: credential env). Image
+`$A/boot-backup/boot_b-ios-daily-4413f62a-full2.img`, sha256 4413f62a8696cee8e948c54294eec935e4562d5bcb32719ad3b01e91285d8558, flashed to boot_b
+after daily-verify7-full. Still for the user's eyes/ears: the Settings > Bluetooth switch and device list, the connect sound on a charger, lock /
+key-click sounds, Settings > Wi-Fi at home (stored network in range at boot), the volume HUD.
