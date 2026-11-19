@@ -49,6 +49,16 @@ class T(unittest.TestCase):
         self.assertEqual(job, {"Label": "org.pixelios.sweetaudio", "RunAtLoad": True, "ProgramArguments": ["/usr/local/bin/sweetaudio_install"]})
         self.assertEqual(self.run_tool("--sha256", h, "--job", "nope").returncode, 2)
 
+    def test_sweetvol_job_keepalive(self):
+        h = self.put(base())
+        r = self.run_tool("--sha256", h, "--job", "sweetvol")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = plistlib.load(open(self.o, "rb"))
+        job = out["LaunchDaemons"].pop("/System/Library/LaunchDaemons/org.pixelios.sweetaudio-vol.plist")
+        self.assertEqual(out, base())
+        self.assertEqual(job, {"Label": "org.pixelios.sweetaudio-vol", "RunAtLoad": True, "KeepAlive": True,
+                               "ProgramArguments": ["/usr/local/bin/sweetaudio_vol"]})
+
     def test_deterministic(self):
         h = self.put(base())
         self.assertEqual(self.run_tool("--sha256", h).returncode, 0)

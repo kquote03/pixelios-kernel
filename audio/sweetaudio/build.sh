@@ -36,9 +36,11 @@ CF=(--target=arm64-apple-ios16.0 -isysroot "$SDK" -miphoneos-version-min=16.0 -O
 "$CLANG" "${CF[@]}" -bundle -fvisibility=hidden -framework CoreFoundation -o "$OUT/SweetAudio.driver/SweetAudio" "$HERE/SweetAudio.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_tone" "$HERE/sweetaudio_tone.c"
 "$CLANG" "${CF[@]}" -o "$OUT/sweetaudio_install" "$HERE/sweetaudio_install.c"
+"$CLANG" "${CF[@]}" -framework CoreFoundation -lobjc -o "$OUT/sweetaudio_vol" "$HERE/sweetaudio_vol.c"
 "$CLANG" "${CF[@]}" -Wno-deprecated-declarations -framework CoreFoundation -framework CoreAudio -framework AudioToolbox -framework AVFAudio -lobjc -o "$OUT/sweetaudio_play" "$HERE/sweetaudio_play.c"
 "$CLANG" "${CF[@]}" -dynamiclib -install_name /usr/local/lib/libsalog.dylib -framework CoreFoundation -framework CoreAudio -o "$OUT/libsalog.dylib" "$HERE/salog.c"
 for f in "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/libsalog.dylib" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play"; do ldid -S "$f"; done
+ldid -S"$HERE/sweetaudio_vol.entitlements" "$OUT/sweetaudio_vol"
 python3 -I - "$OUT/SweetAudio.driver/Info.plist" <<'EOF'
 import os, plistlib, sys
 FACTORY = "7F3C2A61-5B0E-4E57-9C1D-0A5E1D6B9F42"           # ours (random); type = kAudioServerPlugInTypeUUID
@@ -52,9 +54,9 @@ pl = {"CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "SweetAudio", "CF
       "SweetAudioName": "PixOS Speaker"}
 open(sys.argv[1], "wb").write(plistlib.dumps(pl, fmt=plistlib.FMT_XML))
 EOF
-# symbol + link checks (gpu/ios/check-sdk-symbols.py: every undefined symbol resolves against the SDK .tbd files)
+# symbol + link checks (check-sdk-symbols.py, from the removed gpu/ios: every undefined symbol resolves against the SDK .tbd files)
 llvm-nm -gU "$OUT/SweetAudio.driver/SweetAudio" | grep -q ' T _SweetAudio_Create$'
-python3 -I "$REPO/gpu/ios/check-sdk-symbols.py" "$SDK" "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play" | tail -1
+python3 -I "$HERE/check-sdk-symbols.py" "$SDK" "$OUT/SweetAudio.driver/SweetAudio" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_install" "$OUT/sweetaudio_play" "$OUT/sweetaudio_vol" | tail -1
 
 # 3. overlay: /usr/local/{pixos,bin} + the launchd cache with the one job (paths inside the 0117 allowlist)
 OV=$A/audio/ov-sa-$MODE${TONE:+-$TONE}${SWEETAUDIO_TAG:+-$SWEETAUDIO_TAG}
@@ -62,7 +64,7 @@ rm -rf "$OV"
 mkdir -p "$OV/usr/local/pixos/SweetAudio.driver" "$OV/usr/local/bin" "$OV/System/Library/xpc"
 install -m 0644 "$OUT/SweetAudio.driver/Info.plist" "$OV/usr/local/pixos/SweetAudio.driver/Info.plist"
 install -m 0755 "$OUT/SweetAudio.driver/SweetAudio" "$OV/usr/local/pixos/SweetAudio.driver/SweetAudio"
-install -m 0755 "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_play" "$OV/usr/local/bin/"
+install -m 0755 "$OUT/sweetaudio_install" "$OUT/sweetaudio_tone" "$OUT/sweetaudio_play" "$OUT/sweetaudio_vol" "$OV/usr/local/bin/"
 # debug visibility (doc 54 s7): only used when the boot-args inject it (sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=...)
 mkdir -p "$OV/usr/local/lib"; install -m 0755 "$OUT/libsalog.dylib" "$OV/usr/local/lib/libsalog.dylib"
 printf '%s\n' "$MODE${TONE:+ $TONE}" > "$OV/usr/local/pixos/sweetaudio.mode"; chmod 0644 "$OV/usr/local/pixos/sweetaudio.mode"

@@ -2,6 +2,7 @@
 /*
  * libsalog.dylib: mediaserverd helper (doc 54 s7), injected with the boot-arg
  * sweetenv=mediaserverd:DYLD_INSERT_LIBRARIES=/usr/local/lib/libsalog.dylib[,SALOG_TAP_NULL=1][,SALOG_OSLOG=1] (patches 0110 + 0106).
+ * SALOG_OSLOG=2 mirrors only the levels the process has enabled anyway (=1 also forces every level on, which crashed bluetoothd, run ui-diag2).
  * SALOG_TAP_NULL=1: the audio path (VirtualAudio default route mix -> /dev/sweetaudio, see below). SALOG_OSLOG=1: interposes
  * _os_log_impl and os_log_type_enabled and prints every os_log message of the process (VirtualAudio, the HAL) to stderr,
  * which sweetnull=mediaserverd tees to the console (debug). Bounded: SALOG_MAX lines, SALOG_LINE bytes each.
@@ -13,6 +14,7 @@
 #include <CoreAudio/AudioHardware.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
+#include <notify.h>
 #include <math.h>
 #include <os/lock.h>
 #include <sys/ioctl.h>
@@ -140,7 +142,7 @@ oslog_on(void)
 {
 	if (salog_oslog < 0) {
 		const char *e = getenv("SALOG_OSLOG");
-		salog_oslog = e && e[0] == '1';
+		salog_oslog = e && e[0] == '1' ? 1 : e && e[0] == '2' ? 2 : 0;    /* 2 (Step 8): mirror, but leave os_log_type_enabled alone */
 	}
 	return salog_oslog;
 }
@@ -223,6 +225,39 @@ tap_enabled(void)
 	return salog_tap;
 }
 
+/* Step 8: the iOS system volume published by sweetaudio_vol (darwin notify state SA_VOL_NOTIFY, sa_core.h). notify_check is a shared-memory
+ * read (no IPC) once registered; a failed registration keeps unity (old behaviour) and is retried at most once per 1000 flushes. */
+static int vol_tok = -1;
+static uint32_t vol_retry;
+static float vol_g = 1.0f;
+
+static float
+tap_vol_gain(void)
+{
+	if (vol_tok < 0) {
+		if (vol_retry++ % 1000u != 0)
+			return vol_g;
+		if (notify_register_check(SA_VOL_NOTIFY, &vol_tok) != NOTIFY_STATUS_OK) {
+			vol_tok = -1;
+			return vol_g;
+		}
+	}
+	int chg = 0;
+	if (notify_check(vol_tok, &chg) == NOTIFY_STATUS_OK && chg) {
+		uint64_t st = 0;
+		if (notify_get_state(vol_tok, &st) == NOTIFY_STATUS_OK) {
+			float ng = sa_vol_from_state(st);
+			if (ng != vol_g) {
+				char m[96];
+				int l = snprintf(m, sizeof m, "valog[%d]: tap: volume state %llu -> gain %.4f\n", getpid(), (unsigned long long)st, ng);
+				(void)write(2, m, (size_t)l);
+			}
+			vol_g = ng;
+		}
+	}
+	return vol_g;
+}
+
 /* the leader's flush: n frames of the accumulator -> limiter -> S16 -> /dev/sweetaudio (non-blocking; what does not fit is dropped) */
 static void
 tap_flush(uint32_t n)
@@ -233,9 +268,10 @@ tap_flush(uint32_t n)
 		pk = a > pk ? a : pk;
 	}
 	float g = sa_lim_block(&tap_lim, pk);
+	float gv = g * tap_vol_gain();          /* Step 8: the iOS volume, after the limiter (the limiter keeps working on the mix) */
 	int32_t pko = 0;
 	for (uint32_t i = 0; i < 2 * n; i++) {
-		tap_out[i] = sa_f2s16(tap_mix.acc[i] * g);
+		tap_out[i] = sa_f2s16(tap_mix.acc[i] * gv);
 		int32_t a = tap_out[i] < 0 ? -tap_out[i] : tap_out[i];
 		pko = a > pko ? a : pko;
 	}
@@ -382,7 +418,7 @@ salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioD
 static bool
 salog_type_enabled(os_log_t log, os_log_type_t type)
 {
-	return oslog_on() ? true : os_log_type_enabled(log, type);
+	return oslog_on() == 1 ? true : os_log_type_enabled(log, type);   /* =2: forcing debug levels on crashed bluetoothd (ui-diag2) */
 }
 
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } salog_interpose[] = {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mk_launchd_job.py IN OUT --sha256 HEX [--job sweetgl|sweetaudio]: the replacement /System/Library/xpc/launchd.plist for the G5 self-test run (docs/AUTOMATION.md "G5").
+"""mk_launchd_job.py IN OUT --sha256 HEX [--job sweetgl|sweetaudio|sweetvol]: the replacement /System/Library/xpc/launchd.plist for the G5 self-test run (docs/AUTOMATION.md "G5").
 
 OUT is IN (the launchd job cache extracted read-only from the flashed root image) plus exactly one LaunchDaemons entry, the job that starts
 /usr/local/bin/sweetgl_once once at boot (--job sweetaudio: /usr/local/bin/sweetaudio_install, doc 54). Nothing else is added, removed or changed; tools/test_mk_launchd_job.py checks that. The input must
@@ -11,7 +11,9 @@ JOBS = {
     "sweetgl": ("org.pixelios.sweetgl-selftest",
                 ["/usr/local/bin/sweetgl_once", "/usr/local/bin/sweetgl_selftest", "/usr/local/lib/libsweetgl.dylib"]),
     "sweetaudio": ("org.pixelios.sweetaudio", ["/usr/local/bin/sweetaudio_install"]),   # mode from /usr/local/pixos/sweetaudio.mode
+    "sweetvol": ("org.pixelios.sweetaudio-vol", ["/usr/local/bin/sweetaudio_vol"]),     # doc 56 Step 8: iOS volume -> libsalog tap
 }
+KEEPALIVE = {"sweetvol"}   # a long-running agent: launchd restarts it
 KEY = LABEL = JOB = None
 
 
@@ -20,6 +22,8 @@ def select(name):
     LABEL, args = JOBS[name]
     KEY = "/System/Library/LaunchDaemons/%s.plist" % LABEL
     JOB = {"Label": LABEL, "RunAtLoad": True, "ProgramArguments": list(args)}
+    if name in KEEPALIVE:
+        JOB["KeepAlive"] = True
 
 
 select("sweetgl")

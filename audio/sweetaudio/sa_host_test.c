@@ -112,6 +112,18 @@ main(void)
 		CHECK(a < -0.0021 && a >= -0.003);
 	}
 
+	/* system volume state (Step 8) */
+	{
+		CHECK(sa_vol_from_state(0) == 1.0f);                    /* no publisher: unity */
+		CHECK(sa_vol_from_state(sa_vol_to_state(1.0f)) == 1.0f);
+		CHECK(sa_vol_from_state(sa_vol_to_state(0.0f)) == 0.0f);
+		float h = sa_vol_from_state(sa_vol_to_state(0.5f));
+		CHECK(h > 0.2499f && h < 0.2501f);
+		CHECK(sa_vol_to_state(7.0f) == sa_vol_to_state(1.0f));  /* clamped */
+		CHECK(sa_vol_to_state(-1.0f) == 1u && sa_vol_to_state(0.0f / 0.0f) == 1u);
+		CHECK(sa_vol_from_state(5000000u) == 1.0f);            /* out of range state: unity, never > 1 */
+	}
+
 	printf("sa_host_test: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
 	return fails != 0;
 }

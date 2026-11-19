@@ -150,4 +150,30 @@ sa_drift_adj(double *avg, uint32_t fill, double target, double k, double lim)
 	return a > lim ? lim : a < -lim ? -lim : a;
 }
 
+/* ---- system volume in the tap (doc 56 Step 8): VirtualAudio's mix reaches the tap at unity whatever the iOS volume (run ui-diag1: an
+ * AudioQueue tone gave the same tap peak at volume 0.25 and 1.0), so the tap applies it. sweetaudio_vol publishes the active-category
+ * volume as the darwin notify state SA_VOL_NOTIFY = 1 + volume * 1e6 (0 = nothing published yet: unity). Curve: amplitude = v^2
+ * (-12 dB at 0.5, -24 dB at 0.25) [guess: a perceptual approximation, not Apple's table]. ---- */
+#define SA_VOL_NOTIFY "org.pixelios.sweetaudio.volume"
+
+static inline float
+sa_vol_from_state(uint64_t st)
+{
+	if (st == 0)
+		return 1.0f;                              /* no publisher yet: unchanged behaviour */
+	uint64_t u = st - 1;
+	float v = u >= 1000000u ? 1.0f : (float)u / 1e6f;
+	return v * v;
+}
+
+static inline uint64_t
+sa_vol_to_state(float v)
+{
+	if (!(v >= 0.0f))                                 /* NaN or negative */
+		v = 0.0f;
+	if (v > 1.0f)
+		v = 1.0f;
+	return 1u + (uint64_t)(v * 1e6f + 0.5f);
+}
+
 #endif
