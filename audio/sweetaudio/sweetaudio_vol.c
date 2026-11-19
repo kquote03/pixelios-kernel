@@ -24,6 +24,7 @@
 static id avsc;
 static int tok = -1;
 static uint64_t last = UINT64_MAX;
+static float cur_v = -1;           /* Step 9: the volume the keys step from */
 
 static id nsstr(const char *c)
 {
@@ -44,6 +45,11 @@ static void publish(const char *why)
 	if (!((bool (*)(id, SEL, float *, id *))objc_msgSend)(avsc, SEL_("getActiveCategoryVolume:andName:"), &v, &name) || v < 0)
 		return;
 	uint64_t st = sa_vol_to_state(v);
+	static uint64_t last_avsc = UINT64_MAX;      /* Step 9: follow AVSystemController only when ITS value moves (a key step is not undone) */
+	if (st == last_avsc)
+		return;
+	last_avsc = st;
+	cur_v = v;
 	if (st == last)
 		return;
 	last = st;
@@ -52,6 +58,71 @@ static void publish(const char *why)
 	const char *n = name ? ((const char *(*)(id, SEL))objc_msgSend)(name, SEL_("UTF8String")) : "?";
 	printf("sweetaudio_vol: %s: category %s volume %.3f -> state %llu (tap gain %.4f)\n", why, n, v, (unsigned long long)st, sa_vol_from_state(st));
 	fflush(stdout);
+}
+
+/* Step 9 (doc 56, run vol1): the physical keys reach backboardd (SWEET KEYS key=1/2, SWEET HID 0xe9/0xea) but no volume change reaches
+ * mediaserverd: VirtualAudio's Null_Device route has no volume control ("VolumeProperties for Port: pnul is [ ]"). So this agent also
+ * watches the HID event stream (monitor client) for consumer-page Volume Increment / Decrement key-downs and steps its own volume by 1/16
+ * (the iOS step), sets it on AVSystemController (best effort, so iOS reads the same value) and publishes it for the tap at once.
+ * IOHIDEvent constants from IOHIDFamily (open source) IOHIDEventTypes.h: kIOHIDEventTypeKeyboard 3, field base type << 16, keyboard fields
+ * UsagePage +0, Usage +1, Down +2; kIOHIDEventSystemClientTypeMonitor 1. [read from source; checked on the phone by run vol2] */
+#define HID_EV_KEYBOARD 3u
+#define HID_F_KB(n) ((HID_EV_KEYBOARD << 16) | (n))
+
+
+static void publish_v(float v, const char *why)
+{
+	uint64_t st = sa_vol_to_state(v);
+	if (st == last)
+		return;
+	last = st;
+	notify_set_state(tok, st);
+	notify_post(SA_VOL_NOTIFY);
+	printf("sweetaudio_vol: %s: volume %.3f -> state %llu (tap gain %.4f)\n", why, v, (unsigned long long)st, sa_vol_from_state(st));
+	fflush(stdout);
+}
+
+static void on_hid(void *target, void *refcon, void *sender, CFTypeRef ev)
+{
+	static uint32_t (*gtype)(CFTypeRef);
+	static long (*gint)(CFTypeRef, uint32_t);
+	(void)target; (void)refcon; (void)sender;
+	if (!gtype) {
+		gtype = (uint32_t (*)(CFTypeRef))dlsym(RTLD_DEFAULT, "IOHIDEventGetType");
+		gint = (long (*)(CFTypeRef, uint32_t))dlsym(RTLD_DEFAULT, "IOHIDEventGetIntegerValue");
+		if (!gtype || !gint)
+			return;
+	}
+	if (!ev || gtype(ev) != HID_EV_KEYBOARD || gint(ev, HID_F_KB(0)) != 0x0C || !gint(ev, HID_F_KB(2)))
+		return;
+	long u = gint(ev, HID_F_KB(1));
+	if (u != 0xE9 && u != 0xEA)
+		return;
+	if (cur_v < 0)
+		cur_v = 1.0f;
+	float v = cur_v + (u == 0xE9 ? 1.0f : -1.0f) / 16.0f;
+	v = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+	cur_v = v;
+	if (avsc && responds(avsc, "setActiveCategoryVolumeTo:"))
+		((bool (*)(id, SEL, float))objc_msgSend)(avsc, SEL_("setActiveCategoryVolumeTo:"), v);
+	publish_v(v, u == 0xE9 ? "key volume-up" : "key volume-down");
+}
+
+static void hid_start(void)
+{
+	void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+	CFTypeRef (*mk)(CFAllocatorRef, int, CFDictionaryRef) = h ? dlsym(h, "IOHIDEventSystemClientCreateWithType") : NULL;
+	void (*sched)(CFTypeRef, CFRunLoopRef, CFStringRef) = h ? dlsym(h, "IOHIDEventSystemClientScheduleWithRunLoop") : NULL;
+	void (*reg)(CFTypeRef, void (*)(void *, void *, void *, CFTypeRef), void *, void *) =
+	    h ? dlsym(h, "IOHIDEventSystemClientRegisterEventCallback") : NULL;
+	CFTypeRef c = mk ? mk(kCFAllocatorDefault, 1, NULL) : NULL;
+	if (!c || !sched || !reg) {
+		printf("sweetaudio_vol: GAP hid monitor client not available (create %p sched %p reg %p): volume keys not followed\n", (void *)c, (void *)sched, (void *)reg);
+		return;
+	}
+	reg(c, on_hid, NULL, NULL);
+	sched(c, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	printf("sweetaudio_vol: hid monitor client on (volume keys step 1/16)\n");
 }
 
 static void on_note(CFNotificationCenterRef c, void *obs, CFNotificationName name, const void *obj, CFDictionaryRef info)
@@ -98,6 +169,7 @@ int main(void)
 	    CFNotificationSuspensionBehaviorDeliverImmediately);
 	CFRunLoopTimerRef t = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1, 1.0, 0, 0, on_timer, NULL);
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), t, kCFRunLoopDefaultMode);
+	hid_start();
 	publish("start");
 	CFRunLoopRun();
 	return 0;
