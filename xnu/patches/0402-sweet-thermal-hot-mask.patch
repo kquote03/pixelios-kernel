@@ -1,0 +1,88 @@
+SWEET THERMAL hot mask by topology (patch 0402, follow-up of 0336; oriole speed round 2026-11-19, plan step 1.4). 0336's X1 drop applies mask 0x18 (boot & 0x18), which is the A76 pair only under tools/xrun's cpus=5 X1-first /cpus order. The oriole daily image runs cpus=8 in the plain DT order, where 0x18 = logical cpu3 (A55) + cpu4 (A76): two cores until <= 44 C (doc 56 Step 7, run wlan-gpu-o-all2). New pure th_hot_mask() in bsd/dev/sweet_thermal.h: the boot mask without every logical cpu whose physical core (topology phys_id Aff1, gs101 A55 0-3 / A76 4-5 / X1 6-7) is an X1; 0 = keep 0336's mask when the topology is unknown, when 0336's order check is clean (cpus=5 xrun order, 0x18 is the A76 pair), when no X1 is in the boot mask, or when fewer than TH_HOT_MIN_CORES (3) cores would stay (user 2026-11-19: never drop to two cores). Glue: th_check_cpu_order() stores it (th_hot_new) and prints 'SWEET THERMAL: hot mask 0x.. (patch 0402: ...)' when it is used; th_op_x1() applies it on the drop (restore = the boot mask, unchanged); the 'on' line shows the mask in use. Example: cpus=8 plain order with sweetrecores=0xfe -> 0x3e (A55 1-3 + A76 4-5). Unchanged: the thresholds (48 / 44 C), the charge hold, the 55 C CRIT park, every scheduler call is the same 0270 hint (no register). Host tests: tools/sweet_thermal_host_test.c (hot_* cases) and tools/sweet_thermal_glue_test.c (hot_dt8_*, hot_xrun8_drop_f9, hot_xrun5_no_hot_line) via tools/test_sweet_thermal.py.
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 33d4252..1f2d318 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -37,6 +37,7 @@ extern int sweet_thermal_reboot_bootloader(void);
+ static int th_on = -1;                  /* -1 = boot-arg not read yet */
+ static struct th_ctl th_c;
+ static uint32_t th_boot_mask;
++static uint32_t th_hot_new;   /* patch 0402: the X1-drop mask from the topology (th_hot_mask), 0 = 0336 mask (boot & 0x18) */
+ static volatile int32_t th_g_cc;        /* latest good value, centi-C (published before th_g_ms with a release store; read after an acquire load of th_g_ms: review 0336 F8) */
+ static volatile uint32_t th_g_state;
+ static volatile uint64_t th_g_ms;       /* when th_g_cc was read; 0 = never */
+@@ -153,6 +154,9 @@ static void
+ th_op_x1(int drop, int32_t dC)
+ {
+ 	uint32_t m = drop ? (th_boot_mask & TH_X1_DROP_MASK) : th_boot_mask;
++	if (drop && th_hot_new != 0) {
++		m = th_hot_new;   /* patch 0402 */
++	}
+ 
+ 	(void)dC;
+ 	if (m == 0) {
+@@ -230,6 +234,11 @@ th_check_cpu_order(unsigned int cpus)
+ 		}
+ 	}
+ 	g = th_order_gaps(cpus, n ? phys : NULL, n, th_boot_mask);
++	th_hot_new = th_hot_mask(cpus, n ? phys : NULL, n, th_boot_mask);   /* patch 0402 */
++	if (th_hot_new != 0) {
++		printf("SWEET THERMAL: hot mask 0x%x (patch 0402: boot 0x%x without the X1 cores, physical 6,7; cpus=%u) is what the X1 drop applies, not 0x%x & boot\n", th_hot_new, th_boot_mask, cpus,
++		    TH_X1_DROP_MASK);
++	}
+ 	if (g == 0) {
+ 		printf("SWEET THERMAL: X1 drop mask 0x%x = logical cpu3,4 = physical A76 pair 4,5 (cpus=%u, tools/xrun /cpus order 0,6,7,4,5: the order patch 0270 sweetrecores=0x1e assumes)\n", TH_X1_DROP_MASK, cpus);
+ 		return;
+@@ -281,7 +290,7 @@ sweet_thermal_start(void)
+ 	}
+ 	th_check_cpu_order(ncpu);
+ 	printf("SWEET THERMAL: on (patch 0336, sweetthermal=0 disables): sample %u s | X1 drop >= %d.%d C restore <= %d.%d C (mask 0x%x of boot 0x%x) | charge hold >= %d.%d C while charging, release <= %d.%d C | CRIT >= %d.%d C x%u samples -> reboot to bootloader\n",
+-	    TH_PERIOD_MS / 1000u, TH_X1_DROP_DC / 10, TH_X1_DROP_DC % 10, TH_X1_RESTORE_DC / 10, TH_X1_RESTORE_DC % 10, TH_X1_DROP_MASK, th_boot_mask, TH_CHG_HOLD_DC / 10, TH_CHG_HOLD_DC % 10,
++	    TH_PERIOD_MS / 1000u, TH_X1_DROP_DC / 10, TH_X1_DROP_DC % 10, TH_X1_RESTORE_DC / 10, TH_X1_RESTORE_DC % 10, th_hot_new ? th_hot_new : TH_X1_DROP_MASK, th_boot_mask, TH_CHG_HOLD_DC / 10, TH_CHG_HOLD_DC % 10,
+ 	    TH_CHG_RELEASE_DC / 10, TH_CHG_RELEASE_DC % 10, TH_CRIT_DC / 10, TH_CRIT_DC % 10, TH_CRIT_CONFIRM);
+ 	/* what note 150 says stays unknown or has no backend (rule 7: say it on every boot) */
+ 	printf("SWEET THERMAL GAP: sensor->hotspot mapping of thermalmonitord (D22AP plist) is unresolved (note 150 A4): the TG0B battery value may feed analytics and the pressure level only, not every hotspot\n");
+diff --git a/bsd/dev/sweet_thermal.h b/bsd/dev/sweet_thermal.h
+index 899743c..e187706 100644
+--- a/bsd/dev/sweet_thermal.h
++++ b/bsd/dev/sweet_thermal.h
+@@ -70,6 +70,39 @@ th_order_gaps(unsigned ncpu, const uint32_t *phys, unsigned nphys, uint32_t boot
+ 	return g;
+ }
+ 
++/*
++ * Patch 0402 (oriole speed round 2026-11-19, plan step 1.4): the X1 drop with any cpu count / order. 0336's mask 0x18 is the A76 pair only under tools/xrun's cpus=5 X1-first order;
++ * with cpus=8 and the plain /cpus order (the oriole daily image) it left logical cpu3 (an A55) and cpu4 (an A76): two cores until <= 44 C (doc 56 Step 7, wlan-gpu-o-all2).
++ * th_hot_mask() returns the mask the drop uses instead: the boot mask without every logical cpu whose physical core is an X1 (gs101 MPIDR Aff1 6, 7: the cores the backstop is
++ * meant to take out), or 0 = keep 0336's (boot_mask & 0x18) when the topology is unknown, when 0336's order check is clean (cpus=5, xrun order: 0x18 IS the A76 pair), when no
++ * X1 is in the boot mask (nothing to drop), or when fewer than TH_HOT_MIN_CORES cores would stay (a two-core phone stalls the UI; user 2026-11-19: never drop to two cores).
++ * Pure function (host test tools/sweet_thermal_host_test.c, glue cases tools/sweet_thermal_glue_test.c).
++ */
++#define TH_HOT_MIN_CORES    3u
++
++static inline uint32_t
++th_hot_mask(unsigned ncpu, const uint32_t *phys, unsigned nphys, uint32_t boot_mask)
++{
++	uint32_t m = boot_mask;
++	unsigned i, n = 0;
++
++	if (phys == 0 || nphys == 0 || th_order_gaps(ncpu, phys, nphys, boot_mask) == 0) {
++		return 0;
++	}
++	for (i = 0; i < nphys && i < 32u; i++) {
++		if (phys[i] == 6u || phys[i] == 7u) {
++			m &= ~(1u << i);
++		}
++	}
++	if (m == boot_mask) {
++		return 0;
++	}
++	for (i = 0; i < 32u; i++) {
++		n += (m >> i) & 1u;
++	}
++	return n >= TH_HOT_MIN_CORES ? m : 0;
++}
++
+ enum { TH_RD_OK = 0, TH_RD_NOTREADY = 1, TH_RD_BUSY = 2, TH_RD_FAIL = -1, TH_RD_DEAD = -2, TH_RD_NOENGINE = -3 };
+ 
+ /* The three actuators. chg() returns 0 = done, 1 = nothing to do (lever not engaged), 2 = engine busy (asked again at the next sample), -1 = refused/failed (GAP already printed by the callee). */

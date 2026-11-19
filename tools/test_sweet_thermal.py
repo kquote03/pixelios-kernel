@@ -367,6 +367,70 @@ class T(unittest.TestCase):
             "i2c_engine_thermal_off_loads": (I, "if (sweet_thermal_enabled()) {\n\t\t\t\t/* patch 0336", "if (0) {\n\t\t\t\t/* patch 0336"),
         }
 
+    # ---- patch 0402 (oriole fork): the X1-drop hot mask from the topology, tested on the tree WITH 0402 (only patches after 0402 peeled) ----
+    def tree_0402(self):
+        t = os.path.join(self.tmp, "tree402")
+        if os.path.exists(t):
+            shutil.rmtree(t)
+        # the 0336 harness stubs only what 0336/0339 need: start from the peeled tree (self.d, fork patches after 0368 removed) and apply 0402 alone on top
+        d = os.path.join(t, "bsd", "dev")
+        shutil.copytree(self.d, d)
+        r = run("git", "apply", "--include=bsd/dev/sweet_thermal.h", "--include=bsd/dev/sweet_thermal.c", os.path.join(ROOT, "xnu", "patches", "0402-sweet-thermal-hot-mask.patch"), cwd=t)
+        self.assertEqual(r.returncode, 0, "0402 does not apply on the peeled 0336 tree: " + r.stderr[-600:])
+        self.assertIn("th_hot_mask", rd(os.path.join(d, "sweet_thermal.h")), "the build tree has no patch 0402")
+        return d
+
+    def run_0402(self, d):
+        """(host cases, glue cases) of the -DTH_0402 builds; None when a build fails."""
+        exe_h, exe_g = os.path.join(self.tmp, "h402"), os.path.join(self.tmp, "g402")
+        rh = run("gcc", "-Wall", "-Wextra", "-Werror", "-O1", "-DTH_0402", "-DCHG_PMIC", "-DCHG_MON", "-DSWEET_CHG_I2C_HOST", '-DCHG_I2C_SRC="%s"' % os.path.join(d, "sweet_chg_i2c.c"),
+                 '-DTH_HDR="%s"' % os.path.join(d, "sweet_thermal.h"), "-I", os.path.join(ROOT, "tools"), os.path.join(ROOT, "tools", "sweet_thermal_host_test.c"), "-o", exe_h)
+        rg = run("gcc", "-Wall", "-Wextra", "-Werror", "-O1", "-DTH_0402", "-DSWEET_THERMAL_HOST", '-DTH_C="%s"' % os.path.join(d, "sweet_thermal.c"), "-I", self.inc,
+                 os.path.join(ROOT, "tools", "sweet_thermal_glue_test.c"), "-o", exe_g)
+        if rh.returncode != 0 or rg.returncode != 0:
+            return None, (rh.stderr + rg.stderr)[-3000:]
+        return (self.cases(exe_h)[0], self.cases(exe_g)[0]), ""
+
+    def test_0402_hot_mask(self):
+        d = self.tree_0402()
+        res, err = self.run_0402(d)
+        self.assertIsNotNone(res, err)
+        host, glue = res
+        bad = {k: v for k, v in list(host.items()) + list(glue.items()) if v != "ok"}
+        self.assertEqual(bad, {}, "0402 tree: every 0336 case and every hot case must pass")
+        for must in ("hot_xrun_5cpus_keeps_0336_mask", "hot_dt_8cpus_recores_fe_is_3e", "hot_never_below_three_cores", "hot_unknown_topology_keeps_0336", "x1_48_0_drops"):
+            self.assertIn(must, host)
+        for must in ("hot_dt8_drop_3e_restore_fe", "hot_dt8_no_recores_drop_3f", "hot_xrun8_drop_f9", "hot_xrun5_no_hot_line", "x1_drop_then_restore_masks", "start_thread_and_table_line",
+                     "x1_drop_with_empty_result_mask_is_a_gap_not_a_call", "order_dt_cpus8_both_gaps"):
+            self.assertIn(must, glue)
+        CASES.extend("0402:" + k for k in list(host) + list(glue))
+        # mutants of the 0402 code: each must make a case fail
+        H, C = "sweet_thermal.h", "sweet_thermal.c"
+        muts = {
+            "hot_keeps_x1_7": (H, "if (phys[i] == 6u || phys[i] == 7u) {", "if (phys[i] == 6u) {"),
+            "hot_min_cores_2": (H, "#define TH_HOT_MIN_CORES    3u", "#define TH_HOT_MIN_CORES    2u"),
+            "hot_ignores_clean_order": (H, "nphys == 0 || th_order_gaps(ncpu, phys, nphys, boot_mask) == 0) {", "nphys == 0) {"),
+            "hot_not_applied": (C, "\tif (drop && th_hot_new != 0) {\n\t\tm = th_hot_new;", "\tif (0) {\n\t\tm = th_hot_new;"),
+            "hot_applied_on_restore": (C, "\tif (drop && th_hot_new != 0) {\n\t\tm = th_hot_new;", "\tif (th_hot_new != 0) {\n\t\tm = th_hot_new;"),
+            "hot_never_computed": (C, "\tth_hot_new = th_hot_mask(cpus, n ? phys : NULL, n, th_boot_mask);", "\tth_hot_new = 0;"),
+        }
+        survivors = []
+        for name, (f, old, new) in muts.items():
+            md = os.path.join(self.tmp, "mut402")
+            if os.path.exists(md):
+                shutil.rmtree(md)
+            shutil.copytree(d, md)
+            p = os.path.join(md, f)
+            s = rd(p)
+            self.assertEqual(s.count(old), 1, "0402 mutant anchor %r matches %d times in %s" % (old, s.count(old), f))
+            with open(p, "w") as fh:
+                fh.write(s.replace(old, new))
+            r, _ = self.run_0402(md)
+            if r is not None and all(v == "ok" for v in list(r[0].values()) + list(r[1].values())):
+                survivors.append(name)
+        self.assertEqual(survivors, [], "0402 mutants that no case caught")
+        CASES.append("mutants402=%d" % len(muts))
+
     def test_mutants_fail(self):
         H, C = "sweet_thermal.h", "sweet_thermal.c"
         muts = {**self.muts_core(), **self.muts_ramp(), **self.muts_tail()}

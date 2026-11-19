@@ -186,6 +186,33 @@ main(void)
 	sweet_thermal_start();
 	TCASE("order_cpus3_gap", KHAS("SWEET THERMAL GAP: cpus=3, the X1 drop mask 0x18 is made for cpus=5") && thr_started == 1, klog);
 
+#ifdef TH_0402   /* the 0402 tree only (tools/test_sweet_thermal.py test_0402_hot_mask) */
+	/* patch 0402: cpus=8 under the plain /cpus order (the oriole daily image): the X1 drop keeps 3 A55 + 2 A76 (sweetrecores=0xfe), never 0x18 */
+	greset(); ncpu = 8; have_recores = 1; arg_recores = 0xfe;
+	{ static const uint32_t d8[8] = { 0, 1, 2, 3, 4, 5, 6, 7 }; topo_set(d8, 8); }
+	sweet_thermal_start();
+	add(TH_RD_OK, 485, -100000);
+	add(TH_RD_OK, 430, -100000);
+	run_thread(20 + 10 + 1);
+	TCASE("hot_dt8_drop_3e_restore_fe", nsched == 2 && sched_calls[0] == 0x3e && sched_calls[1] == 0xfe && KHAS("SWEET THERMAL: hot mask 0x3e (patch 0402: boot 0xfe without the X1 cores") &&
+	    KHAS("recommended cores now 0x3e (X1 dropped; boot value 0xfe") && KHAS("(mask 0x3e of boot 0xfe)"), klog);
+	greset(); ncpu = 8;
+	{ static const uint32_t d8b[8] = { 0, 1, 2, 3, 4, 5, 6, 7 }; topo_set(d8b, 8); }
+	sweet_thermal_start();
+	add(TH_RD_OK, 500, -100000);
+	run_thread(20 + 10 + 1);
+	TCASE("hot_dt8_no_recores_drop_3f", nsched == 1 && sched_calls[0] == 0x3f, klog);
+	greset(); ncpu = 8;
+	{ static const uint32_t x8b[8] = { 0, 6, 7, 4, 5, 1, 2, 3 }; topo_set(x8b, 8); }
+	sweet_thermal_start();
+	add(TH_RD_OK, 500, -100000);
+	run_thread(20 + 10 + 1);
+	TCASE("hot_xrun8_drop_f9", nsched == 1 && sched_calls[0] == 0xf9, klog);
+	greset();
+	sweet_thermal_start();
+	TCASE("hot_xrun5_no_hot_line", !KHAS("hot mask"), klog);
+#endif
+
 	/* default on */
 	greset();
 	TCASE("enabled_by_default", sweet_thermal_enabled() == 1, "default");

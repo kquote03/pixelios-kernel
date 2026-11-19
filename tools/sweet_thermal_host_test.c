@@ -419,6 +419,18 @@ part_a(void)
 		TCASE("order_cpus4_one_a76_kept", th_order_gaps(4, ok5, 4, 0x0f) == 1, "cpus4");
 		TCASE("order_short_topology_flags_missing_cpu", th_order_gaps(5, ok5, 4, 0x1f) == 2, "short");
 		TCASE("order_a55_in_mask", ({ static const uint32_t m[5] = { 0, 6, 7, 3, 5 }; th_order_gaps(5, m, 5, 0x1f) == 2; }), "a55");
+#ifdef TH_0402   /* built with the 0402 tree only (tools/test_sweet_thermal.py test_0402_hot_mask): the default build peels the fork patches */
+		/* patch 0402: the hot mask (X1 drop) from the topology */
+		TCASE("hot_xrun_5cpus_keeps_0336_mask", th_hot_mask(5, ok5, 5, 0x1e) == 0 && th_hot_mask(5, ok5, 5, 0x1f) == 0, "hot ok5");
+		TCASE("hot_dt_8cpus_recores_fe_is_3e", th_hot_mask(8, dt8, 8, 0xfe) == 0x3e, "hot dt8 fe");
+		TCASE("hot_dt_8cpus_all_is_3f", th_hot_mask(8, dt8, 8, 0xff) == 0x3f, "hot dt8 ff");
+		TCASE("hot_xrun_8cpus_drops_logical_1_2", th_hot_mask(8, ok8, 8, 0xff) == 0xf9 && th_hot_mask(8, ok8, 8, 0xfe) == 0xf8, "hot ok8");
+		TCASE("hot_unknown_topology_keeps_0336", th_hot_mask(8, 0, 0, 0xff) == 0 && th_hot_mask(8, dt8, 0, 0xff) == 0, "hot unknown");
+		TCASE("hot_no_x1_in_boot_mask_keeps_0336", th_hot_mask(5, dt5, 5, 0x1f) == 0 && th_hot_mask(8, dt8, 8, 0x3f) == 0, "hot no x1");
+		TCASE("hot_never_below_three_cores", th_hot_mask(8, dt8, 8, 0xd0) == 0 && th_hot_mask(8, dt8, 8, 0xe0) == 0 && th_hot_mask(8, dt8, 8, 0xf0) == 0 && th_hot_mask(8, dt8, 8, 0xf8) == 0x38,
+		    "hot min cores");
+		TCASE("hot_a76_first_order_drops_x1_logical_3_4", th_hot_mask(5, a76first, 5, 0x1f) == 0x07, "hot a76first");
+#endif
 	}
 
 	/* log cadence */
