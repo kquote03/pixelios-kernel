@@ -112,6 +112,27 @@ class MkWlancredTest(Base):
             for v in over.values():
                 self.assertNotIn(v.encode(), r.stdout, "a value was printed")
 
+    def test_open_network_dhcp(self):
+        # xnu patch 0400: PIXOS_WIFI2_SECURITY=open, no PSK, no ip/gw -> security word 1, psk_len 0, zero psk and addresses
+        self.env.write_text("PIXOS_WIFI2_SSID=%s\nPIXOS_WIFI2_SECURITY=open\n" % self.ssid)
+        r = self.mk(env_extra={"PIXOS_WIFI_NET": "2"})
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn(b"wlancred-mode: dhcp", r.stdout)
+        blob = self.blob_path(r).read_bytes()
+        self.assertEqual(int.from_bytes(blob[8:12], "little"), 1)
+        self.assertEqual(int.from_bytes(blob[16:20], "little"), 0)
+        self.assertFalse(any(blob[52:124]), "psk and addresses must be zero")
+        self.assertEqual(mkwlancred.parse(blob), {"ssid": self.ssid.encode(), "psk": b"", "ip": "0.0.0.0", "gw": "0.0.0.0"})
+        # open with a passphrase is refused, naming the key only
+        self.env.write_text("PIXOS_WIFI2_SSID=%s\nPIXOS_WIFI2_SECURITY=open\nPIXOS_WIFI2_PSK=%s\n" % (self.ssid, self.fake))
+        r = self.mk(env_extra={"PIXOS_WIFI_NET": "2"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(b"_PSK must be absent or empty", r.stdout)   # the net-2 view names keys as PIXOS_WIFI_* (select_net)
+        # an open blob with psk_len != 0 (valid crc) is refused by the host reader
+        b = bytearray(blob[:124]); b[16] = 8
+        with self.assertRaises(ValueError):
+            mkwlancred.parse(bytes(b) + (zlib.crc32(bytes(b)) & 0xffffffff).to_bytes(4, "little"))
+
     def test_no_tmpfs_no_fallback(self):
         r = self.run_tool([PY, str(HERE / "mkwlancred.py"), "--env", str(self.env)], env_extra={"XDG_RUNTIME_DIR": str(self.tmp / "nope")})
         self.assertEqual(r.returncode, 2)

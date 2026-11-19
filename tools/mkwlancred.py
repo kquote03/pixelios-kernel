@@ -7,7 +7,7 @@
           static address" (printed `wlancred-mode: dhcp`; the kernel must accept a zero ip/gw for that, see W-D6-rejoin-dhcp research)
   tools/mkwlancred.py --self-test    format round trip on a made-up env (also run by tools/test_mkwlancred.py)
 
-Reads PIXOS_WIFI_SSID, PIXOS_WIFI_PSK, PIXOS_WIFI_SECURITY (must read wpa2-psk), PIXOS_WIFI_IP, PIXOS_WIFI_GW from the kernel .env
+Reads PIXOS_WIFI_SSID, PIXOS_WIFI_PSK, PIXOS_WIFI_SECURITY (wpa2-psk, or open: then PIXOS_WIFI_PSK must be absent or empty; patch 0400), PIXOS_WIFI_IP, PIXOS_WIFI_GW from the kernel .env
 (PIXOS_ENV_FILE / tools/envfile.py order; --env overrides; template: env.example at the repo root), writes the 128-byte blob to a 0600 file in a fresh 0700 directory under
 $XDG_RUNTIME_DIR (tmpfs: no fallback, never the run dir, never shim/out) and prints
   wlancred: <path>
@@ -17,9 +17,9 @@ never a default and never a value. The caller removes the directory (tools/xrun 
 
 Blob layout (little endian, 128 bytes; `parse` below is the host reader, the shim reader follows this table):
   0x00 char   magic[8] = "WLANCRB1"   (the trailing 1 is the format version)
-  0x08 u32    security = 0            (0 = wpa2-psk; any other value is refused)
+  0x08 u32    security                (0 = wpa2-psk, 1 = open network (xnu patch 0400); any other value is refused)
   0x0c u32    ssid_len  1..32
-  0x10 u32    psk_len   8..63
+  0x10 u32    psk_len   8..63 for wpa2-psk, 0 for open (psk[] all zero)
   0x14 u8     ssid[32]                (zero padded)
   0x34 u8     psk[64]                 (zero padded)
   0x74 u8     ip[4]                   (static address of the ping)
@@ -53,6 +53,8 @@ def select_net(env, net):
         raise CredError("set both %s and %s, or neither (DHCP)" % (NET2[IP_KEY], NET2[GW_KEY]))
     return view, dhcp
 SECURITY_WPA2_PSK = "wpa2-psk"
+SECURITY_OPEN = "open"          # xnu patch 0400: an open network (no passphrase, no PMK, no 4-way)
+SEC_CODE = {SECURITY_WPA2_PSK: 0, SECURITY_OPEN: 1}
 DIR_PREFIX = "wlancred-"
 FMT = "<8s3I32s64s4s4sI"
 
@@ -81,23 +83,30 @@ def _quad(env, key, allow_zero=False):
 
 def build_blob(env, dhcp=False):
     """-> 128 bytes. Raises CredError (no value in the text). dhcp: ip/gw are zero on purpose (the second network)."""
-    ssid, psk = _need(env, SSID_KEY), _need(env, PSK_KEY)
-    if _need(env, SEC_KEY).lower() != SECURITY_WPA2_PSK:
-        raise CredError("key %s must read %s (the only security the shim implements)" % (SEC_KEY, SECURITY_WPA2_PSK))
+    ssid = _need(env, SSID_KEY)
+    sec = _need(env, SEC_KEY).lower()
+    if sec not in SEC_CODE:
+        raise CredError("key %s must read %s or %s (the securities the kernel implements)" % (SEC_KEY, SECURITY_WPA2_PSK, SECURITY_OPEN))
+    if sec == SECURITY_OPEN:
+        if env.get(PSK_KEY):
+            raise CredError("key %s must be absent or empty when %s reads %s" % (PSK_KEY, SEC_KEY, SECURITY_OPEN))
+        psk = ""
+    else:
+        psk = _need(env, PSK_KEY)
     sb, pb = ssid.encode("utf-8"), psk.encode("utf-8")
     if not 1 <= len(sb) <= 32:
         raise CredError("key %s must be 1..32 bytes" % SSID_KEY)
-    if not 8 <= len(pb) <= 63 or not all(32 <= c <= 126 for c in pb):
+    if sec == SECURITY_WPA2_PSK and (not 8 <= len(pb) <= 63 or not all(32 <= c <= 126 for c in pb)):
         raise CredError("key %s must be 8..63 printable ASCII characters (a 64-digit hex PMK is not supported)" % PSK_KEY)
     ip, gw = _quad(env, IP_KEY, dhcp), _quad(env, GW_KEY, dhcp)
-    body = struct.pack(FMT[:-1], MAGIC, 0, len(sb), len(pb), sb, pb, ip, gw)
+    body = struct.pack(FMT[:-1], MAGIC, SEC_CODE[sec], len(sb), len(pb), sb, pb, ip, gw)
     blob = body + struct.pack("<I", zlib.crc32(body) & 0xffffffff)
     assert len(blob) == SIZE
     return blob
 
 
 def parse(blob):
-    """-> dict(ssid bytes, psk bytes, ip str, gw str). Raises ValueError (no value in the text): the host twin of the shim's validation
+    """-> dict(ssid bytes, psk bytes (b"" = open network), ip str, gw str). Raises ValueError (no value in the text): the host twin of the shim's validation
     (size, magic, crc, security, lengths, zero padding)."""
     if len(blob) != SIZE:
         raise ValueError("wlancred blob is %d bytes, need %d" % (len(blob), SIZE))
@@ -106,9 +115,9 @@ def parse(blob):
         raise ValueError("wlancred blob has the wrong magic")
     if zlib.crc32(blob[:SIZE - 4]) & 0xffffffff != crc:
         raise ValueError("wlancred blob crc mismatch")
-    if sec != 0:
-        raise ValueError("wlancred blob security is not wpa2-psk")
-    if not 1 <= sl <= 32 or not 8 <= pl <= 63:
+    if sec not in (0, 1):
+        raise ValueError("wlancred blob security is not wpa2-psk or open")
+    if not 1 <= sl <= 32 or not (8 <= pl <= 63 if sec == 0 else pl == 0):
         raise ValueError("wlancred blob lengths out of range")
     if any(ssid[sl:]) or any(psk[pl:]):
         raise ValueError("wlancred blob padding is not zero")
@@ -144,6 +153,15 @@ def self_test():
     e2 = {"PIXOS_WIFI2_SSID": "hotspot-net", "PIXOS_WIFI2_PSK": "hotspot-passphrase", "PIXOS_WIFI2_SECURITY": SECURITY_WPA2_PSK}
     v2, dh = select_net(e2, 2)
     ok &= dh and parse(build_blob(v2, dh)) == {"ssid": b"hotspot-net", "psk": b"hotspot-passphrase", "ip": "0.0.0.0", "gw": "0.0.0.0"}
+    e3 = {"PIXOS_WIFI2_SSID": "open-net", "PIXOS_WIFI2_SECURITY": SECURITY_OPEN}      # patch 0400: open network, DHCP
+    v3, dh3 = select_net(e3, 2)
+    b3 = build_blob(v3, dh3)
+    ok &= dh3 and b3[8:12] == b"\x01\0\0\0" and b3[16:20] == bytes(4) and not any(b3[52:116])
+    ok &= parse(b3) == {"ssid": b"open-net", "psk": b"", "ip": "0.0.0.0", "gw": "0.0.0.0"}
+    try:
+        build_blob(dict(v3, **{PSK_KEY: "selftest-passphrase"}), dh3); ok = False   # open + a passphrase is refused
+    except CredError as e:
+        ok &= PSK_KEY in str(e)
     try:
         build_blob(dict(env, **{IP_KEY: "0.0.0.0"})); ok = False   # network 1 never takes a zero address
     except CredError as e:

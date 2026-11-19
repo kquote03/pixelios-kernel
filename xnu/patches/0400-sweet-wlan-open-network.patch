@@ -1,0 +1,327 @@
+SWEET WLAN open-network join (patch 0400, oriole upstream port Step 10; user 2026-11-19: join an open campus guest network at boot). Upstream's boot join is WPA2-PSK only: the WLANCRED blob refuses any
+security word but 0, L24 sends wpa_auth WPA2_AUTH_PSK / wsec AES, L25 needs a PMK, the target's RSNE and a finished host 4-way before the en0 hand-over.
+(a) sweet_wlan_cred.h: security word 1 = open (tools/mkwlancred.py PIXOS_WIFI*_SECURITY=open): psk_len 0, psk bytes zero, no PMK; swc_creds.open; line `credentials loaded security=open`. Every other word stays refused.
+(b) sweet_wlan_join_fw.h: swj_join_cmds_open = the six H1..H5 commands with wpa_auth 0 and wsec 0 (sup_wpa 0, auth 0 open system, mfp 0 and the v1 join unchanged) [src OpenBSD sys/dev/ic/bwfm.c:2036-2040, the
+    no-privacy branch of bwfm_connect: BWFM_WPA_AUTH_DISABLED, BWFM_WSEC_NONE, BWFM_AUTH_OPEN; bwfmreg.h:167, 180, 188 = 0]. sweet_wlan.c uses it when swc_creds.open.
+(c) L25 (sweet_wlan_l25.h cfg.open, sweet_wlan_l25_rsne.h tgt.open, sweet_wlan_l25_glue.h, sweet_wlan_l25_hs.h): no PMK is required; the target record must carry NO RSNE (one with an RSNE is refused:
+    the credentials say open); a zero cfg BSSID adopts the record (rsne_len 0); swl25_go skips the supplicant context and the 4-way, sets hs_done (the en0 hand-over's check) and prints `L25 done: open network (no keys)`.
+(d) Keep mode: the 0282 re-join is not armed for an open link (GAP: stays DOWN after an AP loss); the Apple80211 kept link answers sec=open (no privacy bit, Get 2 auth lower 1 / upper 0 [guess from the observed
+    WPA2-PSK pair lower 1 / upper 8]).
+No new register, address, store kind or ioctl: the L24 SET_VARs are the same names with value 0 (the L24 list whitelists the built payloads exactly), L25 makes fewer calls. WPA2-PSK blobs take the old path byte for byte.
+Host test: shim/wlan_open_host_test.c (the cred + join_fw hunks of this patch on the 0206 headers: open blob load, refusals, the open join payloads). ORDER: after 0399.
+diff --git a/bsd/dev/sweet_wlan_a80211.c b/bsd/dev/sweet_wlan_a80211.c
+index ade16f0..bb7236d 100644
+--- a/bsd/dev/sweet_wlan_a80211.c
++++ b/bsd/dev/sweet_wlan_a80211.c
+@@ -219,6 +219,15 @@ sweet_wlan_a80211_kept_target(const uint8_t *bssid, const uint8_t *ie, uint32_t
+ 	sw_kept_tgt.ok = 1;
+ }
+ 
++/* patch 0400: the boot run joined an OPEN network (swc_creds.open): set by the hook (sw_keep_capture) before the attach, applied right after swr_kept_set (which assumes WPA2-PSK), then cleared. */
++static uint32_t sw_kept_open;
++
++void
++sweet_wlan_a80211_kept_open(uint32_t open)
++{
++	sw_kept_open = open ? 1u : 0u;
++}
++
+ /* W-UI (sprint 2026-11-08, xnu patch 0268 keep mode): the same attach for the case that the boot run's link is still up. `ssid`, `bssid`, `channel`, `rssi` are what the FIRMWARE reported after L26
+  * (sweet_wlan_l25_hs.h swl25_live, copied by the caller before the engine record is reused); `ok` says which were read (1 ssid, 2 bssid, 4 channel, 8 rssi). Read once, not refreshed (a GAP says so). The radio then answers joined (sweet_wlan_radio.h swr_kept_set), the station is told so (ASSOC_DONE -> kev 9, 2, 3, 4)
+  * once the handler is installed. Prints the install line of sweet_wlan_a80211_attach and `SWEET WLAN: A80211 kept link announced` on success; any refusal is a WIFI GAP and nothing is announced. Returns 0 or a positive errno. */
+@@ -237,6 +246,11 @@ sweet_wlan_a80211_radio_attach_kept(ifnet_t ifp, const uint8_t *ssid, uint32_t s
+ 	swr_init(&sw_scan_tab, NULL, &cb);      /* patch 0292: the scratch table of the live scan; its gap lines (a record dropped, a bad event) print through the same callbacks */
+ 	swr_ascan_set(&sw_radio, sw_scan_req, NULL);      /* patch 0292: in keep mode Set 10 scans live; the replay link above is the fallback when the live scan is off */
+ 	(void)swr_kept_set(&sw_radio, ssid, ssid_len, bssid, channel, rssi, ok);      /* before the handler: swsta_init reads the power flag (on) */
++	if (sw_kept_open && sw_radio.kept.joined) {        /* patch 0400 */
++		sw_radio.kept.sec = SWSTA_SEC_OPEN;
++		printf("SWEET WLAN: A80211 kept link is an open network (sec=open)\n");
++	}
++	sw_kept_open = 0;
+ 	if (sw_kept_tgt.ok) {      /* patch 0293: the join target's record, so that the very first Get 103 carries its IEs */
+ 		(void)swr_kept_target(&sw_radio, sw_kept_tgt.bssid, sw_kept_tgt.ie, sw_kept_tgt.ie_len, sw_kept_tgt.ie_short, sw_kept_tgt.chspec, sw_kept_tgt.beacon, sw_kept_tgt.noise, sw_kept_tgt.snr, sw_kept_tgt.rates, sw_kept_tgt.nrates);
+ 		memset(&sw_kept_tgt, 0, sizeof sw_kept_tgt);
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index 0879cc3..d00a6fa 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2407,6 +2407,7 @@ extern int sweet_wlan_registry_set_bsd_name(const char *name);
+ extern void sweet_wlan_a80211_scan_event(uint32_t status, const uint8_t *res, uint32_t len);                                    /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0292): one ESCAN_RESULT event of the live scan */
+ extern int sweet_wlan_a80211_scan_done(uint32_t kind, uint32_t ms, uint32_t ev);                                               /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0292): the live scan ended, swap the list in and post SCAN_DONE */
+ extern void sweet_wlan_a80211_kept_target(const uint8_t *bssid, const uint8_t *ie, uint32_t ie_len, uint32_t ie_short, uint32_t chspec, uint32_t beacon, int32_t noise, int32_t snr, const uint8_t *rates, uint32_t nrates);     /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0293): the join target's record (IEs, rates, ...) for Get 103 */
++extern void sweet_wlan_a80211_kept_open(uint32_t open);     /* bsd/dev/sweet_wlan_a80211.c (patch 0400): the kept link is an open network */
+ int sweet_wlan_keep_scan_request(void);
+ 
+ /* patch 0292 (WIFI-COVERAGE D3/D4, Settings > Wi-Fi lists networks): the keep-phase scan state (sweet_wlan_l25_hs.h swl25_sc_*). Set 10 reaches sweet_wlan_keep_scan_request from the iOS ioctl thread (through sweet_wlan_a80211.c); that sets ONE flag and touches no engine state, no lock.
+@@ -2883,6 +2884,7 @@ sw_keep_capture(void)
+ 	sw_keep_join.rssi = swl25_H.live_rssi;
+ 	sw_keep_join.live = swl25_H.live_ok;
+ 	sw_keep_join.ok = 1u;
++	sweet_wlan_a80211_kept_open(sw_l25g.cfg.open);      /* patch 0400: the radio answers the kept link as open (no privacy, no WPA2-PSK auth type) */
+ 	printf("SWEET WLAN: keep: firmware link values (SSID len %u, BSSID, chan %u, rssi %d, ok %#x) captured for the Apple80211 radio\n", (unsigned)sw_keep_join.ssid_len,
+ 	    (unsigned)sw_keep_join.chan, (int)sw_keep_join.rssi, (unsigned)sw_keep_join.live);
+ 	/* patch 0293 (W-D3-weak-security): Settings snapshots the Get 103 record ONCE, so it must carry the join target's IEs from the first answer. The L25 target record (the L23 scan's, or WLC_GET_BSS_INFO's) is still valid here (the disarm below wipes it); only for the BSSID the firmware reports */
+@@ -2899,6 +2901,11 @@ sw_keep_capture(void)
+ static void
+ sw_rj_capture(struct sw_hw *h)
+ {
++	if (sw_l25g.cfg.open) {        /* patch 0400: the re-join machine is the WPA2-PSK one (PMK, RSNE, host 4-way); an open link is not re-joined */
++		swl_gap("keep", "re-join not armed: open network (the re-join needs a PMK)", "medium");
++		printf("WIFI GAP: keep rejoin: not armed for an open network: the link will stay DOWN after an AP loss\n");
++		return;
++	}
+ 	(void)swl25_rj_arm(&sw_rj, &swl25_H, sw_l25g.cfg.pmk, h->jc, h->njc, sw_l25g.cfg.rsne_beacon, sw_l25g.cfg.rsne_beacon_len, sw_l25g.cfg.rsne_assoc, sw_l25g.cfg.rsne_assoc_len);
+ 	printf("SWEET WLAN: keep rejoin: the beacon RSNE kept is the L25 target record's (%u B, from %s)\n", (unsigned)sw_l25g.cfg.rsne_beacon_len, sw_l25g.tgt.via_bss_info ? "WLC_GET_BSS_INFO" : "the scan");   /* patch 0288 */
+ }
+@@ -3348,7 +3355,7 @@ sweet_wlan_creds(struct sw_hw *h, uint32_t level)
+ 	if (swc_load((volatile uint8_t *)ml_static_ptovirt((vm_offset_t)pa), (uint32_t)len, work, &sw_cred) != 0) {
+ 		return;
+ 	}
+-	if (swj_join_cmds(c, sw_cred.ssid, sw_cred.ssid_len, any_bssid, 0) != SWG_J_NCMD) {
++	if ((sw_cred.open ? swj_join_cmds_open(c, sw_cred.ssid, sw_cred.ssid_len, any_bssid) : swj_join_cmds(c, sw_cred.ssid, sw_cred.ssid_len, any_bssid, 0)) != SWG_J_NCMD) {    /* patch 0400: open network = wpa_auth 0, wsec 0 */
+ 		swc_wipe(&sw_cred, (uint32_t)sizeof sw_cred);
+ 		swl_gap("creds", "join commands not built", "high");
+ 		printf("SWEET WLAN: join commands not built\n");
+@@ -3385,7 +3392,7 @@ sweet_wlan_creds(struct sw_hw *h, uint32_t level)
+ 	}
+ 	h->jc = sw_jc;
+ 	h->njc = nc;
+-	printf("SWEET WLAN: L24 join commands ready: %u commands, wildcard BSSID%s\n", (unsigned)h->njc, have_mac ? ", station MAC knob (sweetwlanmac)" : "");
++	printf("SWEET WLAN: L24 join commands ready: %u commands, wildcard BSSID%s%s\n", (unsigned)h->njc, have_mac ? ", station MAC knob (sweetwlanmac)" : "", sw_cred.open ? ", open network (wpa_auth 0, wsec 0)" : "");
+ }
+ 
+ /* review T-48a0 r1 F3/F9: whatever sweet_wlan_creds left (join payloads with the SSID, ip, gw, a PMK) is zeroed when sweet_wlan_init is left, on EVERY return path (cleanup attribute: a guard variable at the top of the function; an L25 child that needs the PMK later moves this) */
+diff --git a/bsd/dev/sweet_wlan_cred.h b/bsd/dev/sweet_wlan_cred.h
+index a1f12e2..f066bfa 100644
+--- a/bsd/dev/sweet_wlan_cred.h
++++ b/bsd/dev/sweet_wlan_cred.h
+@@ -28,15 +28,20 @@
+ #define SWC_SIZE      128u
+ #define SWC_MAGIC     "WLANCRB1"
+ #define SWC_L_LOADED  "SWEET WLAN: credentials loaded security=wpa2-psk"
++#define SWC_L_LOADED_OPEN "SWEET WLAN: credentials loaded security=open"
+ #define SWC_GAP_MISSING "WIFI GAP: creds missing"
+ #define SWC_GAP_INVALID "WIFI GAP: creds invalid"
++/* patch 0400: blob security word. 0 = WPA2-PSK (psk_len 8..63), 1 = open network (psk_len 0, psk all zero, no PMK) [tools/mkwlancred.py docstring] */
++#define SWC_SEC_WPA2_PSK 0u
++#define SWC_SEC_OPEN     1u
+ 
+-/* what the join needs after the load: no passphrase (only the PMK) */
++/* what the join needs after the load: no passphrase (only the PMK; open = 1: no PMK, pmk stays zero) */
+ struct swc_creds {
+ 	uint8_t ssid[32];
+ 	uint32_t ssid_len;
+ 	uint8_t pmk[32];
+ 	uint8_t ip[4], gw[4];
++	uint8_t open;
+ };
+ 
+ /* zero n bytes in a way the compiler cannot drop (volatile stores plus a memory clobber) */
+@@ -70,14 +75,21 @@ static inline uint32_t swc_le32(const uint8_t *p)
+ /* validate `w` (SWC_SIZE bytes): 0 = ok, -1 = invalid. Looks at no byte it has not bounds-checked; never prints. */
+ static inline int swc_check(const uint8_t w[SWC_SIZE])
+ {
+-	uint32_t sl, pl, i;
++	uint32_t sl, pl, i, sec;
+ 
+-	if (memcmp(w, SWC_MAGIC, 8) != 0 || swc_crc32(w, SWC_SIZE - 4u) != swc_le32(w + 0x7c) || swc_le32(w + 0x08) != 0u)
++	if (memcmp(w, SWC_MAGIC, 8) != 0 || swc_crc32(w, SWC_SIZE - 4u) != swc_le32(w + 0x7c))
+ 		return -1;
++	sec = swc_le32(w + 0x08);
+ 	sl = swc_le32(w + 0x0c);
+ 	pl = swc_le32(w + 0x10);
+-	if (sl < 1u || sl > 32u || pl < 8u || pl > 63u)
++	if (sl < 1u || sl > 32u)
+ 		return -1;
++	if (sec == SWC_SEC_WPA2_PSK) {
++		if (pl < 8u || pl > 63u)
++			return -1;
++	} else if (sec != SWC_SEC_OPEN || pl != 0u) {	/* patch 0400: open = no passphrase at all; any other security word is refused */
++		return -1;
++	}
+ 	for (i = sl; i < 32u; i++)
+ 		if (w[0x14 + i] != 0u)
+ 			return -1;
+@@ -110,7 +122,8 @@ static inline int swc_load(volatile uint8_t *region, uint32_t avail, uint8_t wor
+ 	if (bad == 0) {
+ 		sl = swc_le32(work + 0x0c);
+ 		pl = swc_le32(work + 0x10);
+-		bad = swj_pmk_from_passphrase((const char *)(work + 0x34), pl, work + 0x14, sl, out->pmk);
++		out->open = swc_le32(work + 0x08) == SWC_SEC_OPEN ? 1u : 0u;
++		bad = out->open ? 0 : swj_pmk_from_passphrase((const char *)(work + 0x34), pl, work + 0x14, sl, out->pmk);	/* patch 0400: an open network has no PMK */
+ 		if (bad == 0) {
+ 			memcpy(out->ssid, work + 0x14, sl);
+ 			out->ssid_len = sl;
+@@ -124,7 +137,7 @@ static inline int swc_load(volatile uint8_t *region, uint32_t avail, uint8_t wor
+ 		SWC_GAP(SWC_GAP_INVALID);
+ 		return -1;
+ 	}
+-	SWC_LOG(SWC_L_LOADED);
++	SWC_LOG(out->open ? SWC_L_LOADED_OPEN : SWC_L_LOADED);
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_wlan_join_fw.h b/bsd/dev/sweet_wlan_join_fw.h
+index 15dfdfc..b16dbc1 100644
+--- a/bsd/dev/sweet_wlan_join_fw.h
++++ b/bsd/dev/sweet_wlan_join_fw.h
+@@ -150,6 +150,17 @@ static inline unsigned swj_join_cmds(struct swj_cmd out[6], const uint8_t *ssid,
+ 	return out[5].len ? 6u : 0u;
+ }
+ 
++/* patch 0400: the same six commands for an OPEN network: H2 wpa_auth = 0 (WPA_AUTH_DISABLED), H3 wsec = 0 (no cipher); sup_wpa 0, auth 0 (open system), mfp 0 and the join stay as above
++ * [src OpenBSD sys/dev/ic/bwfm.c:2036-2040 (no-privacy branch of bwfm_connect: wpa_auth BWFM_WPA_AUTH_DISABLED, wsec BWFM_WSEC_NONE, auth BWFM_AUTH_OPEN), bwfmreg.h:167, 180, 188 = 0]. Returns 6, or 0 with a GAP. */
++static inline unsigned swj_join_cmds_open(struct swj_cmd out[6], const uint8_t *ssid, uint32_t slen, const uint8_t bssid[6])
++{
++	if (swj_join_cmds(out, ssid, slen, bssid, 0) != 6u)
++		return 0;
++	out[1].len = swj_var_u32(out[1].buf, sizeof out[1].buf, "wpa_auth", 0u);
++	out[2].len = swj_var_u32(out[2].buf, sizeof out[2].buf, "wsec", 0u);
++	return out[1].len && out[2].len ? 6u : 0u;
++}
++
+ /* ALL-ON T-32: the firmware keep-alive, SET_VAR "mkeep_alive" + the packed wl_mkeep_alive_pkt_v1_t header of 11 bytes, little endian: u16 version = 1, u16 length = 11 (WL_MKEEP_ALIVE_FIXED_LEN),
+  * u32 period_msec, u16 len_bytes = 0 (0 = the firmware sends a NULL data frame), u8 keep_alive_id = 0; no data[] [src docs/research/138-wlan-keepalive.md s.1/s.2: bcmdhd bcm4389 dhd_common.c:7257-7295 (null packet, id 0, len_bytes 0),
+  * wlioctl.h:7274-7290; mainline brcmfmac fwil_types.h:1221-1237 is the same layout; the Pixel build period is 30000 ms, Kbuild:480]. The period is a plain millisecond count (the high bit means "send now" and is refused here: it is
+diff --git a/bsd/dev/sweet_wlan_l25_glue.h b/bsd/dev/sweet_wlan_l25_glue.h
+index 7252962..4a92cad 100644
+--- a/bsd/dev/sweet_wlan_l25_glue.h
++++ b/bsd/dev/sweet_wlan_l25_glue.h
+@@ -86,7 +86,7 @@ swl25g_cfg(struct swl25g *g, const struct swc_creds *cr, const uint8_t bssid[6])
+ 	int bad = 0;
+ 
+ 	memset(g, 0, sizeof *g);
+-	if (cr == NULL || swl25g_zero(cr->pmk, 32u)) {
++	if (cr == NULL || (!cr->open && swl25g_zero(cr->pmk, 32u))) {      /* patch 0400: an open network has no PMK */
+ 		swl25g_gap("PMK missing");
+ 		bad = 1;
+ 	}
+@@ -111,6 +111,10 @@ swl25g_cfg(struct swl25g *g, const struct swc_creds *cr, const uint8_t bssid[6])
+ 		return -1;
+ 	}
+ 	memcpy(g->cfg.pmk, cr->pmk, 32);
++	g->cfg.open = g->tgt.open = cr->open ? 1u : 0u;     /* patch 0400 */
++	if (cr->open) {
++		printf("SWEET WLAN: L25 glue: open network (no PMK, no RSNE, no 4-way)\n");
++	}
+ 	memcpy(g->cfg.ip, cr->ip, 4);
+ 	memcpy(g->cfg.gw, cr->gw, 4);
+ 	if (bssid != NULL && !swl25g_zero(bssid, 6u)) {
+@@ -127,7 +131,7 @@ swl25g_cfg(struct swl25g *g, const struct swc_creds *cr, const uint8_t bssid[6])
+ static void
+ swl25g_adopt(struct swl25g *g)
+ {
+-	if (g->tgt.state == SWL25R_OK && g->cfg.rsne_beacon_len != g->tgt.rsne_len) {
++	if (g->tgt.state == SWL25R_OK && (g->cfg.rsne_beacon_len != g->tgt.rsne_len || swl25g_zero(g->cfg.bssid, 6u))) {     /* patch 0400: an open target has rsne_len 0 = the cfg's, so a zero cfg BSSID also adopts */
+ 		memcpy(g->cfg.bssid, g->tgt.bssid, 6);      /* T-fc10 H2: a no-op for a given BSSID, the scan record's for a wildcard join */
+ 		memcpy(g->cfg.rsne_assoc, g->tgt.rsne, g->tgt.rsne_len);
+ 		memcpy(g->cfg.rsne_beacon, g->tgt.rsne, g->tgt.rsne_len);
+diff --git a/bsd/dev/sweet_wlan_l25.h b/bsd/dev/sweet_wlan_l25.h
+index eae652b..44211f9 100644
+--- a/bsd/dev/sweet_wlan_l25.h
++++ b/bsd/dev/sweet_wlan_l25.h
+@@ -39,6 +39,7 @@ struct swl25_cfg {
+ 	uint8_t pmk[32], mac[6], bssid[6], ip[4], gw[4];
+ 	uint8_t rsne_assoc[64], rsne_beacon[64];
+ 	uint32_t rsne_assoc_len, rsne_beacon_len;
++	uint8_t open;                   /* patch 0400: open network (swc_creds.open): no PMK, no RSNE, no 4-way, no keys */
+ };
+ 
+ struct swl25 {
+diff --git a/bsd/dev/sweet_wlan_l25_hs.h b/bsd/dev/sweet_wlan_l25_hs.h
+index 113b3d4..a6547a1 100644
+--- a/bsd/dev/sweet_wlan_l25_hs.h
++++ b/bsd/dev/sweet_wlan_l25_hs.h
+@@ -859,10 +859,13 @@ swl25_go(struct swg_wx *x, unsigned lv, struct swl25h *h)
+ 	swdp_ring_init(&h->r4, h->l.env.depth_d2h[2]);
+ 	swdp_book_init(&h->txb, SWDP_TX_RID);
+ 	/* T-9d71: the AP compares the RSNE in M2 with the one it stored from the association request (`RSN_IE Different in msg 2`); the association request was built by the firmware, so M2 carries what the firmware sent when it was read */
+-	if (swj_ctx_init_ex(&h->sup, c->pmk, mac, c->bssid, h->arsne_len != 0u ? h->arsne : c->rsne_assoc, h->arsne_len != 0u ? h->arsne_len : c->rsne_assoc_len, c->rsne_beacon, c->rsne_beacon_len, h->arsne_len != 0u) != 0) {
++	if (c->open) {     /* patch 0400: open network: no supplicant context (no PMK, no RSNE) */
++		printf("SWEET WLAN: L25 open network: no RSNE, no 4-way\n");
++	} else if (swj_ctx_init_ex(&h->sup, c->pmk, mac, c->bssid, h->arsne_len != 0u ? h->arsne : c->rsne_assoc, h->arsne_len != 0u ? h->arsne_len : c->rsne_assoc_len, c->rsne_beacon, c->rsne_beacon_len, h->arsne_len != 0u) != 0) {
+ 		return swl25_gap(x, "L25 not run: RSNE missing or too long");
++	} else {
++		swl25_rsne_report(h);
+ 	}
+-	swl25_rsne_report(h);
+ 	swdp_net_init(&h->net, mac, c->ip, c->gw);
+ 	swl25_witness_ctx(c, mac);
+ 	ex = swl25_flow(x, &h->l, c->bssid);
+@@ -873,11 +876,16 @@ swl25_go(struct swg_wx *x, unsigned lv, struct swl25h *h)
+ 	if (ex != 0 || x->d4dstop) {
+ 		return ex;
+ 	}
+-	ex = swl25_4way(x, h);
+-	if (ex != 0 || x->d4dstop) {
+-		return ex;
++	if (c->open) {     /* patch 0400: no keys to install; hs_done = the link carries data (the en0 hand-over checks it); an EAPOL frame is then the counted rekey GAP */
++		h->hs_done = 1u;
++		printf("SWEET WLAN: L25 done: open network (no keys), rx frames %u, tx posts %u, ring-0 WR %u, ring-2 RD %u\n", h->rx_frames, h->tx_posts, x->d4wr, x->d4rd);
++	} else {
++		ex = swl25_4way(x, h);
++		if (ex != 0 || x->d4dstop) {
++			return ex;
++		}
++		printf("SWEET WLAN: L25 done: keys installed, rx frames %u, tx posts %u, ring-0 WR %u, ring-2 RD %u\n", h->rx_frames, h->tx_posts, x->d4wr, x->d4rd);
+ 	}
+-	printf("SWEET WLAN: L25 done: keys installed, rx frames %u, tx posts %u, ring-0 WR %u, ring-2 RD %u\n", h->rx_frames, h->tx_posts, x->d4wr, x->d4rd);
+ 	swg_d4d_done(x, 25u, lv, x->d4wr, x->d4rd);
+ 	if (lv < 26u) {
+ 		return 0;
+diff --git a/bsd/dev/sweet_wlan_l25_rsne.h b/bsd/dev/sweet_wlan_l25_rsne.h
+index 276f8f6..b2ac37a 100644
+--- a/bsd/dev/sweet_wlan_l25_rsne.h
++++ b/bsd/dev/sweet_wlan_l25_rsne.h
+@@ -42,6 +42,7 @@ struct swl25_tgt {
+ 	uint8_t ssid[32];
+ 	uint8_t rsne[SWL25R_RSNE_MAX];
+ 	uint32_t rsne_len;
++	uint8_t open;                   /* patch 0400: open credentials: the target record must carry NO RSNE (state OK with rsne_len 0); one with an RSNE is refused */
+ 	uint8_t via_bss_info;           /* patch 0288: the record came from WLC_GET_BSS_INFO (the scan never saw the AP), for the re-join's log line */
+ 	/* 2026-11-11 (W-D3-weak-security: Settings snapshots the Get 103 record of the joined network ONCE, so it must carry the real IEs from the first answer): what the target's record carried besides the RSNE, kept for the Apple80211 radio.
+ 	 * ie = the record's IE block as the firmware sent it (at most SWL25R_IE_KEEP bytes; ie_short = it was longer), rates = the 500 kbps rateset entries, the rest the plain fields; xf = the extras were read (state OK). */
+@@ -229,6 +230,9 @@ swl25r_note_src(struct swg_wx *x, const struct swg_ev *ev, const struct swl25r_s
+ 			return swl25r_bad(t, "an IE runs past ie_length");
+ 		}
+ 		if (eh[0] == SWL25R_IE_RSN) {
++			if (t->open) {
++				return swl25r_bad(t, "open credentials, but the target has an RSNE");
++			}
+ 			if (eh[1] < 2u || 2u + eh[1] > SWL25R_RSNE_MAX) {
+ 				return swl25r_bad(t, "RSNE shorter than 2 B or longer than 64 B");
+ 			}
+@@ -243,6 +247,12 @@ swl25r_note_src(struct swg_wx *x, const struct swg_ev *ev, const struct swl25r_s
+ 		}
+ 		pos += 2u + eh[1];
+ 	}
++	if (t->open && k < SWL25R_MAXIE) {      /* patch 0400: every IE walked, no RSNE: the open BSS the credentials name */
++		t->rsne_len = 0u;
++		t->state = SWL25R_OK;
++		printf("SWEET WLAN: L23 join target is an open BSS (no RSNE), as the open credentials expect\n");
++		return 0;
++	}
+ 	return swl25r_bad(t, k >= SWL25R_MAXIE ? "no RSNE in the first 128 IEs" : "no RSNE (IE 48) in the target record");
+ }
+ 
+diff --git a/bsd/dev/sweet_wlan_sta.h b/bsd/dev/sweet_wlan_sta.h
+index 76a6083..50375b2 100644
+--- a/bsd/dev/sweet_wlan_sta.h
++++ b/bsd/dev/sweet_wlan_sta.h
+@@ -250,7 +250,7 @@ static inline const char *swsta_cd_gap(uint32_t type, const struct swsta_view *v
+ 	switch (type) {
+ 	case SWSTA_T_CARD_CAPS: return "get 12 caps bits open, zero-filled";
+ 	case SWSTA_T_RSSI_BOUNDS: return "get 106 bounds values open, zeros";
+-	case SWSTA_T_AUTH_TYPE: return v && v->st.joined && v->st.sec == SWSTA_SEC_WPA2_PSK ? 0 : "get 2 auth values open, zeros";	/* WPA2-PSK is answered (lower 1, upper 8); any other security stays zeros */
++	case SWSTA_T_AUTH_TYPE: return v && v->st.joined && (v->st.sec == SWSTA_SEC_WPA2_PSK || v->st.sec == SWSTA_SEC_OPEN) ? 0 : "get 2 auth values open, zeros";	/* WPA2-PSK is answered (lower 1, upper 8); any other security stays zeros */
+ 	case SWSTA_T_PROTMODE: return "get 6 protmode values open, zeros";
+ 	case SWSTA_T_CHANNEL: return "get 4 channel flags open, zero";
+ 	case SWSTA_T_RSSI: return "get 16 unit block open, zeros";
+@@ -278,6 +278,7 @@ static inline int swsta_cd_get(void *cx, uint32_t type, const struct swsta_view
+ 		swsta_p32(b, 0, 1); swsta_p32(b, 8, v->st.channel); return 0;
+ 	case SWSTA_T_AUTH_TYPE:						/* 16 B (+4 always, +8/+0xc if non-zero) [RE-A L2]. Joined with WPA2-PSK: lower 1, upper 8, the values IO80211 stores itself at the join [W-D3-weak-security s.6, obs-RE]; else zeros (gap) */
+ 		if (v->st.joined && v->st.sec == SWSTA_SEC_WPA2_PSK) { swsta_p32(b, 0, 1); swsta_p32(b, 4, 1); swsta_p32(b, 8, 8); }
++		else if (v->st.joined && v->st.sec == SWSTA_SEC_OPEN) { swsta_p32(b, 0, 1); swsta_p32(b, 4, 1); }	/* patch 0400: open = lower 1 (open system, as above), upper 0 (no key management) [guess from the WPA2-PSK pair] */
+ 		return 0;
+ 	case SWSTA_T_PROTMODE: return 0;				/* 12 B (+4,+8) [RE-A L4]; values open */
+ 	case SWSTA_T_RSSI: case SWSTA_T_NOISE:				/* 52 B, success needs word +4 == 1, value at +8 [RE-A L7] */

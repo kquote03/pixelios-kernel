@@ -805,6 +805,13 @@ else
 	patch -s -p1 -d $O/wrp396 < $O/sweet_wlan_wr.0396.diff || { echo "FAIL patch 0396 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
 	chk "wlan_fwid_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O/wrp396/bsd/dev -o $O/wlan_fwid_host_test wlan_fwid_host_test.c
 	chk "wlan_fwid_host_test" $O/wlan_fwid_host_test
+	# xnu patch 0400 (open-network join): the 0206 join/cred headers (shim/ copies) + the cred and join_fw hunks of 0400; the test is copied next to them (quoted includes)
+	rm -rf $O/op400; mkdir -p $O/op400/bsd/dev; cp sweet_wlan_join.h sweet_wlan_join_fw.h sweet_wlan_cred.h $O/op400/bsd/dev/
+	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_(cred|join_fw)\.h /{on=1;print;next} /^diff --git /{on=0} on{print}' ../xnu/patches/0400-sweet-wlan-open-network.patch > $O/op400.diff
+	patch -s -p1 -d $O/op400 < $O/op400.diff || { echo "FAIL patch 0400 does not apply to the 0206 cred/join_fw headers" >&2; exit 1; }
+	cp wlan_open_host_test.c $O/op400/bsd/dev/
+	chk "wlan_open_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -o $O/wlan_open_host_test $O/op400/bsd/dev/wlan_open_host_test.c
+	chk "wlan_open_host_test" $O/wlan_open_host_test
 	# the pure NVRAM part of the same header (process_nvram_vars port): known answers, no bus
 	chk "wlan_nv_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_nv_host_test wlan_nv_host_test.c
 	chk "wlan_nv_host_test" $O/wlan_nv_host_test
