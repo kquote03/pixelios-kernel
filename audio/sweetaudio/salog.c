@@ -415,6 +415,48 @@ salog_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *ctx, AudioD
 	return r;
 }
 
+/* Step 9 (doc 56): SALOG_PROPLOG=1 logs every AudioObjectSetPropertyData of the process (VirtualAudio, the HAL glue): object, selector,
+ * scope, element, size, the value as float and u32 when it is 4 bytes; at most PROPLOG_MAX lines. Diagnostic only: where (if anywhere)
+ * the iOS volume reaches a HAL object while the default route is Null_Device. The call itself is passed through unchanged. */
+#define PROPLOG_MAX 400
+static atomic_int proplog_n;
+static int proplog_on = -1;
+
+static void
+fourcc(uint32_t v, char o[5])
+{
+	for (int i = 0; i < 4; i++) {
+		char c = (char)(v >> (24 - 8 * i));
+		o[i] = c >= 32 && c < 127 ? c : '.';
+	}
+	o[4] = 0;
+}
+
+static OSStatus
+salog_set_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 qsz, const void *q, UInt32 sz, const void *d)
+{
+	if (proplog_on < 0) {
+		const char *e = getenv("SALOG_PROPLOG");
+		proplog_on = e && e[0] == '1';
+	}
+	OSStatus r = AudioObjectSetPropertyData(obj, a, qsz, q, sz, d);
+	if (proplog_on == 1 && a && atomic_fetch_add(&proplog_n, 1) < PROPLOG_MAX) {
+		char s[5], sc[5], m[200];
+		float f = 0;
+		uint32_t u = 0;
+		if (sz == 4 && d) {
+			memcpy(&f, d, 4);
+			memcpy(&u, d, 4);
+		}
+		fourcc(a->mSelector, s);
+		fourcc(a->mScope, sc);
+		int l = snprintf(m, sizeof m, "valog[%d]: prop: set obj %u '%s' scope '%s' el %u size %u f %.4f u %u -> %d\n", getpid(), (unsigned)obj, s,
+		    sc, (unsigned)a->mElement, (unsigned)sz, (double)f, (unsigned)u, (int)r);
+		(void)write(2, m, (size_t)l);
+	}
+	return r;
+}
+
 static bool
 salog_type_enabled(os_log_t log, os_log_type_t type)
 {
@@ -425,6 +467,7 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct { const
 	{ (const void *)salog_os_log_impl, (const void *)_os_log_impl },
 	{ (const void *)salog_type_enabled, (const void *)os_log_type_enabled },
 	{ (const void *)salog_create_ioproc, (const void *)AudioDeviceCreateIOProcID },
+	{ (const void *)salog_set_prop, (const void *)AudioObjectSetPropertyData },
 };
 
 __attribute__((constructor)) static void

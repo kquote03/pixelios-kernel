@@ -2,7 +2,7 @@
  * pixui_probe: read-only-first probe of the iOS state that the Settings Wi-Fi / Bluetooth switches, the volume keys and system
  * sounds depend on (doc 56 "Step 8"). One shot, every wait bounded, counts and states only (no SSID, address or name printed).
  *
- *   pixui_probe [all|mg|wifi|bt|vol|snd]     (default all; launchd job, stdout mirrored by xnu sweetnull=pixui_probe)
+ *   pixui_probe [all|mg|wifi|bt|vol|snd|seq] (default all; launchd job, stdout mirrored by xnu sweetnull=pixui_probe; seq: PIXUI_SEQ, Step 9)
  *
  * Every private symbol is looked up with dlsym/objc_getClass: a missing one is a "PIXUI GAP:" line, never a crash.
  * Private prototypes are [guess] (written from memory of class-dump / public reverse-engineering notes, not checked against
@@ -453,9 +453,74 @@ static void probe_snd(float v0)
 		vol_set(v0);
 }
 
+/* ---- 6. listening sequence (doc 56 Step 9): PIXUI_SEQ="T:k,T:k,..." with T = seconds of kernel uptime (CLOCK_UPTIME_RAW) and k =
+ * d (/dev/sweetaudio direct: sweetaudio_tone 3 660 3 = 3 beeps), a (AudioQueue via mediaserverd: sweetaudio_play aq = 5 beeps 1320 Hz),
+ * s (AudioServices system sound: sweetaudio_play sys = one tri-tone). At most 16 entries, T <= 900, each pattern bounded 20 s; the volume
+ * and ringer state are printed before each pattern (read only). ---- */
+static double uptime_s(void)
+{
+	return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+}
+
+static void probe_seq(const char *spec)
+{
+	char buf[256];
+	unsigned n = 0;
+	snprintf(buf, sizeof buf, "%s", spec ? spec : "");
+	for (char *save = NULL, *e = strtok_r(buf, ",", &save); e && n < 16; e = strtok_r(NULL, ",", &save), n++) {
+		int t = atoi(e);
+		char *c = strchr(e, ':');
+		char k = c ? c[1] : '?';
+		if (t <= 0 || t > 900 || (k != 'd' && k != 'a' && k != 's')) {
+			gap("seq: entry '%s' ignored", e);
+			continue;
+		}
+		double now = uptime_s();
+		if (now < t)
+			usleep((useconds_t)((t - now) * 1e6));
+		int tok;
+		uint64_t st = 0;
+		if (notify_register_check("com.apple.springboard.ringerstate", &tok) == NOTIFY_STATUS_OK) {
+			notify_get_state(tok, &st);
+			notify_cancel(tok);
+		}
+		vol_get("seq");
+		say("seq: pattern %u kind %c start at uptime %.1f s (planned %d), ringerstate %llu", n, k, uptime_s(), t, (unsigned long long)st);
+		int rc;
+		if (k == 'd') {
+			pid_t pid;
+			char *av[] = {"/usr/local/bin/sweetaudio_tone", "3", "660", "3", NULL};
+			int s = 0;
+			rc = posix_spawn(&pid, av[0], NULL, NULL, av, environ) == 0 ? 0 : -1;
+			for (int i = 0; rc == 0 && i < 200; i++) {
+				if (waitpid(pid, &s, WNOHANG) == pid) {
+					rc = WIFEXITED(s) ? WEXITSTATUS(s) : 128;
+					break;
+				}
+				usleep(100000);
+				if (i == 199) {
+					kill(pid, 9);
+					waitpid(pid, &s, 0);
+					rc = -2;
+				}
+			}
+		} else {
+			rc = spawn_wait("/usr/local/bin/sweetaudio_play", k == 'a' ? "aq" : "sys", 20);
+		}
+		say("seq: pattern %u kind %c end at uptime %.1f s rc %d", n, k, uptime_s(), rc);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	const char *m = argc > 1 ? argv[1] : "all";
+	if (!strcmp(m, "seq")) {
+		say("start mode seq at uptime %.1f s, spec %s", uptime_s(), getenv("PIXUI_SEQ") ? getenv("PIXUI_SEQ") : "(none)");
+		vol_get("seq-start");
+		probe_seq(getenv("PIXUI_SEQ"));
+		say("RESULT done seq gaps=%u", gaps);
+		return 0;
+	}
 	int all = !strcmp(m, "all");
 	int wait_s = getenv("PIXUI_WAIT") ? atoi(getenv("PIXUI_WAIT")) : 0;
 	t_start = time(NULL);
@@ -484,6 +549,13 @@ int main(int argc, char **argv)
 			sleep((unsigned)(at - (now - t_start)));
 		vol_get("late");
 		say("snd: late aq tone rc %d", spawn_wait("/usr/local/bin/sweetaudio_play", "aq", 20));
+	}
+	if (getenv("PIXUI_FINAL_VOL")) {	/* Step 9: put the volume back after kernel test presses (sweethidtestkey) changed it */
+		float fv = (float)atof(getenv("PIXUI_FINAL_VOL"));
+		if (fv >= 0.0f && fv <= 1.0f) {
+			vol_set(fv);
+			vol_get("final");
+		}
 	}
 	say("RESULT done mg_wifi=%d mg_bt=%d mg_volbuttons=%d wifi_scan=%d gaps=%u", mg_wifi, mg_bt, mg_vol, scan_n, gaps);
 	return 0;
